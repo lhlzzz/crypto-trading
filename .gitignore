@@ -1,0 +1,22 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local database and runtime output
+postgres-data/
+*.log
+
+# Plan Enforcer runtime state and generated receipts
+.plan-enforcer/statusline-state.json
+.plan-enforcer/.ledger-mtime
+.plan-enforcer/proof/
