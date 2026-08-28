@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from engine import MarketDataEnvelope, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
+
+
+def _frame(closes: list[str]) -> MarketFrame:
+    return MarketFrame(
+        symbol="btcusdt",
+        closes=tuple(Decimal(value) for value in closes),
+        captured_at=datetime.now(timezone.utc),
+    )
+
+
+def test_engine_returns_no_intent_until_slow_window_is_ready() -> None:
+    engine = StrategyEngine(StrategyConfig(fast_window=3, slow_window=5))
+
+    assert engine.evaluate(_frame(["1", "2", "3", "4"])) is None
+
+
+def test_engine_creates_buy_intent_without_execution_dependencies() -> None:
+    engine = StrategyEngine(
+        StrategyConfig(
+            fast_window=3,
+            slow_window=5,
+            minimum_confidence=Decimal("0.5"),
+            order_quote_usdt=Decimal("25"),
+        )
+    )
+    intent = engine.evaluate(_frame(["1", "1", "1", "1", "1", "2", "3"]))
+
+    assert intent is not None
+    assert intent.side == "BUY"
+    assert intent.order_type == "MARKET"
+    assert intent.quote_quantity == Decimal("25")
+    assert intent.strategy_version == "momentum-sma-1"
+
+
+def test_engine_does_not_call_broker_or_risk() -> None:
+    source = open("engine.py", encoding="utf-8").read()
+
+    assert "PrivateClient" not in source
+    assert "create_order" not in source
+    assert "RiskGate" not in source
+
+
+def _positioning_frame(**updates: object) -> MarketFrame:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    source_timestamps = {
+        source: {
+            "source_timestamp": captured.isoformat(),
+            "received_timestamp": captured.isoformat(),
+            "latency_ms": 0,
+        }
+        for source in (
+            "spot_trade",
+            "futures_open_interest",
+            "futures_funding",
+            "futures_taker_flow",
+            "spot_book_ticker",
+            "spot_orderbook",
+        )
+    }
+    values: dict[str, object] = {
+        "symbol": "BTCUSDT",
+        "closes": (Decimal("100"), Decimal("101")),
+        "captured_at": captured,
+        "spot_buy_volume": Decimal("12"),
+        "spot_sell_volume": Decimal("4"),
+        "net_spot_flow": Decimal("8"),
+        "cvd_change": Decimal("8"),
+        "taker_buy_volume": Decimal("10"),
+        "taker_sell_volume": Decimal("3"),
+        "oi_change": Decimal("0.03"),
+        "funding_rate": Decimal("0.0001"),
+        "spread_bps": Decimal("2"),
+        "depth_25bps": Decimal("100"),
+        "market_regime": "RISK_ON",
+        "freshness": (SourceFreshness("spot", captured, captured, 900, captured),),
+        "source_timestamps": source_timestamps,
+    }
+    values.update(updates)
+    return MarketFrame(**values)  # type: ignore[arg-type]
+
+
+def test_market_data_envelope_calculates_latency() -> None:
+    source = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    received = source.replace(second=1)
+    envelope = MarketDataEnvelope.create(
+        source="binance", market="SPOT", symbol="btcusdt", event_type="TRADE",
+        source_timestamp=source, received_timestamp=received, payload={"p": "1"},
+    )
+    assert envelope.symbol == "BTCUSDT"
+    assert envelope.latency_ms == 1000
+
+
+def test_positioning_building_is_explainable_but_shadow_only_by_default() -> None:
+    frame = _positioning_frame()
+    decision = StrategyEngine().positioning_decision(frame)
+    assert decision.state == "LONG_BUILDING"
+    assert decision.direction == "LONG"
+    assert "SPOT_BUYING" in decision.reason_codes
+    assert StrategyEngine().evaluate(frame) is None
+
+
+def test_stale_positioning_data_fails_closed() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    stale = SourceFreshness("spot", captured, captured, 1, captured.replace(hour=13))
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(freshness=(stale,)), now=captured.replace(hour=13)
+    )
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+
+
+def test_one_stale_required_source_fails_closed_even_when_others_are_fresh() -> None:
+    captured = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    fresh = SourceFreshness("spot_trade", captured, captured, 900, captured)
+    stale = SourceFreshness(
+        "futures_taker", captured, captured, 1, captured.replace(hour=13)
+    )
+
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(freshness=(fresh, stale)),
+        now=captured.replace(hour=13),
+    )
+
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+
+
+def test_missing_timestamp_provenance_fails_closed() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(source_timestamps={})
+    )
+
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+    assert "MISSING_TIMESTAMP_PROVENANCE" in decision.reason_codes
+
+
+def test_conflicting_flow_fails_closed() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(net_spot_flow=Decimal("-8"), cvd_change=Decimal("-8"))
+    )
+    assert decision.state == "CONFLICTED"
+    assert decision.direction == "FLAT"
+
+
+def test_price_cvd_divergence_is_a_conflicted_flat_decision() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(
+            cvd_change=Decimal("-8"),
+            price_cvd_divergence=True,
+        )
+    )
+
+    assert decision.state == "CONFLICTED"
+    assert decision.direction == "FLAT"
+    assert "PRICE_CVD_DIVERGENCE" in decision.reason_codes
+
+
+def test_absorption_requires_exceptional_flow_and_low_price_impact() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(
+            closes=(Decimal("100"), Decimal("100")),
+            net_spot_flow=Decimal("-8"),
+            cvd_change=Decimal("-8"),
+            taker_buy_volume=Decimal("3"),
+            taker_sell_volume=Decimal("10"),
+            volume_ratio_5m=Decimal("2.1"),
+            price_impact_sell=Decimal("0.0005"),
+        )
+    )
+
+    assert decision.state == "ABSORPTION_LONG"
+    assert decision.direction == "FLAT"
+
+
+def test_long_unwind_cannot_open_a_new_long_intent() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    frame = _positioning_frame(
+        closes=(Decimal("101"), Decimal("100")),
+        oi_change=Decimal("-0.03"),
+    )
+
+    decision = engine.positioning_decision(frame)
+
+    assert decision.state == "LONG_UNWIND"
+    assert decision.direction == "FLAT"
+    assert "ENTRY_STATE_NOT_CONFIRMED" in decision.reason_codes
+    assert engine.evaluate(frame) is None
+
+
+def test_short_covering_cannot_open_a_new_long_intent() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(oi_change=Decimal("-0.03"))
+    )
+
+    assert decision.state == "SHORT_COVERING"
+    assert decision.direction == "FLAT"
+    assert "ENTRY_STATE_NOT_CONFIRMED" in decision.reason_codes
+
+
+def test_short_building_is_directionally_symmetric_with_long_building() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(
+            closes=(Decimal("101"), Decimal("100")),
+            net_spot_flow=Decimal("-8"),
+            cvd_change=Decimal("-8"),
+            taker_buy_volume=Decimal("3"),
+            taker_sell_volume=Decimal("10"),
+            oi_change=Decimal("0.03"),
+            market_regime="RISK_OFF",
+        )
+    )
+
+    assert decision.state == "SHORT_BUILDING"
+    assert decision.direction == "SHORT"
+
+
+def test_weak_transition_strength_cannot_create_an_intent() -> None:
+    engine = StrategyEngine(
+        StrategyConfig(
+            positioning_decision_enabled=True,
+            minimum_transition_strength=Decimal("1"),
+        )
+    )
+    frame = _positioning_frame()
+
+    decision = engine.positioning_decision(frame)
+
+    assert decision.state == "LONG_BUILDING"
+    assert decision.direction == "FLAT"
+    assert "TRANSITION_STRENGTH_LOW" in decision.reason_codes
+    assert engine.evaluate(frame) is None
+
+
+def test_positioning_snapshot_id_is_replay_deterministic() -> None:
+    frame = _positioning_frame()
+    first = StrategyEngine().positioning_decision(frame)
+    second = StrategyEngine().positioning_decision(frame)
+    assert first.as_dict() == second.as_dict()
+
+
+def test_positioning_decision_preserves_normalized_input_provenance() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    frame = _positioning_frame(
+        source_timestamps={
+            "spot_trade": {
+                "source_timestamp": captured.isoformat(),
+                "received_timestamp": captured.isoformat(),
+                "latency_ms": 0,
+            }
+        }
+    )
+
+    decision = StrategyEngine().positioning_decision(frame)
+
+    assert decision.source_timestamps["spot_trade"]["latency_ms"] == 0
+    assert decision.input_features["net_spot_flow"] == Decimal("8")
+    assert decision.as_dict()["source_timestamps"] == dict(frame.source_timestamps)
+
+
+def test_future_data_fails_closed() -> None:
+    frame = _positioning_frame()
+    decision = StrategyEngine().positioning_decision(
+        frame, now=frame.captured_at.replace(hour=11)
+    )
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+
+
+def test_received_after_decision_fails_closed() -> None:
+    frame = _positioning_frame(
+        freshness=(
+            SourceFreshness(
+                "spot",
+                datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+                datetime(2026, 8, 26, 12, 0, 1, tzinfo=timezone.utc),
+                900,
+                datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+            ),
+        )
+    )
+
+    decision = StrategyEngine().positioning_decision(frame, now=frame.captured_at)
+
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+
+
+def test_inconsistent_declared_latency_fails_closed() -> None:
+    captured = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    frame = _positioning_frame(
+        source_timestamps={
+            "spot_trade": {
+                "source_timestamp": captured.isoformat(),
+                "received_timestamp": captured.replace(second=1).isoformat(),
+                "latency_ms": 0,
+            }
+        }
+    )
+
+    decision = StrategyEngine().positioning_decision(frame)
+
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+    assert "TIMESTAMP_INCONSISTENT" in decision.reason_codes
+
+
+def test_market_frame_rebuilds_from_normalized_evidence_snapshot() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    frame = _positioning_frame(
+        source_timestamps={
+            "spot_trade": {
+                "source_timestamp": captured.isoformat(),
+                "received_timestamp": captured.isoformat(),
+                "latency_ms": 0,
+            }
+        }
+    )
+    expected = StrategyEngine().positioning_decision(frame)
+
+    rebuilt = MarketFrame.from_evidence_snapshot(expected.as_dict())
+    actual = StrategyEngine().positioning_decision(rebuilt)
+
+    assert actual.as_dict() == expected.as_dict()

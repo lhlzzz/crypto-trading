@@ -15,8 +15,14 @@ build/
 # Local database and runtime output
 postgres-data/
 *.log
+*.log.[0-9]*
+feedhandler.log*
 
 # Plan Enforcer runtime state and generated receipts
 .plan-enforcer/statusline-state.json
 .plan-enforcer/.ledger-mtime
+.plan-enforcer/.session-log.jsonl
 .plan-enforcer/proof/
+
+# Local analysis / knowledge-graph caches
+.understand-anything/

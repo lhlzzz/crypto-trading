@@ -1,3 +1,8 @@
+click>=8,<9
+binance-sdk-spot>=11,<12
+cryptofeed>=2.5,<3
 fastapi>=0.115,<1
+httpx2>=2.10,<3
 psycopg2-binary>=2.9,<3
+vectorbt>=0.28,<1
 uvicorn>=0.30,<1

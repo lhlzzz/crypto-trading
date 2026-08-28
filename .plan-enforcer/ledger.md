@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 5 total  |  0 done  |  5 verified  |  0 skipped  |  0 blocked  |  0 remaining
- Drift: 0  |  Last reconcile: T5  |  Tier: structural
+ 33 total  |  0 done  |  32 verified  |  0 skipped  |  0 blocked  |  1 remaining
+ Drift: 2  |  Last reconcile: T27-T33 |  Tier: structural
 
 ## Task Ledger
 
@@ -16,11 +16,62 @@
 | T3 | Align Financial OS bian integration | verified | Financial OS tsc passed | A:I1,V3 | Next route proxies API |
 | T4 | Add provenance, runtime, and version configuration | verified | config and compile checks pass | A:I1,V4 | Explicit release/contract versions |
 | T5 | Validate the end-to-end bian path | verified | 5 tests; tsc; API 200 | A:I2,V5 | Final payload boundary reviewed |
+| T6 | Add public-only real-time collection path | verified | public trade feed test passes | D1,D2,V9 | Python 3.12, no auth channels |
+| T7 | Make collection results correct and diagnosable | verified | Decimal, retries, DB errors pass | D1,V7 | Runs and idempotent SQL covered |
+| T8 | Expose freshness and verify service identity | verified | API health and shell checks pass | D1,V8 | Service identity verified on :18001 |
+| T9 | Provision bian isolated PostgreSQL endpoint | verified | DB healthy; API reads 5 markets | D3,D4,D5,D6,D7,V10 | Dedicated localhost:5446 service verified |
+| T10 | Audit Phase 1-4 ownership boundaries | verified | 38 tests passed | V11 | Adapter/schema/engine/execution owners verified |
+| T11 | Implement exchange rules and transport-safe adapter helpers | verified | adapter cache tests passed | V12 | Exchange filters parsed and cached |
+| T12 | Implement isolated User Data Stream | verified | user stream tests passed | D8,V13 | SDK stream isolated; reconnect hook wired |
+| T13 | Complete reconciliation and restart recovery | verified | 44 tests; schema ensure | V14 | Client-order lookup; restore or HALT |
+| T14 | Add paper lifecycle parity and accounting coverage | verified | limit/expiry tests passed | V15 | Latency, limit pending, expiry, PnL paths |
+| T15 | Add backtesting research boundary | verified | vectorbt test passed | V16 | One research path; no second live engine |
+| T16 | Extend read-only Financial OS trading contract | verified | API summary/events tests passed | V17 | Mode, risk, PnL, events remain GET-only |
+| T17 | Add Testnet runner and startup recovery gate | verified | shell/recovery guards passed | V18 | Reconcile before private trading loop |
+| T18 | Add emergency stop and live guard | verified | live guard test passed | V19 | Token and explicit confirmation; hard block |
+| T19 | Add recovery/safety/integration tests | verified | 50 tests passed | V20 | Restart, unknown, timeout, live-disabled cases |
+| T20 | Final runtime, graph, and repository health review | verified | 50 tests; graph 526 nodes | V21 | API, DB, market, guards, owners checked |
+| T21 | Add isolated paper validation controls | verified | 18 tests; injection guards pass | D9,V22 | NO_SIGNAL and test-only injection |
+| T22 | Validate paper order lifecycle and accounting | verified | 18 tests; lifecycle/PnL pass | V22 | Deterministic lifecycle and accounting |
+| T23 | Validate paper restart and idempotency | verified | restart/idempotency pass | V23 | Recovery and duplicate effects |
+| T24 | Validate risk and transport failure behavior | verified | 34 focused tests pass | V24 | Risk limits and adapter failures |
+| T25 | Validate strategy research boundaries | verified | backtest/lookahead tests pass | V25 | Metrics and timestamp safety |
+| T26 | Execute available runtime gates | verified | 71 tests; API/DB; graph 564/1869 | D10,V26 | External gates explicitly unverified |
+| T27 | Restore timestamped market observations | verified | 89 tests; fresh collection | D11,V27 | Envelopes and stale gate fail closed |
+| T28 | Persist and aggregate Spot trade flow | verified | CVD/no-lookahead tests pass | D11,V27 | Received-time boundary enforced |
+| T29 | Add candidate Spot liquidity observation | verified | real trade/book/depth smoke | D11,V27 | Runtime duration gate remains pending |
+| T30 | Add Futures observation-only context | verified | fresh REST and force-order tests | D11,V27 | No Futures order path added |
+| T31 | Assemble timestamp-aligned MarketFrame | verified | real frame and provenance | D11,V27 | Raw events stay out of engine |
+| T32 | Run positioning in shadow mode | verified | API snapshot; no signal | D11,V27 | Legacy remains execution owner |
+| T33 | Complete research and elapsed-time gates | pending | 104 tests; observer/Shadow restart and zero-order audit | D11,V28,V29,V30 | Duration, 7-day Shadow, Testnet remain |
 
 ## Decision Log
 
 | ID | Task Ref | Decision | Reason |
 |---|---|---|---|
+| D1 | T6-T8 | Use Python 3.12 and Cryptofeed | User approved higher runtime; public-only boundary remains |
+| D2 | T6 | Use trade instead of ticker stream | Ticker only exposes bid/ask, not last price |
+| D3 | T9 | Add bian database compose file | No existing bian lifecycle configuration exists |
+| D4 | T9 | Use docker-compose binary | Docker Compose plugin is unavailable |
+| D5 | T9 | Use project Python 3.12 virtualenv | uv-managed Python cannot be modified in place |
+| D6 | T9 | Declare Uvicorn CLI dependency | Uvicorn 0.52 imports click without installing it |
+| D7 | T9 | Use uv pip install in setup command | It resolves Cryptofeed runtime dependencies |
+| D8 | T12 | Use official SDK WebSocket API user-data stream | Installed SDK exposes signed user-data subscriptions |
+| D9 | T21 | Keep test-only signal injection in paper_runner.py | It is validation control, not strategy logic or execution |
+| D10 | T24 | Require mode-specific Testnet/Live credential names | Shared credentials cannot prove environment isolation |
+| D11 | T27-T32 | Keep Positioning fail-closed and shadow-only | Data is incomplete until runtime gates pass |
+
+## Reconciliation History
+
+| Round | Tasks Checked | Gaps Found | Action Taken |
+|---|---|---|---|
+| R7 | T21-T25 | 0 | Paper controls, lifecycle, recovery, risk, transport, and research gates verified |
+| R8 | T26 | External credentials and elapsed-time gates unavailable | Marked unverified; no LIVE approval |
+| R9 | T27-T33 | 1 | T33 remains runtime/research gated |
+| R10 | T27-T33 | 1 | Research verified; elapsed gates remain |
+| R11 | T27-T33 | 1 | Feature smoke passed; elapsed gates remain |
+| R12 | T27-T33 | 1 | Observer validated; elapsed gates remain |
+| R13 | T27-T33 | 1 | Regression test, 104-test suite, restart, zero-order audit, and 358/528 graph refresh passed; elapsed gates remain |
 
 ## Reconciliation History
 
@@ -28,3 +79,7 @@
 |---|---|---|---|
 | R1 | T1-T5 | 0 | All tasks have verification evidence |
 | R2 | T1-T5 | 0 | Removed unused import and bounded API payload |
+| R3 | T1-T8 | 0 | All tasks have verification evidence |
+| R4 | T1-T8 | 0 | Trade price semantics verified |
+| R5 | T1-T9 | 0 | Database and API connection verified |
+| R6 | T10-T19 | 0 | Tests, schema, market collect, API, and guards verified |

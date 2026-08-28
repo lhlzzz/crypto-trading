@@ -1,0 +1,458 @@
+"""Binance REST adapter with separate public and private clients."""
+from __future__ import annotations
+
+import os
+import time
+import json
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Callable
+
+from binance_common.configuration import ConfigurationRestAPI
+from binance_sdk_spot import (
+    BadRequestError,
+    ClientError,
+    ForbiddenError,
+    NetworkError,
+    RateLimitBanError,
+    ServerError,
+    Spot,
+    TooManyRequestsError,
+    UnauthorizedError,
+)
+from binance_sdk_spot.rest_api.models import (
+    KlinesIntervalEnum,
+    NewOrderSideEnum,
+    NewOrderTypeEnum,
+)
+
+
+class BinanceError(Exception):
+    """Base class for adapter errors."""
+
+
+class BinanceAuthError(BinanceError):
+    """Credentials or permissions are invalid."""
+
+
+class BinanceConnectionError(BinanceError):
+    """The exchange could not be reached or returned a server failure."""
+
+
+class BinanceRateLimitError(BinanceError):
+    """The exchange rate limit was reached."""
+
+
+class BinanceOrderError(BinanceError):
+    """The exchange rejected an order operation."""
+
+
+class BinanceAPIError(BinanceError):
+    """A non-order Binance API operation failed."""
+
+
+@dataclass(frozen=True)
+class ClientConfig:
+    """Configuration loaded from environment or an explicit test mapping."""
+
+    mode: str = "paper"
+    api_key: str | None = None
+    api_secret: str | None = None
+    live_trading_enabled: bool = False
+    live_confirmation_token: str | None = None
+    timeout_ms: int = 10_000
+    retries: int = 3
+    backoff_ms: int = 250
+    exchange_info_ttl_sec: int = 300
+
+    @classmethod
+    def from_env(cls) -> "ClientConfig":
+        mode = os.environ.get("BIAN_MODE", "paper").strip().lower()
+        credential_prefix = {
+            "testnet": "BIAN_TESTNET",
+            "live": "BIAN_LIVE",
+        }.get(mode, "BIAN")
+        return cls(
+            mode=mode,
+            api_key=os.environ.get(f"{credential_prefix}_API_KEY"),
+            api_secret=os.environ.get(f"{credential_prefix}_API_SECRET"),
+            live_trading_enabled=_env_bool("LIVE_TRADING_ENABLED"),
+            live_confirmation_token=os.environ.get("LIVE_CONFIRMATION_TOKEN"),
+            timeout_ms=_env_int("BIAN_BINANCE_TIMEOUT_MS", 10_000, minimum=100),
+            retries=_env_int("BIAN_BINANCE_RETRIES", 3, minimum=0),
+            backoff_ms=_env_int("BIAN_BINANCE_BACKOFF_MS", 250, minimum=0),
+            exchange_info_ttl_sec=_env_int(
+                "BIAN_EXCHANGE_INFO_TTL_SEC", 300, minimum=1
+            ),
+        )
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"paper", "testnet", "live"}:
+            raise ValueError("BIAN_MODE must be paper, testnet, or live")
+        if (
+            self.timeout_ms < 100
+            or self.retries < 0
+            or self.backoff_ms < 0
+            or self.exchange_info_ttl_sec < 1
+        ):
+            raise ValueError("invalid Binance transport configuration")
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
+    if isinstance(exc, (UnauthorizedError, ForbiddenError)):
+        return BinanceAuthError(f"{operation} authentication failed")
+    if isinstance(exc, (TooManyRequestsError, RateLimitBanError)):
+        return BinanceRateLimitError(f"{operation} rate limited")
+    if isinstance(exc, (NetworkError, ServerError)):
+        return BinanceConnectionError(f"{operation} connection failure")
+    if isinstance(exc, (BadRequestError, ClientError)):
+        message = str(exc)
+        if operation in {"create_order", "cancel_order"}:
+            return BinanceOrderError(f"{operation} rejected: {message}")
+        return BinanceAPIError(f"{operation} failed: {message}")
+    if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
+        return BinanceConnectionError(f"{operation} connection failure")
+    return BinanceAPIError(f"{operation} failed: {exc}")
+
+
+def _decimal_value(value: Decimal | str | float | int | None) -> float | None:
+    return float(value) if value is not None else None
+
+
+def _model_dict(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [_model_dict(item) for item in value]
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {key: _model_dict(item) for key, item in value.items()}
+    return value
+
+
+def _call(operation: str, function: Callable[[], Any]) -> Any:
+    try:
+        response = function()
+        return _model_dict(response.data())
+    except Exception as exc:
+        raise _translate_error(exc, operation=operation) from exc
+
+
+def _configuration(config: ClientConfig, *, private: bool) -> ConfigurationRestAPI:
+    if private and (not config.api_key or not config.api_secret):
+        raise BinanceAuthError(
+            f"credentials are required for BIAN_MODE={config.mode}"
+        )
+    base_path = (
+        "https://testnet.binance.vision"
+        if config.mode == "testnet"
+        else "https://api.binance.com"
+    )
+    return ConfigurationRestAPI(
+        api_key=config.api_key if private else None,
+        api_secret=config.api_secret if private else None,
+        base_path=base_path,
+        timeout=config.timeout_ms,
+        retries=config.retries,
+        backoff=config.backoff_ms,
+    )
+
+
+class PublicClient:
+    """Unauthenticated public market-data adapter."""
+
+    def __init__(self, config: ClientConfig | None = None) -> None:
+        self.config = config or ClientConfig.from_env()
+        self._client = Spot(config_rest_api=_configuration(self.config, private=False))
+        self._exchange_info_cache: tuple[float, dict[str, Any]] | None = None
+
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str = "1m",
+        limit: int = 500,
+    ) -> list[Any]:
+        try:
+            interval_enum = KlinesIntervalEnum(interval)
+        except ValueError as exc:
+            raise ValueError(f"unsupported Binance kline interval: {interval}") from exc
+        return _call(
+            "get_klines",
+            lambda: self._client.rest_api.klines(symbol, interval_enum, limit=limit),
+        )
+
+    def get_depth(self, symbol: str, limit: int = 100) -> dict[str, Any]:
+        return _call(
+            "get_depth",
+            lambda: self._client.rest_api.depth(symbol, limit=limit),
+        )
+
+    def get_ticker(self, symbol: str) -> dict[str, Any] | list[dict[str, Any]]:
+        return _call(
+            "get_ticker",
+            lambda: self._client.rest_api.ticker_price(symbol=symbol),
+        )
+
+    def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
+        if symbol is None and self._exchange_info_cache is not None:
+            cached_at, cached = self._exchange_info_cache
+            if time.monotonic() - cached_at < self.config.exchange_info_ttl_sec:
+                return cached
+        payload = _call(
+            "get_exchange_info",
+            lambda: self._client.rest_api.exchange_info(symbol=symbol),
+        )
+        if symbol is None:
+            self._exchange_info_cache = (time.monotonic(), payload)
+        return payload
+
+    def get_symbol_rules(
+        self,
+        symbol: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, str]:
+        """Return normalized exchange filters for one symbol.
+
+        This is exchange metadata only. Risk owns how these values are
+        applied to an intent; the adapter only fetches, caches, and parses the
+        Binance response.
+        """
+        symbol = symbol.upper().strip()
+        if not symbol:
+            raise ValueError("symbol is required")
+        if force_refresh:
+            self._exchange_info_cache = None
+        payload = self.get_exchange_info()
+        symbols = payload.get("symbols") or []
+        row = next(
+            (item for item in symbols if str(item.get("symbol", "")).upper() == symbol),
+            None,
+        )
+        if row is None:
+            raise BinanceAPIError(f"exchange info has no symbol: {symbol}")
+        filters = {
+            str(item.get("filterType")): item
+            for item in row.get("filters", [])
+        }
+        lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
+        price = filters.get("PRICE_FILTER") or {}
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        return {
+            "symbol": symbol,
+            "status": str(row.get("status", "")),
+            "min_qty": str(lot.get("minQty", "0")),
+            "max_qty": str(lot.get("maxQty", "0")),
+            "step_size": str(lot.get("stepSize", "0")),
+            "tick_size": str(price.get("tickSize", "0")),
+            "min_notional": str(
+                notional.get("minNotional", notional.get("notional", "0"))
+            ),
+        }
+
+
+class FuturesPublicClient:
+    """Public USD-M Futures observation adapter; it has no order methods."""
+
+    def __init__(self, config: ClientConfig | None = None) -> None:
+        self.config = config or ClientConfig.from_env()
+        self.base_url = (
+            "https://testnet.binancefuture.com/fapi/v1"
+            if self.config.mode == "testnet"
+            else "https://fapi.binance.com/fapi/v1"
+        )
+        self.data_url = (
+            "https://testnet.binancefuture.com/futures/data"
+            if self.config.mode == "testnet"
+            else "https://fapi.binance.com/futures/data"
+        )
+
+    def _get(self, path: str, **params: Any) -> Any:
+        query = urllib.parse.urlencode({key: value for key, value in params.items() if value is not None})
+        url = f"{path}?{query}" if query else path
+        request = urllib.request.Request(
+            url, headers={"Accept": "application/json", "User-Agent": "bian-futures-observer/1.0"}
+        )
+        for attempt in range(self.config.retries + 1):
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.config.timeout_ms / 1000
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                translated = _translate_error(exc, operation="futures_observation")
+                retryable = isinstance(
+                    translated, (BinanceConnectionError, BinanceRateLimitError)
+                )
+                if not retryable or attempt >= self.config.retries:
+                    raise translated from exc
+                delay_sec = self.config.backoff_ms / 1000 * (2**attempt)
+                if delay_sec:
+                    time.sleep(delay_sec)
+        raise AssertionError("Futures public retry loop must return or raise")
+
+    def get_mark_price(self, symbol: str) -> dict[str, Any]:
+        return self._get(f"{self.base_url}/premiumIndex", symbol=symbol.upper())
+
+    def get_open_interest(self, symbol: str) -> dict[str, Any]:
+        return self._get(f"{self.base_url}/openInterest", symbol=symbol.upper())
+
+    def get_funding_rate(self, symbol: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        return self._get(
+            f"{self.base_url}/fundingRate", symbol=symbol.upper(), limit=max(1, min(limit, 1000))
+        )
+
+    def get_taker_buy_sell(self, symbol: str, *, period: str = "5m", limit: int = 30) -> list[dict[str, Any]]:
+        return self._get(
+            f"{self.data_url}/takerlongshortRatio", symbol=symbol.upper(),
+            period=period, limit=max(1, min(limit, 500))
+        )
+
+    def get_global_long_short_ratio(self, symbol: str, *, period: str = "5m", limit: int = 30) -> list[dict[str, Any]]:
+        return self._get(
+            f"{self.data_url}/globalLongShortAccountRatio", symbol=symbol.upper(),
+            period=period, limit=max(1, min(limit, 500))
+        )
+
+    def get_top_trader_long_short_ratio(self, symbol: str, *, period: str = "5m", limit: int = 30) -> list[dict[str, Any]]:
+        return self._get(
+            f"{self.data_url}/topLongShortAccountRatio", symbol=symbol.upper(),
+            period=period, limit=max(1, min(limit, 500))
+        )
+
+
+class PrivateClient:
+    """Authenticated account/order adapter for Testnet or explicitly enabled Live."""
+
+    def __init__(self, config: ClientConfig | None = None) -> None:
+        self.config = config or ClientConfig.from_env()
+        if self.config.mode == "paper":
+            raise BinanceAuthError(
+                "PrivateClient cannot be created in paper mode; use execution.py"
+            )
+        if self.config.mode == "live" and not self.config.live_trading_enabled:
+            raise BinanceAuthError(
+                "live mode is hard-blocked unless LIVE_TRADING_ENABLED=true"
+            )
+        if self.config.mode == "live" and not self.config.live_confirmation_token:
+            raise BinanceAuthError(
+                "live mode requires LIVE_CONFIRMATION_TOKEN"
+            )
+        self._client = Spot(config_rest_api=_configuration(self.config, private=True))
+
+    def get_account(self) -> dict[str, Any]:
+        return _call("get_account", lambda: self._client.rest_api.get_account())
+
+    def get_balance(self, asset: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
+        account = self.get_account()
+        balances = account.get("balances", [])
+        if asset is None:
+            return balances
+        return next(
+            (row for row in balances if row.get("asset") == asset.upper()),
+            {"asset": asset.upper(), "free": "0", "locked": "0"},
+        )
+
+    def create_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal | str | float | int | None = None,
+        quote_order_qty: Decimal | str | float | int | None = None,
+        price: Decimal | str | float | int | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            side_enum = NewOrderSideEnum(side.upper())
+            type_enum = NewOrderTypeEnum(order_type.upper())
+        except ValueError as exc:
+            raise ValueError("unsupported Binance order side or type") from exc
+        return _call(
+            "create_order",
+            lambda: self._client.rest_api.new_order(
+                symbol=symbol,
+                side=side_enum,
+                type=type_enum,
+                quantity=_decimal_value(quantity),
+                quote_order_qty=_decimal_value(quote_order_qty),
+                price=_decimal_value(price),
+                new_client_order_id=client_order_id,
+            ),
+        )
+
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: int | str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        return _call(
+            "cancel_order",
+            lambda: self._client.rest_api.delete_order(
+                symbol=symbol,
+                order_id=int(order_id) if order_id is not None else None,
+                orig_client_order_id=client_order_id,
+            ),
+        )
+
+    def get_order(
+        self,
+        symbol: str,
+        order_id: int | str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        return _call(
+            "get_order",
+            lambda: self._client.rest_api.get_order(
+                symbol=symbol,
+                order_id=int(order_id) if order_id is not None else None,
+                orig_client_order_id=client_order_id,
+            ),
+        )
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        return _call(
+            "get_open_orders",
+            lambda: self._client.rest_api.get_open_orders(symbol=symbol),
+        )
+
+    def get_all_orders(
+        self,
+        symbol: str,
+        order_id: int | str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return _call(
+            "get_all_orders",
+            lambda: self._client.rest_api.all_orders(
+                symbol=symbol,
+                order_id=int(order_id) if order_id is not None else None,
+                limit=limit,
+            ),
+        )
+
+    def get_my_trades(self, symbol: str, limit: int | None = None) -> list[dict[str, Any]]:
+        return _call(
+            "get_my_trades",
+            lambda: self._client.rest_api.my_trades(symbol=symbol, limit=limit),
+        )

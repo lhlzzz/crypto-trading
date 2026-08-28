@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python_bin="${BIAN_PYTHON_BIN:-$script_dir/.venv/bin/python}"
+
+if [ "${BIAN_MODE:-}" != "live" ]; then
+  echo "LIVE HARD BLOCK: BIAN_MODE must equal live" >&2
+  exit 1
+fi
+if [ "${LIVE_TRADING_ENABLED:-false}" != "true" ]; then
+  echo "LIVE HARD BLOCK: LIVE_TRADING_ENABLED must equal true" >&2
+  exit 1
+fi
+if [ -z "${LIVE_CONFIRMATION_TOKEN:-}" ]; then
+  echo "LIVE HARD BLOCK: LIVE_CONFIRMATION_TOKEN is required" >&2
+  exit 1
+fi
+if [ ! -x "$python_bin" ]; then
+  echo "bian Python runtime not found: $python_bin" >&2
+  exit 1
+fi
+if [ -z "${BIAN_LIVE_API_KEY:-}" ] || [ -z "${BIAN_LIVE_API_SECRET:-}" ]; then
+  echo "BIAN_LIVE_API_KEY and BIAN_LIVE_API_SECRET are required for Live" >&2
+  exit 1
+fi
+
+cat <<BANNER
+================================
+BIAN LIVE TRADING
+MODE: LIVE
+LIVE_TRADING_ENABLED: TRUE
+ACCOUNT: Binance Spot API account
+RISK LIMITS: environment configured
+MAX ORDER: ${MAX_ORDER_USDT:-100}
+MAX POSITION: ${MAX_POSITION_USDT:-500}
+MAX DAILY LOSS: ${MAX_DAILY_LOSS_USDT:-50}
+================================
+BANNER
+read -r -p "Type LIVE_CONFIRMATION_TOKEN to continue: " confirmation
+if [ "$confirmation" != "$LIVE_CONFIRMATION_TOKEN" ]; then
+  echo "LIVE HARD BLOCK: confirmation did not match" >&2
+  exit 1
+fi
+
+export BIAN_LIVE_CONFIRMATION="$confirmation"
+cd "$script_dir"
+exec "$python_bin" paper_runner.py --mode live "$@"

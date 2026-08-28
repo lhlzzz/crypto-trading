@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
-from scripts.database import read_overview, schema_status
+from scripts.database import read_overview
+from trading_store import TradingStore
 
 BIAN_OPERATOR_CONTRACT_VERSION = os.environ.get(
     "BIAN_OPERATOR_CONTRACT_VERSION",
@@ -44,6 +45,36 @@ def _csv_env(name: str, default: str) -> list[str]:
     ]
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+BIAN_MAX_DATA_AGE_SEC = _positive_int_env("BIAN_MAX_DATA_AGE_SEC", 900)
+
+
+def _trading_store() -> TradingStore:
+    return TradingStore()
+
+
+def _trading_mode() -> str:
+    return os.environ.get("BIAN_MODE", "paper").strip().lower()
+
+
+def _trading_halted() -> bool:
+    return _env_enabled("BIAN_TRADING_HALTED")
+
+
+def _persistent_trading_halt(store: TradingStore) -> bool:
+    try:
+        return _trading_halted() or store.is_halted()
+    except Exception:
+        return _trading_halted()
+
+
 class BianFrontData(BaseModel):
     """Versioned response consumed by the Financial OS bian workspace."""
 
@@ -57,6 +88,7 @@ class BianFrontData(BaseModel):
     source: str
     database_connected: bool
     database: dict[str, Any]
+    collection: dict[str, Any]
     markets: list[dict[str, Any]] = Field(default_factory=list)
     coverage: list[dict[str, Any]] = Field(default_factory=list)
     provenance: dict[str, Any] = Field(default_factory=dict)
@@ -67,26 +99,51 @@ class BianFrontData(BaseModel):
 class BianHealth(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    service: str
     status: str
     contract_version: str
     release_version: str
     environment: str
     database: dict[str, Any]
+    collection: dict[str, Any]
 
 
 def _front_data(limit: int) -> dict[str, Any]:
-    report = read_overview(limit=limit)
+    report = read_overview(
+        limit=limit,
+        max_data_age_sec=BIAN_MAX_DATA_AGE_SEC,
+    )
     database = report["database_status"]
     connected = database.get("status") == "ok"
+    try:
+        store = _trading_store()
+        positioning = {
+            "enabled": _env_enabled("POSITIONING_DECISION_ENABLED"),
+            "shadow_mode": not _env_enabled("POSITIONING_DECISION_ENABLED"),
+            "snapshots": store.list_positioning_snapshots(limit),
+            "source_freshness": store.market_data_freshness(
+                max_age_sec=BIAN_MAX_DATA_AGE_SEC
+            ),
+        }
+    except Exception:
+        positioning = {
+            "enabled": _env_enabled("POSITIONING_DECISION_ENABLED"),
+            "shadow_mode": not _env_enabled("POSITIONING_DECISION_ENABLED"),
+            "snapshots": [],
+            "status": "unavailable",
+        }
     return {
         "contract_version": BIAN_OPERATOR_CONTRACT_VERSION,
         "release_version": BIAN_RELEASE_VERSION,
         "environment": BIAN_ENVIRONMENT,
         "workspace": "bian",
         "mode": "PUBLIC_READ_ONLY / NO_TRADE",
-        "source": "binance_public_api",
+        "trading_mode": _trading_mode(),
+        "trading_halted": _persistent_trading_halt(_trading_store()),
+        "source": "binance_public_api_and_stream",
         "database_connected": connected,
         "database": database,
+        "collection": report["collection"],
         "markets": report["markets"],
         "coverage": report["coverage"],
         "provenance": {
@@ -106,6 +163,7 @@ def _front_data(limit: int) -> dict[str, Any]:
             "authority": "bian_postgresql",
             "entries": report["coverage"],
         },
+        "positioning": positioning,
         "updated_at": report["updated_at"],
     }
 
@@ -138,13 +196,24 @@ app.add_middleware(
 
 @app.get("/health", response_model=BianHealth)
 def health() -> dict[str, Any]:
-    status = schema_status()
+    report = read_overview(
+        limit=1,
+        max_data_age_sec=BIAN_MAX_DATA_AGE_SEC,
+    )
+    database = report["database_status"]
+    collection = report["collection"]
+    healthy = (
+        database.get("status") == "ok"
+        and collection.get("status") == "fresh"
+    )
     return {
-        "status": "ok" if status["status"] == "ok" else "degraded",
+        "service": "bian",
+        "status": "ok" if healthy else "degraded",
         "contract_version": BIAN_OPERATOR_CONTRACT_VERSION,
         "release_version": BIAN_RELEASE_VERSION,
         "environment": BIAN_ENVIRONMENT,
-        "database": status,
+        "database": database,
+        "collection": collection,
     }
 
 
@@ -160,6 +229,209 @@ def get_dashboard_overview(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     return _front_data(limit)
+
+
+@app.get("/api/trading/status")
+def get_trading_status() -> dict[str, Any]:
+    store = _trading_store()
+    try:
+        counts = store.trading_counts()
+        summary = store.trading_summary()
+        halted = _persistent_trading_halt(store)
+        database_status = "ok"
+    except Exception:
+        counts = {}
+        summary = {}
+        halted = _trading_halted()
+        database_status = "unavailable"
+    mode = _trading_mode()
+    live_enabled = _env_enabled("LIVE_TRADING_ENABLED")
+    live_allowed = mode == "live" and live_enabled and not halted
+    return {
+        "mode": mode,
+        "database_status": database_status,
+        "trading_halted": halted,
+        "risk_status": "HALT" if halted else "SAFE",
+        "live_trading_enabled": live_enabled,
+        "live_orders_allowed": live_allowed,
+        "counts": counts,
+        "summary": summary,
+    }
+
+
+@app.get("/api/trading/summary")
+def get_trading_summary() -> dict[str, Any]:
+    try:
+        return {"status": "ok", **_trading_store().trading_summary()}
+    except Exception:
+        return {"status": "unavailable"}
+
+
+@app.get("/api/trading/orders")
+def get_trading_orders(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return {"items": _trading_store().list_orders(limit)}
+    except Exception:
+        return {"items": [], "status": "unavailable"}
+
+
+@app.get("/api/trading/trades")
+def get_trading_trades(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return {"items": _trading_store().list_trades(limit)}
+    except Exception:
+        return {"items": [], "status": "unavailable"}
+
+
+@app.get("/api/trading/positions")
+def get_trading_positions() -> dict[str, Any]:
+    try:
+        return {"items": _trading_store().list_positions()}
+    except Exception:
+        return {"items": [], "status": "unavailable"}
+
+
+@app.get("/api/trading/balance")
+def get_trading_balance() -> dict[str, Any]:
+    try:
+        return {"items": _trading_store().list_balances()}
+    except Exception:
+        return {"items": [], "status": "unavailable"}
+
+
+@app.get("/api/trading/risk")
+def get_trading_risk(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return {
+            "halted": _persistent_trading_halt(_trading_store()),
+            "items": _trading_store().list_risk_events(limit),
+        }
+    except Exception:
+        return {"halted": _trading_halted(), "items": [], "status": "unavailable"}
+
+
+@app.get("/api/trading/events")
+def get_trading_events(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return {"items": _trading_store().list_system_events(limit)}
+    except Exception:
+        return {"items": [], "status": "unavailable"}
+
+
+def _positioning_items(limit: int) -> dict[str, Any]:
+    try:
+        items = _trading_store().list_positioning_snapshots(limit)
+        return {"status": "ok", "items": items}
+    except Exception:
+        return {"status": "unavailable", "items": []}
+
+
+@app.get("/api/positioning/snapshots")
+def get_positioning_snapshots(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    return _positioning_items(limit)
+
+
+@app.get("/api/positioning/candidates")
+def get_positioning_candidates(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    result = _positioning_items(200)
+    if result.get("status") != "ok":
+        return result
+    items = [
+        item for item in result["items"]
+        if item.get("direction") in {"LONG", "SHORT"}
+    ]
+    return {"status": "ok", "items": items[:limit]}
+
+
+@app.get("/api/positioning/transitions")
+def get_positioning_transitions(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    result = _positioning_items(limit)
+    if result.get("status") != "ok":
+        return result
+    return {
+        "status": "ok",
+        "items": [item for item in result["items"] if item.get("transition") != "NONE"],
+    }
+
+
+@app.get("/api/positioning/evidence")
+def get_positioning_evidence(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    result = _positioning_items(limit)
+    if result.get("status") != "ok":
+        return result
+    return {
+        "status": "ok",
+        "items": [
+            {
+                "snapshot_id": item.get("snapshot_id"),
+                "symbol": item.get("symbol"),
+                "observed_at": item.get("observed_at"),
+                "payload": item.get("payload", {}),
+            }
+            for item in result["items"]
+        ],
+    }
+
+
+@app.get("/api/positioning/data-quality")
+def get_positioning_data_quality(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    result = _positioning_items(limit)
+    try:
+        source_freshness = _trading_store().market_data_freshness(
+            max_age_sec=BIAN_MAX_DATA_AGE_SEC
+        )
+    except Exception:
+        source_freshness = []
+    if result.get("status") != "ok":
+        return {**result, "source_freshness": source_freshness}
+    return {
+        "status": "ok",
+        "source_freshness": source_freshness,
+        "items": [
+            {
+                "snapshot_id": item.get("snapshot_id"),
+                "symbol": item.get("symbol"),
+                "observed_at": item.get("observed_at"),
+                "data_quality_score": item.get("data_quality_score"),
+                "state": item.get("state"),
+            }
+            for item in result["items"]
+        ],
+    }
+
+
+@app.get("/api/positioning/status")
+def get_positioning_status() -> dict[str, Any]:
+    enabled = _env_enabled("POSITIONING_DECISION_ENABLED")
+    snapshots = _positioning_items(1)
+    items = snapshots.get("items") or []
+    latest = items[0] if items else None
+    return {
+        "status": "ok" if snapshots.get("status") == "ok" else "unavailable",
+        "enabled": enabled,
+        "shadow_mode": not enabled,
+        "futures_execution": False,
+        "latest": latest,
+        "trading_halted": _persistent_trading_halt(_trading_store()),
+    }
 
 
 if __name__ == "__main__":

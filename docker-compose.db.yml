@@ -1,0 +1,21 @@
+services:
+  bian-db:
+    image: postgres:16-alpine
+    container_name: bian-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bian
+      POSTGRES_USER: bian
+      POSTGRES_PASSWORD: bian
+    ports:
+      - "127.0.0.1:5446:5432"
+    volumes:
+      - bian-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bian -d bian"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  bian-postgres-data:
