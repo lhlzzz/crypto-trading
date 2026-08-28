@@ -313,6 +313,9 @@ class FuturesPublicClient:
     def get_mark_price(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/premiumIndex", symbol=symbol.upper())
 
+    def get_ticker_price(self, symbol: str) -> dict[str, Any]:
+        return self._get(f"{self.base_url}/ticker/price", symbol=symbol.upper())
+
     def get_open_interest(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/openInterest", symbol=symbol.upper())
 

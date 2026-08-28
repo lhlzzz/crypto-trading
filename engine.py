@@ -207,6 +207,9 @@ class MarketFrame:
     ask_price: Decimal | None = None
     quote_volume: Decimal | None = None
     volume: Decimal | None = None
+    last_price: Decimal | None = None
+    mark_price: Decimal | None = None
+    index_price: Decimal | None = None
     spot_buy_volume: Decimal | None = None
     spot_sell_volume: Decimal | None = None
     net_spot_flow: Decimal | None = None
@@ -217,6 +220,7 @@ class MarketFrame:
     cvd_5m: Decimal | None = None
     cvd_15m: Decimal | None = None
     cvd_1h: Decimal | None = None
+    cvd_30m: Decimal | None = None
     cvd_acceleration: Decimal | None = None
     price_cvd_divergence: bool | None = None
     volume_ratio_1m: Decimal | None = None
@@ -225,6 +229,8 @@ class MarketFrame:
     volume_zscore: Decimal | None = None
     taker_buy_volume: Decimal | None = None
     taker_sell_volume: Decimal | None = None
+    taker_buy_volume_30m: Decimal | None = None
+    taker_sell_volume_30m: Decimal | None = None
     oi: Decimal | None = None
     oi_change: Decimal | None = None
     oi_change_1m: Decimal | None = None
@@ -232,8 +238,11 @@ class MarketFrame:
     oi_change_5m: Decimal | None = None
     oi_change_15m: Decimal | None = None
     oi_change_1h: Decimal | None = None
+    oi_change_30m: Decimal | None = None
     funding_rate: Decimal | None = None
     funding_change: Decimal | None = None
+    funding_percentile: Decimal | None = None
+    funding_zscore: Decimal | None = None
     basis_bps: Decimal | None = None
     global_long_short_ratio: Decimal | None = None
     top_trader_long_short_ratio: Decimal | None = None
@@ -281,11 +290,14 @@ class MarketFrame:
             "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow", "cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
-            "cvd_1h", "cvd_acceleration", "volume_ratio_1m",
+            "cvd_1h", "cvd_30m", "cvd_acceleration", "volume_ratio_1m",
             "volume_ratio_5m", "volume_ratio_15m", "volume_zscore",
-            "taker_buy_volume", "taker_sell_volume", "oi", "oi_change",
+            "taker_buy_volume", "taker_sell_volume",
+            "taker_buy_volume_30m", "taker_sell_volume_30m",
+            "oi", "oi_change", "last_price", "mark_price", "index_price",
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
-            "oi_change_15m", "oi_change_1h", "funding_rate", "funding_change",
+            "oi_change_15m", "oi_change_1h", "oi_change_30m",
+            "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
             "short_liquidation_notional", "long_liquidation_notional",
             "liquidation_acceleration", "bid_depth_5", "ask_depth_5",
@@ -602,11 +614,14 @@ class StrategyEngine:
             "closes", "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow", "cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
-            "cvd_1h", "cvd_acceleration", "price_cvd_divergence",
+            "cvd_1h", "cvd_30m", "cvd_acceleration", "price_cvd_divergence",
             "volume_ratio_1m", "volume_ratio_5m", "volume_ratio_15m",
-            "volume_zscore", "taker_buy_volume", "taker_sell_volume", "oi",
-            "oi_change", "oi_change_1m", "oi_change_3m", "oi_change_5m",
-            "oi_change_15m", "oi_change_1h", "funding_rate", "funding_change",
+            "volume_zscore", "taker_buy_volume", "taker_sell_volume",
+            "taker_buy_volume_30m", "taker_sell_volume_30m",
+            "oi", "oi_change", "last_price", "mark_price", "index_price",
+            "oi_change_1m", "oi_change_3m", "oi_change_5m",
+            "oi_change_15m", "oi_change_1h", "oi_change_30m",
+            "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
             "short_liquidation_notional", "long_liquidation_notional",
             "liquidation_acceleration", "bid_depth_5", "ask_depth_5",

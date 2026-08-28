@@ -1,26 +1,17 @@
 # Next Action
 
-Keep `POSITIONING_DECISION_ENABLED=false` and run the positioning observer in
-shadow mode. The observer and pure Shadow loop are active after the historical
-liquidation-freshness regression fix and the direct-script import-path repair;
-the full suite has 118 passing tests. Local order books now carry explicit
-REST snapshot provenance across diff events, and Futures public observation
-uses the existing bounded retry/backoff transport configuration.
-Breadth, relative strength, regime, deterministic replay, and research
-attribution are implemented. Multi-window flow, price impact, and native
-Futures-period observations remain covered by focused and full regression
-tests.
-Use `scripts/bian_market.py observe` for the continuing public-only data gate;
-its Tier 2 candidate limit is independent from the broader scanner limit.
-The next evidence gates are 1 hour, 6 hours, and 24 hours of public
-Spot/Futures observation, followed by seven days of fresh Shadow snapshots
-with meaningful forward-return samples. Storage measurement now reports
-observed-span daily estimates; continue sampling before setting
-`POSITIONING_RAW_RETENTION_DAYS`, and do not run raw pruning by default.
-The current replay store contains 54 frames but only four non-flat Positioning
-samples. Continue collecting before interpreting attribution or changing any
-positioning score threshold.
-Testnet remains observation-only until credentials, account lifecycle, and
-reconciliation evidence exist. The refreshed interactive Understand-Anything
-graph is served from the tokenized dashboard URL reported for the current
-session.
+Keep `POSITIONING_DECISION_ENABLED=false`. Do not add Futures private order
+methods. Continue from `d75a795`; the suite is 120 tests and green.
+
+Phase A and Phase B are complete. Next is Phase C / T36: USD-M Futures
+orderbook as production liquidity evidence.
+
+Phase C scope:
+
+1. REST snapshot plus diff using `U`/`u`/`pu`.
+2. Invalidate and resnapshot on gap.
+3. Keep Spot book as confirmation only.
+
+Restart `scripts/bian_market.py observe` after the Futures book lands so
+freshness can recover. T33 elapsed 1h/6h/24h/7-day gates remain open and
+are not skipped. Do not add Futures private order methods.

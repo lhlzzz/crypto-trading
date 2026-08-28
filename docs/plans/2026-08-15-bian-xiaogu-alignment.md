@@ -212,3 +212,121 @@ second strategy or execution path. `POSITIONING_DECISION_ENABLED` remains
   attribution against legacy SMA and simple momentum.
 - [ ] Complete seven days of fresh shadow evidence, then Paper attribution.
 - [ ] Complete Testnet lifecycle observation and explicit Live readiness review.
+
+## Meme Futures Capital Positioning V4 Addendum
+
+**Goal:** Upgrade bian from Spot-executed SMA plus Futures observation into a
+Binance USD-M Meme Futures capital-positioning trader, without a second
+engine, risk, execution, or database owner.
+**Constraints:** `POSITIONING_DECISION_ENABLED` stays `false` until shadow,
+paper, testnet, and recovery gates pass. Spot remains confirmation only.
+Futures private order submission is forbidden until Phase J+. Continue from
+`d75a795`; do not roll back the existing 118 tests.
+**Out of scope:** COIN-M, options, margin, delivery, Spot live execution, LLM
+or social-signal order placement, Freqtrade/Hummingbot/NautilusTrader, and
+parallel `engine_v2` / `futures_engine` files.
+
+## Must-Haves
+
+- MH5: Production execution market is USD-M Futures; Spot never submits
+  orders. A:I3
+- MH6: Positioning distinguishes `SHORT_COVERING` from `LONG_BUILDING` and
+  `LONG_UNWIND` from `SHORT_BUILDING`. A:I5
+- MH7: Meme universe uses allowlist/blocklist plus liquidity quality, not
+  name heuristics alone. A:I3
+- MH8: Missing or stale critical evidence yields `UNKNOWN`/`FLAT`, never a
+  synthetic direction. A:I4
+- MH9: Each phase lands with tests, compile, owner, and duplicate checks
+  before the next phase starts. A:I4
+
+### Task 34: Phase A architecture audit A:I3 A:I4 A:I5
+- [x] Map current owners, positioning semantics, Futures observation, Spot
+  execution, meme-universe absence, and missing Futures risk/execution fields.
+- [x] Confirm no parallel engine/risk/execution files exist.
+- [x] Verification: 118 tests pass; `compileall` succeeds; PostgreSQL schema
+  has no missing tables; STATE/NEXT_ACTION record the gap list.
+
+### Task 35: Phase B Futures data completeness A:I3
+- [x] Collect native Binance USD-M taker and long/short periods `5m`, `15m`,
+  `30m`, and `1h`. Do not fabricate `1m` or `3m` taker ratios.
+- [x] Persist last, mark, and index as distinct fields; keep OI percent change
+  and funding change/percentile/z-score from persisted events only.
+- [x] Verification: focused Futures observation tests cover 30m native
+  periods, distinct price fields, and absent unsupported windows.
+
+### Task 36: Phase C Futures orderbook A:I3
+- [ ] Replace production liquidity evidence with USD-M REST snapshot plus
+  diff (`U`/`u`/`pu`). Invalidate and resnapshot on gap.
+- [ ] Keep Spot book as confirmation only.
+- [ ] Verification: Futures book gap, resync, and feature tests pass; Spot
+  depth is no longer the positioning liquidity owner.
+
+### Task 37: Phase D Futures positioning features A:I5
+- [ ] Derive multi-window OI, taker, liquidation, basis, and impact features
+  from persisted Futures facts; leave missing windows absent.
+- [ ] Verification: feature tests prove no synthesis and no lookahead.
+
+### Task 38: Phase E MarketFrame alignment A:I3
+- [ ] Extend the existing `MarketFrame` with the new Futures fields, 30m
+  windows, and meme/BTC regime split. Do not create a second frame type.
+- [ ] Verification: snapshot rebuild tests include the new fields.
+
+### Task 39: Phase F positioning state machine A:I5
+- [ ] Keep canonical states only; remove `TRANSITION` as a state value.
+- [ ] Require flow confirmation for building states; keep covering/unwind
+  distinct from building.
+- [ ] Verification: existing covering/unwind tests remain; invalid state
+  literals fail.
+
+### Task 40: Phase G transition semantics A:I5
+- [ ] Make `transition_strength` a real previous-to-current state-change
+  measure, not `abs(long_score-short_score)`.
+- [ ] Carry `transition_strength` on `TradeIntent`.
+- [ ] Verification: same scores with no state change yield strength 0.
+
+### Task 41: Phase H evidence and replay
+- [ ] Treat missing critical evidence as `MISSING`, not `NEUTRAL`.
+- [ ] Replay persisted evidence to the same state, transition, scores, and
+  direction.
+- [ ] Verification: determinism and missing-evidence tests pass.
+
+### Task 42: Phase I shadow A:I4
+- [ ] Keep `POSITIONING_DECISION_ENABLED=false`. Complete 1h/6h/24h public
+  observation and 7-day shadow; this includes T33 elapsed gates.
+- [ ] Verification: elapsed evidence exists; zero TradeIntents from shadow.
+
+### Task 43: Phase J Futures paper A:I3
+- [ ] Upgrade the existing Paper executor to USD-M semantics: isolated
+  margin, conservative leverage, mark price, funding, liquidation, reduce-only.
+- [ ] Do not add a second executor class family.
+- [ ] Verification: paper futures open/reduce/close and reduce-only tests pass.
+
+### Task 44: Phase K backtest and walk-forward A:I4
+- [ ] Replay MarketFrames with cost-adjusted expectancy versus SMA, momentum,
+  and buy/hold-like baselines. Parameters come from train/validation only.
+- [ ] Verification: out-of-sample report exists; small samples are labeled
+  `INSUFFICIENT_SAMPLE`.
+
+### Task 45: Phase L Testnet Futures lifecycle A:I3
+- [ ] Use `BIAN_TESTNET_API_KEY` / `BIAN_TESTNET_API_SECRET` against USD-M
+  Testnet. Spot private create-order remains disabled for production path.
+- [ ] Verification: account, leverage, order, fill, user stream, reconcile,
+  restart evidence exists.
+
+### Task 46: Phase M failure injection
+- [ ] Inject timeout, 429, 5xx, WS disconnect, DB failure, unknown order,
+  stale OI/funding, and orderbook gap.
+- [ ] Verification: no duplicate orders, no leverage escalation, HALT on
+  unresolved state.
+
+### Task 47: Phase N production guards A:I3
+- [ ] Add `BIAN_MARKET=FUTURES`, meme universe mode, max leverage/margin,
+  liquidation buffer, and hard-block live unless all confirmation flags pass.
+- [ ] Verification: live-guard tests block incomplete combinations; API
+  remains GET-only.
+
+### Task 48: Phase O limited live A:I3 A:I4
+- [ ] Allow live only after data, shadow, paper, testnet, recovery, and risk
+  gates pass. First live: small size, low leverage, few meme symbols.
+- [ ] Verification: operator confirmation evidence exists; otherwise HARD
+  BLOCK remains.

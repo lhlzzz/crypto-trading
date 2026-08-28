@@ -492,6 +492,12 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "quantity": "100",
             },
             {
+                "event_id": "oi-30", "event_type": "OPEN_INTEREST",
+                "event_timestamp": "2026-08-26T11:40:00+00:00",
+                "received_timestamp": "2026-08-26T11:40:01+00:00",
+                "quantity": "100",
+            },
+            {
                 "event_id": "oi-5", "event_type": "OPEN_INTEREST",
                 "event_timestamp": "2026-08-26T12:05:00+00:00",
                 "received_timestamp": "2026-08-26T12:05:01+00:00",
@@ -546,6 +552,8 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertEqual(features["price_impact_buy"], Decimal("0"))
         self.assertEqual(features["oi_change_5m"], Decimal("0.1"))
         self.assertEqual(features["oi_change"], Decimal("0.1"))
+        self.assertEqual(features["oi_change_30m"], Decimal("0.21"))
+        self.assertGreater(features["cvd_30m"], features["cvd_5m"])
         self.assertEqual(features["liquidity_added"], Decimal("5"))
         self.assertEqual(features["liquidity_removed"], Decimal("1"))
         self.assertEqual(features["global_long_short_ratio"], Decimal("1.2"))
@@ -556,6 +564,10 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             def get_mark_price(self, symbol: str):
                 self.assert_symbol(symbol)
                 return {"markPrice": "101", "indexPrice": "100", "time": 2_000}
+
+            def get_ticker_price(self, symbol: str):
+                self.assert_symbol(symbol)
+                return {"symbol": symbol, "price": "99.5", "time": 2_000}
 
             def get_open_interest(self, symbol: str):
                 self.assert_symbol(symbol)
@@ -595,9 +607,84 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "TAKER_FLOW", "GLOBAL_LONG_SHORT", "TOP_TRADER_LONG_SHORT",
             }
         ]
-        self.assertEqual(len(report["events"]), 12)
-        self.assertEqual({event["metadata"]["observationPeriod"] for event in period_events}, {"5m", "15m", "1h"})
+        self.assertEqual(len(report["events"]), 16)
+        self.assertEqual(
+            {event["metadata"]["observationPeriod"] for event in period_events},
+            {"5m", "15m", "30m", "1h"},
+        )
+        last_event = next(event for event in report["events"] if event["event_type"] == "LAST_PRICE")
+        mark_event = next(
+            event for event in report["events"] if event["event_type"] == "MARK_INDEX_FUNDING"
+        )
+        self.assertEqual(last_event["price"], "99.5")
+        self.assertEqual(mark_event["metadata"]["markPrice"], "101")
+        self.assertEqual(mark_event["metadata"]["indexPrice"], "100")
+        self.assertNotEqual(last_event["price"], mark_event["metadata"]["markPrice"])
         self.assertEqual(len({event["event_id"] for event in report["events"]}), len(report["events"]))
+
+    def test_positioning_features_keep_last_mark_index_distinct_and_omit_synthetic_taker(self):
+        as_of = datetime(2026, 8, 26, 12, 10, tzinfo=timezone.utc)
+        events = [
+            {
+                "event_id": "last", "event_type": "LAST_PRICE",
+                "event_timestamp": "2026-08-26T12:10:00+00:00",
+                "received_timestamp": "2026-08-26T12:10:00+00:00",
+                "price": "99.5",
+                "metadata": {"price": "99.5"},
+            },
+            {
+                "event_id": "mark", "event_type": "MARK_INDEX_FUNDING",
+                "event_timestamp": "2026-08-26T12:10:00+00:00",
+                "received_timestamp": "2026-08-26T12:10:00+00:00",
+                "metadata": {"markPrice": "101", "indexPrice": "100", "lastFundingRate": "0.0001"},
+            },
+            {
+                "event_id": "taker-5m", "event_type": "TAKER_FLOW",
+                "event_timestamp": "2026-08-26T12:10:00+00:00",
+                "received_timestamp": "2026-08-26T12:10:00+00:00",
+                "metadata": {"observationPeriod": "5m", "buyVol": "9", "sellVol": "4"},
+            },
+            {
+                "event_id": "taker-30m", "event_type": "TAKER_FLOW",
+                "event_timestamp": "2026-08-26T12:10:00+00:00",
+                "received_timestamp": "2026-08-26T12:10:00+00:00",
+                "metadata": {"observationPeriod": "30m", "buyVol": "40", "sellVol": "21"},
+            },
+        ]
+        features = bian_market.positioning_feature_values(events, as_of=as_of)
+        self.assertEqual(features["last_price"], Decimal("99.5"))
+        self.assertEqual(features["mark_price"], Decimal("101"))
+        self.assertEqual(features["index_price"], Decimal("100"))
+        self.assertNotEqual(features["last_price"], features["mark_price"])
+        self.assertEqual(features["taker_buy_volume"], Decimal("9"))
+        self.assertEqual(features["taker_buy_volume_30m"], Decimal("40"))
+        self.assertNotIn("taker_buy_volume_1m", features)
+        self.assertNotIn("taker_buy_volume_3m", features)
+
+    def test_funding_stats_stay_absent_until_enough_persisted_samples(self):
+        as_of = datetime(2026, 8, 26, 12, 10, tzinfo=timezone.utc)
+
+        def funding(index: int, rate: str):
+            event_at = as_of - timedelta(hours=8 * (7 - index))
+            return {
+                "event_id": f"fund-{index}", "event_type": "FUNDING",
+                "event_timestamp": event_at.isoformat(),
+                "received_timestamp": event_at.isoformat(),
+                "metadata": {"fundingRate": rate},
+            }
+
+        short = bian_market.positioning_feature_values(
+            [funding(index, "0.0001") for index in range(7)], as_of=as_of
+        )
+        self.assertIsNone(short["funding_percentile"])
+        self.assertIsNone(short["funding_zscore"])
+
+        rates = ["0.0001", "0.0002", "0.0003", "0.0004", "0.0005", "0.0006", "0.0007", "0.0008"]
+        full = bian_market.positioning_feature_values(
+            [funding(index, rate) for index, rate in enumerate(rates)], as_of=as_of
+        )
+        self.assertEqual(full["funding_percentile"], Decimal("1"))
+        self.assertGreater(full["funding_zscore"], Decimal("0"))
 
     def test_local_order_book_requires_contiguous_updates(self):
         book = bian_market.LocalOrderBook.from_snapshot(

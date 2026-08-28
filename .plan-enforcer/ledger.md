@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 33 total  |  0 done  |  32 verified  |  0 skipped  |  0 blocked  |  1 remaining
- Drift: 2  |  Last reconcile: T27-T33 |  Tier: structural
+ 48 total  |  0 done  |  34 verified  |  0 skipped  |  0 blocked  |  14 remaining
+ Drift: 3  |  Last reconcile: T35 |  Tier: structural
 
 ## Task Ledger
 
@@ -44,6 +44,21 @@
 | T31 | Assemble timestamp-aligned MarketFrame | verified | real frame and provenance | D11,V27 | Raw events stay out of engine |
 | T32 | Run positioning in shadow mode | verified | API snapshot; no signal | D11,V27 | Legacy remains execution owner |
 | T33 | Complete research and elapsed-time gates | pending | 104 tests; observer/Shadow restart and zero-order audit | D11,V28,V29,V30 | Duration, 7-day Shadow, Testnet remain |
+| T34 | Phase A meme-futures architecture audit | verified | 118 tests; schema ok; compile ok | D12,A:I3,A:I4,A:I5,V31 | Owners intact; execution still Spot |
+| T35 | Phase B Futures data completeness | verified | 120 tests; live 30m taker | D12,A:I3,V32 | No private Futures orders |
+| T36 | Phase C Futures orderbook | pending |  | D12 | USD-M snapshot+diff; Spot book confirmation |
+| T37 | Phase D Futures positioning features | pending |  | D12 | No synthesized windows |
+| T38 | Phase E MarketFrame alignment | pending |  | D12 | Extend existing frame only |
+| T39 | Phase F positioning state machine | pending |  | D12,A:I5 | Remove TRANSITION state |
+| T40 | Phase G transition semantics | pending |  | D12,A:I5 | Strength is state change |
+| T41 | Phase H evidence and replay | pending |  | D12 | MISSING != NEUTRAL |
+| T42 | Phase I shadow duration gates | pending |  | D12,D13 | Includes T33 elapsed gates |
+| T43 | Phase J Futures paper | pending |  | D12,A:I3 | Upgrade existing executor |
+| T44 | Phase K backtest/walk-forward | pending |  | D12 | Net expectancy, OOS only |
+| T45 | Phase L Testnet Futures lifecycle | pending |  | D12,A:I3 | Separate testnet secrets |
+| T46 | Phase M failure injection | pending |  | D12 | HALT on unresolved state |
+| T47 | Phase N production guards | pending |  | D12,A:I3 | BIAN_MARKET=FUTURES |
+| T48 | Phase O limited live | pending |  | D12 | Hard block until gates pass |
 
 ## Decision Log
 
@@ -60,6 +75,8 @@
 | D9 | T21 | Keep test-only signal injection in paper_runner.py | It is validation control, not strategy logic or execution |
 | D10 | T24 | Require mode-specific Testnet/Live credential names | Shared credentials cannot prove environment isolation |
 | D11 | T27-T32 | Keep Positioning fail-closed and shadow-only | Data is incomplete until runtime gates pass |
+| D12 | T34-T48 | Continue from d75a795; no rollback | User locked Meme Futures production constraints |
+| D13 | T33,T42 | Do not skip elapsed-time gates | 1h/6h/24h/7d remain required evidence |
 
 ## Reconciliation History
 
@@ -72,6 +89,8 @@
 | R11 | T27-T33 | 1 | Feature smoke passed; elapsed gates remain |
 | R12 | T27-T33 | 1 | Observer validated; elapsed gates remain |
 | R13 | T27-T33 | 1 | Regression test, 104-test suite, restart, zero-order audit, and 358/528 graph refresh passed; elapsed gates remain |
+| R14 | T1-T48 | 15 | T34 verified; T33 elapsed gates remain; T35-T48 pending; no duplicate owners |
+| R15 | T1-T48 | 14 | T35 verified; native 30m + distinct last/mark/index; T33 remains |
 
 ## Reconciliation History
 

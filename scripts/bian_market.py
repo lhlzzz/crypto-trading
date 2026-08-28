@@ -235,8 +235,10 @@ def aggregate_trade_flow(
 
 
 FLOW_WINDOWS: tuple[tuple[str, int], ...] = (
-    ("1m", 60), ("3m", 180), ("5m", 300), ("15m", 900), ("1h", 3600),
+    ("1m", 60), ("3m", 180), ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
 )
+NATIVE_FUTURES_PERIODS: tuple[str, ...] = ("5m", "15m", "30m", "1h")
+FUNDING_STATS_MIN_SAMPLES = 8
 
 
 def _window_events(
@@ -354,6 +356,19 @@ def _window_relative_change(
 
 def _first_not_none(*values: Decimal | None) -> Decimal | None:
     return next((value for value in values if value is not None), None)
+
+
+def _rolling_funding_stats(rates: list[Decimal]) -> tuple[Decimal | None, Decimal | None]:
+    """Percentile and z-score from persisted funding only; small samples stay absent."""
+    if len(rates) < FUNDING_STATS_MIN_SAMPLES:
+        return None, None
+    current = rates[-1]
+    percentile = Decimal(sum(rate <= current for rate in rates)) / Decimal(len(rates))
+    mean = sum(rates, Decimal("0")) / Decimal(len(rates))
+    variance = sum((rate - mean) ** 2 for rate in rates) / Decimal(len(rates))
+    if variance == 0:
+        return percentile, Decimal("0")
+    return percentile, (current - mean) / variance.sqrt()
 
 
 def positioning_feature_values(
@@ -500,6 +515,19 @@ def positioning_feature_values(
     taker_event = latest("TAKER_FLOW")
     taker_5m_event = latest_period("TAKER_FLOW", "5m") or taker_event
     funding_event = latest("FUNDING")
+    last_event = latest("LAST_PRICE")
+    taker_30m_event = latest_period("TAKER_FLOW", "30m")
+    mark_funding_rates = [
+        rate for event in by_type.get("MARK_INDEX_FUNDING", [])
+        if (rate := decimal_metadata(event, "lastFundingRate")) is not None
+    ]
+    settlement_funding_rates = [
+        rate for event in by_type.get("FUNDING", [])
+        if (rate := decimal_metadata(event, "fundingRate")) is not None
+    ]
+    funding_percentile, funding_zscore = _rolling_funding_stats(
+        mark_funding_rates or settlement_funding_rates
+    )
     global_long_short_event = latest_period("GLOBAL_LONG_SHORT", "5m") or latest("GLOBAL_LONG_SHORT")
     top_trader_long_short_event = latest_period("TOP_TRADER_LONG_SHORT", "5m") or latest("TOP_TRADER_LONG_SHORT")
     book_event = latest("BOOK_TICKER")
@@ -548,6 +576,7 @@ def positioning_feature_values(
         "spot_book_ticker": book_event,
         "spot_orderbook": orderbook_event,
         "futures_mark_index": mark_event,
+        "futures_last_price": latest("LAST_PRICE"),
         # Liquidations are sparse. A historical force order outside the
         # current aggregation window is not proof that the source is stale;
         # it contributes no current liquidation evidence and must not poison
@@ -575,6 +604,7 @@ def positioning_feature_values(
         "cvd_3m": cvd_windows["3m"],
         "cvd_5m": cvd_5m,
         "cvd_15m": cvd_windows["15m"],
+        "cvd_30m": cvd_windows["30m"],
         "cvd_1h": cvd_windows["1h"],
         "cvd_acceleration": cvd_acceleration,
         "price_cvd_divergence": price_cvd_divergence,
@@ -582,6 +612,12 @@ def positioning_feature_values(
         "volume_ratio_5m": volume_ratio_5m,
         "volume_ratio_15m": volume_ratio_15m,
         "volume_zscore": volume_zscore,
+        "last_price": _first_not_none(
+            _decimal(last_event.get("price")) if last_event else None,
+            decimal_metadata(last_event, "price"),
+        ),
+        "mark_price": decimal_metadata(mark_event, "markPrice"),
+        "index_price": decimal_metadata(mark_event, "indexPrice"),
         "oi": oi_value,
         "oi_change": _first_not_none(oi_change(300), latest_change(
             "OPEN_INTEREST", lambda event: _decimal(event.get("quantity"))
@@ -591,6 +627,7 @@ def positioning_feature_values(
         "oi_change_5m": oi_change(300),
         "oi_change_15m": oi_change(900),
         "oi_change_1h": oi_change(3600),
+        "oi_change_30m": oi_change(1800),
         "funding_rate": _first_not_none(
             decimal_metadata(mark_event, "lastFundingRate"),
             decimal_metadata(funding_event, "fundingRate"),
@@ -604,9 +641,13 @@ def positioning_feature_values(
                 "FUNDING", lambda event: decimal_metadata(event, "fundingRate")
             ),
         ),
+        "funding_percentile": funding_percentile,
+        "funding_zscore": funding_zscore,
         "basis_bps": decimal_metadata(mark_event, "basisBps"),
         "taker_buy_volume": decimal_metadata(taker_5m_event, "buyVol"),
         "taker_sell_volume": decimal_metadata(taker_5m_event, "sellVol"),
+        "taker_buy_volume_30m": decimal_metadata(taker_30m_event, "buyVol"),
+        "taker_sell_volume_30m": decimal_metadata(taker_30m_event, "sellVol"),
         "global_long_short_ratio": decimal_metadata(global_long_short_event, "longShortRatio"),
         "top_trader_long_short_ratio": decimal_metadata(top_trader_long_short_event, "longShortRatio"),
         "bid_price": _decimal(book_meta.get("bidPrice")),
@@ -1096,7 +1137,7 @@ def collect_futures_observations(
                 "source_timestamp": source.isoformat(),
                 "received_timestamp": received.isoformat(),
                 "latency_ms": _latency_ms(source, received),
-                "price": normalized_payload.get("markPrice"),
+                "price": normalized_payload.get("markPrice") or normalized_payload.get("price"),
                 "quantity": normalized_payload.get("openInterest"),
                 "direction": None,
                 "metadata": normalized_payload,
@@ -1115,6 +1156,8 @@ def collect_futures_observations(
                 "basisBps": str((mark_price - index_price) / index_price * Decimal("10000")),
             }
         append(symbol, "MARK_INDEX_FUNDING", mark, mark.get("time"))
+        ticker = client.get_ticker_price(symbol)
+        append(symbol, "LAST_PRICE", ticker, ticker.get("time"))
         oi = client.get_open_interest(symbol)
         append(symbol, "OPEN_INTEREST", oi, oi.get("time"))
         funding_rows = client.get_funding_rate(symbol, limit=2)
@@ -1128,7 +1171,7 @@ def collect_futures_observations(
             )
         # Binance publishes these aggregate observations on fixed windows.
         # Preserve the native window instead of fabricating unavailable 1m/3m data.
-        for period in ("5m", "15m", "1h"):
+        for period in NATIVE_FUTURES_PERIODS:
             for event_type, rows in (
                 ("TAKER_FLOW", client.get_taker_buy_sell(symbol, period=period, limit=2)),
                 ("GLOBAL_LONG_SHORT", client.get_global_long_short_ratio(symbol, period=period, limit=2)),
