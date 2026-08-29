@@ -4,8 +4,11 @@ from __future__ import annotations
 import os
 import time
 import json
+import hmac
+import hashlib
 import urllib.parse
 import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
@@ -24,8 +27,6 @@ from binance_sdk_spot import (
 )
 from binance_sdk_spot.rest_api.models import (
     KlinesIntervalEnum,
-    NewOrderSideEnum,
-    NewOrderTypeEnum,
 )
 
 
@@ -128,13 +129,24 @@ def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
         if operation in {"create_order", "cancel_order"}:
             return BinanceOrderError(f"{operation} rejected: {message}")
         return BinanceAPIError(f"{operation} failed: {message}")
+    if isinstance(exc, urllib.error.HTTPError):
+        code = int(exc.code)
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            detail = str(exc)
+        if code in {401, 403}:
+            return BinanceAuthError(f"{operation} authentication failed")
+        if code == 429:
+            return BinanceRateLimitError(f"{operation} rate limited")
+        if code >= 500:
+            return BinanceConnectionError(f"{operation} connection failure")
+        if operation in {"create_order", "cancel_order", "cancel_all_orders"}:
+            return BinanceOrderError(f"{operation} rejected: {detail}")
+        return BinanceAPIError(f"{operation} failed: {detail}")
     if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
         return BinanceConnectionError(f"{operation} connection failure")
     return BinanceAPIError(f"{operation} failed: {exc}")
-
-
-def _decimal_value(value: Decimal | str | float | int | None) -> float | None:
-    return float(value) if value is not None else None
 
 
 def _model_dict(value: Any) -> Any:
@@ -163,9 +175,7 @@ def _configuration(config: ClientConfig, *, private: bool) -> ConfigurationRestA
             f"credentials are required for BIAN_MODE={config.mode}"
         )
     base_path = (
-        "https://testnet.binance.vision"
-        if config.mode == "testnet"
-        else "https://api.binance.com"
+        "https://api.binance.com"
     )
     return ConfigurationRestAPI(
         api_key=config.api_key if private else None,
@@ -177,8 +187,64 @@ def _configuration(config: ClientConfig, *, private: bool) -> ConfigurationRestA
     )
 
 
-class PublicClient:
-    """Unauthenticated public market-data adapter."""
+FUTURES_LIVE_REST = "https://fapi.binance.com"
+FUTURES_TESTNET_REST = "https://testnet.binancefuture.com"
+
+
+def _futures_rest_host(config: ClientConfig) -> str:
+    return FUTURES_TESTNET_REST if config.mode == "testnet" else FUTURES_LIVE_REST
+
+
+def _signed_query(secret: str, params: dict[str, Any]) -> str:
+    payload = {key: value for key, value in params.items() if value is not None}
+    payload["timestamp"] = int(time.time() * 1000)
+    payload["recvWindow"] = 5000
+    query = urllib.parse.urlencode(payload)
+    signature = hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{query}&signature={signature}"
+
+
+def _futures_request(
+    config: ClientConfig,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    signed: bool = False,
+    operation: str,
+) -> Any:
+    query_params = dict(params or {})
+    headers = {"Accept": "application/json", "User-Agent": "bian-futures-adapter/1.0"}
+    if signed:
+        if not config.api_key or not config.api_secret:
+            raise BinanceAuthError(f"credentials are required for BIAN_MODE={config.mode}")
+        headers["X-MBX-APIKEY"] = config.api_key
+        query = _signed_query(config.api_secret, query_params)
+    else:
+        query = urllib.parse.urlencode(
+            {key: value for key, value in query_params.items() if value is not None}
+        )
+    url = f"{_futures_rest_host(config)}{path}"
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(url, method=method.upper(), headers=headers)
+    for attempt in range(config.retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=config.timeout_ms / 1000) as response:
+                return json.loads(response.read().decode("utf-8") or "null")
+        except Exception as exc:
+            translated = _translate_error(exc, operation=operation)
+            retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
+            if not retryable or attempt >= config.retries:
+                raise translated from exc
+            delay_sec = config.backoff_ms / 1000 * (2 ** attempt)
+            if delay_sec:
+                time.sleep(delay_sec)
+    raise AssertionError("Futures request retry loop must return or raise")
+
+
+class SpotPublicClient:
+    """Read-only Spot public market-data adapter. It has no order methods."""
 
     def __init__(self, config: ClientConfig | None = None) -> None:
         self.config = config or ClientConfig.from_env()
@@ -270,6 +336,9 @@ class PublicClient:
         }
 
 
+PublicClient = SpotPublicClient
+
+
 class FuturesPublicClient:
     """Public USD-M Futures observation adapter; it has no order methods."""
 
@@ -343,14 +412,14 @@ class FuturesPublicClient:
         )
 
 
-class PrivateClient:
-    """Authenticated account/order adapter for Testnet or explicitly enabled Live."""
+class FuturesPrivateClient:
+    """Authenticated USD-M Futures adapter. Paper cannot construct it."""
 
     def __init__(self, config: ClientConfig | None = None) -> None:
         self.config = config or ClientConfig.from_env()
         if self.config.mode == "paper":
             raise BinanceAuthError(
-                "PrivateClient cannot be created in paper mode; use execution.py"
+                "FuturesPrivateClient cannot be created in paper mode; use execution.py"
             )
         if self.config.mode == "live" and not self.config.live_trading_enabled:
             raise BinanceAuthError(
@@ -360,20 +429,71 @@ class PrivateClient:
             raise BinanceAuthError(
                 "live mode requires LIVE_CONFIRMATION_TOKEN"
             )
-        self._client = Spot(config_rest_api=_configuration(self.config, private=True))
+        if not self.config.api_key or not self.config.api_secret:
+            raise BinanceAuthError(
+                f"credentials are required for BIAN_MODE={self.config.mode}"
+            )
+
+    def _signed(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        return _futures_request(
+            self.config,
+            method,
+            path,
+            params=params,
+            signed=True,
+            operation=operation,
+        )
 
     def get_account(self) -> dict[str, Any]:
-        return _call("get_account", lambda: self._client.rest_api.get_account())
+        return self._signed("GET", "/fapi/v2/account", operation="get_account")
 
     def get_balance(self, asset: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
         account = self.get_account()
-        balances = account.get("balances", [])
+        balances = account.get("assets") or account.get("balances") or []
         if asset is None:
             return balances
+        wanted = asset.upper()
         return next(
-            (row for row in balances if row.get("asset") == asset.upper()),
-            {"asset": asset.upper(), "free": "0", "locked": "0"},
+            (row for row in balances if str(row.get("asset", "")).upper() == wanted),
+            {"asset": wanted, "walletBalance": "0", "availableBalance": "0"},
         )
+
+    def get_position_risk(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        payload = self._signed(
+            "GET",
+            "/fapi/v2/positionRisk",
+            operation="get_position_risk",
+            params={"symbol": symbol.upper() if symbol else None},
+        )
+        return payload if isinstance(payload, list) else [payload]
+
+    def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        return [
+            row for row in self.get_position_risk(symbol)
+            if Decimal(str(row.get("positionAmt") or "0")) != 0
+        ]
+
+    def get_position_mode(self) -> dict[str, Any]:
+        return self._signed("GET", "/fapi/v1/positionSide/dual", operation="get_position_mode")
+
+    def get_leverage(self, symbol: str) -> dict[str, Any]:
+        rows = self.get_position_risk(symbol)
+        if not rows:
+            raise BinanceAPIError(f"no position risk for {symbol}")
+        return {"symbol": symbol.upper(), "leverage": rows[0].get("leverage")}
+
+    def get_margin_type(self, symbol: str) -> dict[str, Any]:
+        rows = self.get_position_risk(symbol)
+        if not rows:
+            raise BinanceAPIError(f"no position risk for {symbol}")
+        return {"symbol": symbol.upper(), "marginType": rows[0].get("marginType")}
 
     def create_order(
         self,
@@ -381,27 +501,38 @@ class PrivateClient:
         side: str,
         order_type: str,
         quantity: Decimal | str | float | int | None = None,
-        quote_order_qty: Decimal | str | float | int | None = None,
         price: Decimal | str | float | int | None = None,
         client_order_id: str | None = None,
+        *,
+        reduce_only: bool = False,
+        position_side: str | None = None,
+        time_in_force: str | None = None,
     ) -> dict[str, Any]:
-        try:
-            side_enum = NewOrderSideEnum(side.upper())
-            type_enum = NewOrderTypeEnum(order_type.upper())
-        except ValueError as exc:
-            raise ValueError("unsupported Binance order side or type") from exc
-        return _call(
-            "create_order",
-            lambda: self._client.rest_api.new_order(
-                symbol=symbol,
-                side=side_enum,
-                type=type_enum,
-                quantity=_decimal_value(quantity),
-                quote_order_qty=_decimal_value(quote_order_qty),
-                price=_decimal_value(price),
-                new_client_order_id=client_order_id,
-            ),
-        )
+        normalized_side = side.upper().strip()
+        normalized_type = order_type.upper().strip()
+        if normalized_side not in {"BUY", "SELL"}:
+            raise ValueError("unsupported Binance order side")
+        if normalized_type not in {"MARKET", "LIMIT"}:
+            raise ValueError("unsupported Binance order type")
+        if quantity is None:
+            raise ValueError("Futures orders require quantity")
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "side": normalized_side,
+            "type": normalized_type,
+            "quantity": str(quantity),
+            "newClientOrderId": client_order_id,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if position_side:
+            params["positionSide"] = position_side.upper()
+        if normalized_type == "LIMIT":
+            if price is None:
+                raise ValueError("LIMIT intents require price")
+            params["price"] = str(price)
+            params["timeInForce"] = (time_in_force or "GTC").upper()
+        return self._signed("POST", "/fapi/v1/order", operation="create_order", params=params)
 
     def cancel_order(
         self,
@@ -409,13 +540,23 @@ class PrivateClient:
         order_id: int | str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(
-            "cancel_order",
-            lambda: self._client.rest_api.delete_order(
-                symbol=symbol,
-                order_id=int(order_id) if order_id is not None else None,
-                orig_client_order_id=client_order_id,
-            ),
+        return self._signed(
+            "DELETE",
+            "/fapi/v1/order",
+            operation="cancel_order",
+            params={
+                "symbol": symbol.upper(),
+                "orderId": int(order_id) if order_id is not None else None,
+                "origClientOrderId": client_order_id,
+            },
+        )
+
+    def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
+        return self._signed(
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            operation="cancel_all_orders",
+            params={"symbol": symbol.upper()},
         )
 
     def get_order(
@@ -424,20 +565,25 @@ class PrivateClient:
         order_id: int | str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(
-            "get_order",
-            lambda: self._client.rest_api.get_order(
-                symbol=symbol,
-                order_id=int(order_id) if order_id is not None else None,
-                orig_client_order_id=client_order_id,
-            ),
+        return self._signed(
+            "GET",
+            "/fapi/v1/order",
+            operation="get_order",
+            params={
+                "symbol": symbol.upper(),
+                "orderId": int(order_id) if order_id is not None else None,
+                "origClientOrderId": client_order_id,
+            },
         )
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        return _call(
-            "get_open_orders",
-            lambda: self._client.rest_api.get_open_orders(symbol=symbol),
+        payload = self._signed(
+            "GET",
+            "/fapi/v1/openOrders",
+            operation="get_open_orders",
+            params={"symbol": symbol.upper() if symbol else None},
         )
+        return payload if isinstance(payload, list) else [payload]
 
     def get_all_orders(
         self,
@@ -445,17 +591,50 @@ class PrivateClient:
         order_id: int | str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        return _call(
-            "get_all_orders",
-            lambda: self._client.rest_api.all_orders(
-                symbol=symbol,
-                order_id=int(order_id) if order_id is not None else None,
-                limit=limit,
-            ),
+        payload = self._signed(
+            "GET",
+            "/fapi/v1/allOrders",
+            operation="get_all_orders",
+            params={
+                "symbol": symbol.upper(),
+                "orderId": int(order_id) if order_id is not None else None,
+                "limit": limit,
+            },
         )
+        return payload if isinstance(payload, list) else [payload]
 
-    def get_my_trades(self, symbol: str, limit: int | None = None) -> list[dict[str, Any]]:
-        return _call(
-            "get_my_trades",
-            lambda: self._client.rest_api.my_trades(symbol=symbol, limit=limit),
+    def get_user_trades(self, symbol: str, limit: int | None = None) -> list[dict[str, Any]]:
+        payload = self._signed(
+            "GET",
+            "/fapi/v1/userTrades",
+            operation="get_user_trades",
+            params={"symbol": symbol.upper(), "limit": limit},
+        )
+        return payload if isinstance(payload, list) else [payload]
+
+    def get_income_history(
+        self,
+        symbol: str | None = None,
+        income_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = self._signed(
+            "GET",
+            "/fapi/v1/income",
+            operation="get_income_history",
+            params={
+                "symbol": symbol.upper() if symbol else None,
+                "incomeType": income_type,
+                "limit": limit,
+            },
+        )
+        return payload if isinstance(payload, list) else [payload]
+
+
+class PrivateClient:
+    """Removed Spot private execution. Production orders use FuturesPrivateClient."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise BinanceAuthError(
+            "Spot private execution is removed; use FuturesPrivateClient"
         )

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import io
+import urllib.error
+import urllib.parse
 from unittest.mock import MagicMock, patch
 
 import pytest
-from binance_sdk_spot import BadRequestError
-from binance_sdk_spot.rest_api.models import NewOrderSideEnum, NewOrderTypeEnum
+from binance_sdk_spot import NetworkError, ServerError, TooManyRequestsError
 
 from binance_client import (
     BinanceAuthError,
@@ -12,12 +16,12 @@ from binance_client import (
     BinanceOrderError,
     BinanceRateLimitError,
     ClientConfig,
+    FuturesPrivateClient,
     FuturesPublicClient,
     PrivateClient,
     PublicClient,
     _translate_error,
 )
-from binance_sdk_spot import NetworkError, ServerError, TooManyRequestsError
 
 
 def test_public_client_uses_public_sdk_without_credentials() -> None:
@@ -59,7 +63,7 @@ def test_futures_public_client_retries_transient_timeout() -> None:
 
 def test_private_client_is_hard_blocked_in_paper_mode() -> None:
     with pytest.raises(BinanceAuthError, match="paper mode"):
-        PrivateClient(ClientConfig(mode="paper"))
+        FuturesPrivateClient(ClientConfig(mode="paper"))
 
 
 def test_private_live_client_requires_explicit_enable() -> None:
@@ -70,7 +74,7 @@ def test_private_live_client_requires_explicit_enable() -> None:
         live_trading_enabled=False,
     )
     with pytest.raises(BinanceAuthError, match="LIVE_TRADING_ENABLED"):
-        PrivateClient(config)
+        FuturesPrivateClient(config)
 
 
 def test_private_live_client_requires_confirmation_token() -> None:
@@ -81,7 +85,14 @@ def test_private_live_client_requires_confirmation_token() -> None:
         live_trading_enabled=True,
     )
     with pytest.raises(BinanceAuthError, match="LIVE_CONFIRMATION_TOKEN"):
-        PrivateClient(config)
+        FuturesPrivateClient(config)
+
+
+def test_spot_private_client_is_removed() -> None:
+    with pytest.raises(BinanceAuthError, match="Spot private execution is removed"):
+        PrivateClient(
+            ClientConfig(mode="testnet", api_key="key", api_secret="secret")
+        )
 
 
 def test_environment_credentials_are_mode_specific(monkeypatch) -> None:
@@ -106,18 +117,17 @@ def test_environment_credentials_are_mode_specific(monkeypatch) -> None:
 
 
 def test_private_testnet_create_order_preserves_client_order_id() -> None:
-    with patch("binance_client.Spot") as spot:
-        response = MagicMock()
-        response.data.return_value = {"orderId": 1}
-        spot.return_value.rest_api.new_order.return_value = response
-        client = PrivateClient(
-            ClientConfig(
-                mode="testnet",
-                api_key="key",
-                api_secret="secret",
-            )
-        )
-        client.create_order(
+    response = MagicMock()
+    response.read.return_value = b'{"orderId":1,"status":"NEW"}'
+    response.__enter__.return_value = response
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret")
+    )
+
+    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen, patch(
+        "binance_client.time.time", return_value=1_700_000_000
+    ):
+        payload = client.create_order(
             "BTCUSDT",
             "buy",
             "limit",
@@ -126,33 +136,81 @@ def test_private_testnet_create_order_preserves_client_order_id() -> None:
             client_order_id="BIAN-20260825-BTC-000001",
         )
 
-    config = spot.call_args.kwargs["config_rest_api"]
-    assert config.api_key == "key"
-    assert config.api_secret == "secret"
-    assert config.base_path == "https://testnet.binance.vision"
-    spot.return_value.rest_api.new_order.assert_called_once_with(
-        symbol="BTCUSDT",
-        side=NewOrderSideEnum.BUY,
-        type=NewOrderTypeEnum.LIMIT,
-        quantity=0.01,
-        quote_order_qty=None,
-        price=100.0,
-        new_client_order_id="BIAN-20260825-BTC-000001",
-    )
+    request = urlopen.call_args.args[0]
+    parsed = urllib.parse.urlparse(request.full_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    unsigned, _, signature = parsed.query.rpartition("&signature=")
+    expected = hmac.new(b"secret", unsigned.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {key.lower(): value for key, value in request.header_items()}
+
+    assert payload == {"orderId": 1, "status": "NEW"}
+    assert request.get_method() == "POST"
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "testnet.binancefuture.com"
+    assert parsed.path == "/fapi/v1/order"
+    assert "testnet.binance.vision" not in request.full_url
+    assert query["symbol"] == ["BTCUSDT"]
+    assert query["side"] == ["BUY"]
+    assert query["type"] == ["LIMIT"]
+    assert query["quantity"] == ["0.01"]
+    assert query["price"] == ["100.00"]
+    assert query["timeInForce"] == ["GTC"]
+    assert query["newClientOrderId"] == ["BIAN-20260825-BTC-000001"]
+    assert "quoteOrderQty" not in query
+    assert "reduceOnly" not in query
+    assert signature == expected
+    assert headers["x-mbx-apikey"] == "key"
 
 
 def test_order_client_error_is_translated() -> None:
-    with patch("binance_client.Spot") as spot:
-        client = PrivateClient(
-            ClientConfig(mode="testnet", api_key="key", api_secret="secret")
-        )
-        spot.return_value.rest_api.new_order.side_effect = BadRequestError(
-            "Filter failure",
-            400,
-        )
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=0)
+    )
+    error = urllib.error.HTTPError(
+        "https://testnet.binancefuture.com/fapi/v1/order",
+        400,
+        "Bad Request",
+        hdrs=None,
+        fp=io.BytesIO(b'{"code":-1111,"msg":"Filter failure"}'),
+    )
 
-        with pytest.raises(BinanceOrderError):
+    with patch("binance_client.urllib.request.urlopen", side_effect=error):
+        with pytest.raises(BinanceOrderError, match="Filter failure"):
             client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
+
+
+def test_futures_private_create_order_requires_quantity() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret")
+    )
+    with pytest.raises(ValueError, match="quantity"):
+        client.create_order("BTCUSDT", "BUY", "MARKET")
+
+
+def test_futures_private_live_order_uses_production_host() -> None:
+    response = MagicMock()
+    response.read.return_value = b'{"orderId":2}'
+    response.__enter__.return_value = response
+    client = FuturesPrivateClient(
+        ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="confirm",
+        )
+    )
+
+    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen:
+        client.create_order("BTCUSDT", "SELL", "MARKET", quantity="0.01", reduce_only=True)
+
+    request = urlopen.call_args.args[0]
+    parsed = urllib.parse.urlparse(request.full_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    assert parsed.netloc == "fapi.binance.com"
+    assert query["side"] == ["SELL"]
+    assert query["reduceOnly"] == ["true"]
+    assert "quoteOrderQty" not in query
 
 
 @pytest.mark.parametrize(
@@ -164,6 +222,16 @@ def test_order_client_error_is_translated() -> None:
         (NetworkError("network"), BinanceConnectionError),
         (ServerError("server", 503), BinanceConnectionError),
         (TooManyRequestsError("rate limit", 429), BinanceRateLimitError),
+        (
+            urllib.error.HTTPError(
+                "https://fapi.binance.com/fapi/v1/order",
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(b"Filter failure"),
+            ),
+            BinanceOrderError,
+        ),
     ],
 )
 def test_transport_failures_use_unified_adapter_errors(source, translated) -> None:

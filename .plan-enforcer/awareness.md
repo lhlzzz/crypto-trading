@@ -16,6 +16,7 @@
 | I3 | Futures 是唯一生产交易执行市场。 | manual | 2026-08-28 |
 | I4 | DO NOT IMPLEMENT EVERYTHING BLINDLY IN ONE PASS. | manual | 2026-08-28 |
 | I5 | SHORT_COVERING 不能直接等于 LONG_BUILDING | manual | 2026-08-28 |
+| I6 | 该删除的删除。该重构的重构。该合并的合并。该新增的才新增。 | manual | 2026-08-29 |
 
 ## Restate rows
 

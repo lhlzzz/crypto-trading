@@ -23,8 +23,8 @@ bash start_api.sh
 The Binance mode is configuration-only:
 
 - `BIAN_MODE=paper`: no private Binance client and no real orders.
-- `BIAN_MODE=testnet`: private adapter targets Binance Testnet.
-- `BIAN_MODE=live`: private access also requires
+- `BIAN_MODE=testnet`: `FuturesPrivateClient` targets USD-M Futures Testnet.
+- `BIAN_MODE=live`: USD-M Futures production also requires
   `LIVE_TRADING_ENABLED=true`, `LIVE_CONFIRMATION_TOKEN`, and the explicit
   confirmation performed by `start_live.sh`.
 
@@ -32,6 +32,9 @@ Testnet credentials use `BIAN_TESTNET_API_KEY` and
 `BIAN_TESTNET_API_SECRET`; Live credentials use the separate
 `BIAN_LIVE_API_KEY` and `BIAN_LIVE_API_SECRET`. Secrets are only read from
 secret configuration, never stored in the database or returned by the API.
+
+Production execution market is Binance USD-M USDT-margined perpetual. Spot is
+public confirmation only; `PrivateClient` cannot place Spot orders.
 
 The read-only API exposes `/health` and
 `/api/os/front-data`. Financial OS proxies that contract through

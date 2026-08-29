@@ -463,9 +463,9 @@ def _startup_recovery(mode: str, store: TradingStore) -> None:
     if mode == "paper":
         result = Reconciler(store, mode=mode).recover()
     else:
-        from binance_client import PrivateClient
+        from binance_client import FuturesPrivateClient
 
-        client = PrivateClient(ClientConfig.from_env())
+        client = FuturesPrivateClient(ClientConfig.from_env())
         result = Reconciler(store, client=client, mode=mode).recover()
     if not result.safe_to_trade:
         raise SystemExit(f"startup reconciliation blocked trading: {result.status}")

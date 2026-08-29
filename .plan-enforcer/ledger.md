@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 48 total  |  0 done  |  34 verified  |  0 skipped  |  0 blocked  |  14 remaining
- Drift: 3  |  Last reconcile: T35 |  Tier: structural
+ 50 total  |  0 done  |  36 verified  |  0 skipped  |  0 blocked  |  14 remaining
+ Drift: 4  |  Last reconcile: T50 |  Tier: structural
 
 ## Task Ledger
 
@@ -46,7 +46,7 @@
 | T33 | Complete research and elapsed-time gates | pending | 104 tests; observer/Shadow restart and zero-order audit | D11,V28,V29,V30 | Duration, 7-day Shadow, Testnet remain |
 | T34 | Phase A meme-futures architecture audit | verified | 118 tests; schema ok; compile ok | D12,A:I3,A:I4,A:I5,V31 | Owners intact; execution still Spot |
 | T35 | Phase B Futures data completeness | verified | 120 tests; live 30m taker | D12,A:I3,V32 | No private Futures orders |
-| T36 | Phase C Futures orderbook | pending |  | D12 | USD-M snapshot+diff; Spot book confirmation |
+| T36 | Phase C Futures orderbook | pending |  | D12,D14 | Deferred until adapter/TradeIntent/risk |
 | T37 | Phase D Futures positioning features | pending |  | D12 | No synthesized windows |
 | T38 | Phase E MarketFrame alignment | pending |  | D12 | Extend existing frame only |
 | T39 | Phase F positioning state machine | pending |  | D12,A:I5 | Remove TRANSITION state |
@@ -59,6 +59,8 @@
 | T46 | Phase M failure injection | pending |  | D12 | HALT on unresolved state |
 | T47 | Phase N production guards | pending |  | D12,A:I3 | BIAN_MARKET=FUTURES |
 | T48 | Phase O limited live | pending |  | D12 | Hard block until gates pass |
+| T49 | Legacy Spot assumption audit | verified | STATE KEEP/REPLACE/DELETE table | D14,A:I6 | Adapter first |
+| T50 | USD-M private adapter | verified | 124 tests; HMAC/400/tombstone | D14,A:I3,A:I6,V33 | HMAC stdlib; no quoteOrderQty |
 
 ## Decision Log
 
@@ -77,6 +79,7 @@
 | D11 | T27-T32 | Keep Positioning fail-closed and shadow-only | Data is incomplete until runtime gates pass |
 | D12 | T34-T48 | Continue from d75a795; no rollback | User locked Meme Futures production constraints |
 | D13 | T33,T42 | Do not skip elapsed-time gates | 1h/6h/24h/7d remain required evidence |
+| D14 | T36,T49,T50 | Pivot: adapter/audit before orderbook | New pack requires Spot deletion and FuturesPrivateClient first |
 
 ## Reconciliation History
 
@@ -91,6 +94,7 @@
 | R13 | T27-T33 | 1 | Regression test, 104-test suite, restart, zero-order audit, and 358/528 graph refresh passed; elapsed gates remain |
 | R14 | T1-T48 | 15 | T34 verified; T33 elapsed gates remain; T35-T48 pending; no duplicate owners |
 | R15 | T1-T48 | 14 | T35 verified; native 30m + distinct last/mark/index; T33 remains |
+| R16 | T1-T50 | 14 | T49/T50 verified; T36 deferred; T33 elapsed gates remain |
 
 ## Reconciliation History
 

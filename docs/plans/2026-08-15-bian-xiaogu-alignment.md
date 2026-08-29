@@ -220,8 +220,9 @@ Binance USD-M Meme Futures capital-positioning trader, without a second
 engine, risk, execution, or database owner.
 **Constraints:** `POSITIONING_DECISION_ENABLED` stays `false` until shadow,
 paper, testnet, and recovery gates pass. Spot remains confirmation only.
-Futures private order submission is forbidden until Phase J+. Continue from
-`d75a795`; do not roll back the existing 118 tests.
+The authenticated adapter is USD-M `FuturesPrivateClient`; Paper cannot
+construct it. Live orders remain hard-blocked until later gates. Continue
+from `e4dbafe`; do not roll back the existing tests.
 **Out of scope:** COIN-M, options, margin, delivery, Spot live execution, LLM
 or social-signal order placement, Freqtrade/Hummingbot/NautilusTrader, and
 parallel `engine_v2` / `futures_engine` files.
@@ -330,3 +331,16 @@ parallel `engine_v2` / `futures_engine` files.
   gates pass. First live: small size, low leverage, few meme symbols.
 - [ ] Verification: operator confirmation evidence exists; otherwise HARD
   BLOCK remains.
+
+### Task 49: Legacy Spot assumption audit A:I6
+- [ ] Classify Spot private execution, Spot accounting, Spot user stream,
+  quote-quantity, and SMA production assumptions as KEEP / REPLACE / DELETE.
+- [ ] Verification: STATE.md records the audit table.
+
+### Task 50: USD-M private adapter A:I3 A:I6
+- [ ] Replace Spot `PrivateClient` with `SpotPublicClient`,
+  `FuturesPublicClient`, and `FuturesPrivateClient`.
+- [ ] Paper cannot construct the private client. Testnet host is
+  `testnet.binancefuture.com`. No `quoteOrderQty`.
+- [ ] Verification: adapter tests cover paper block, live guards, HMAC
+  signature, client order id, HTTP 400, and Spot tombstone.

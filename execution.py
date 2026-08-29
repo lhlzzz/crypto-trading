@@ -10,7 +10,7 @@ import time
 from typing import Any, Literal
 from uuid import UUID
 
-from binance_client import ClientConfig, PrivateClient
+from binance_client import ClientConfig, FuturesPrivateClient
 from risk import RiskDecision
 from trade_intent import TradeIntent
 from trading_store import TradingStore
@@ -626,7 +626,7 @@ class BinanceExecutor(_BaseExecutor):
         resolved_client_config = client_config or ClientConfig.from_env()
         if resolved_client_config.mode != config.mode:
             raise ValueError("execution and Binance client modes must match")
-        self.client = PrivateClient(resolved_client_config)
+        self.client = FuturesPrivateClient(resolved_client_config)
 
     def submit(
         self,
@@ -638,6 +638,8 @@ class BinanceExecutor(_BaseExecutor):
         if self.store.is_halted():
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
+        if approved.quantity is None:
+            raise ExecutionRejected("Futures orders require quantity")
         order_id = self._create_order(approved, status="CREATED")
         self._event(order_id, "ORDER_CREATED", "CREATED")
         self.store.update_order(order_id, status="RISK_APPROVED")
@@ -648,7 +650,6 @@ class BinanceExecutor(_BaseExecutor):
                 side=approved.side,
                 order_type=approved.order_type,
                 quantity=approved.quantity,
-                quote_order_qty=approved.quote_quantity,
                 price=approved.price,
                 client_order_id=approved.client_order_id,
             )
