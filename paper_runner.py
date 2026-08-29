@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from backtesting import replay_positioning_frames
-from engine import MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
+from engine import CurrentPosition, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
 from binance_client import ClientConfig, PublicClient
 from execution import (
     BinanceExecutor,
@@ -77,27 +77,35 @@ def _test_only_signal_injection(
             "TEST_ONLY_SIGNAL_INJECTION is blocked in production environments"
         )
 
-    side = os.environ.get("TEST_ONLY_SIGNAL_SIDE", "BUY").strip().upper()
+    side = os.environ.get(
+        "TEST_ONLY_SIGNAL_DIRECTION",
+        os.environ.get("TEST_ONLY_SIGNAL_SIDE", "LONG"),
+    ).strip().upper()
     order_type = os.environ.get("TEST_ONLY_SIGNAL_ORDER_TYPE", "MARKET").strip().upper()
-    if side not in {"BUY", "SELL"}:
-        raise ValueError("TEST_ONLY_SIGNAL_SIDE must be BUY or SELL")
+    if side in {"BUY", "LONG"}:
+        side = "LONG"
+    elif side in {"SELL", "SHORT"}:
+        side = "SHORT"
+    else:
+        raise ValueError("TEST_ONLY_SIGNAL_DIRECTION must be LONG or SHORT")
     if order_type not in {"MARKET", "LIMIT"}:
         raise ValueError("TEST_ONLY_SIGNAL_ORDER_TYPE must be MARKET or LIMIT")
 
     quantity_text = os.environ.get("TEST_ONLY_SIGNAL_QUANTITY", "0.01")
-    quote_text = os.environ.get("TEST_ONLY_SIGNAL_QUOTE_QUANTITY")
     price_text = os.environ.get("TEST_ONLY_SIGNAL_PRICE")
-    quantity = Decimal(quantity_text) if quantity_text else None
-    quote_quantity = Decimal(quote_text) if quote_text else None
+    quantity = Decimal(quantity_text)
     price = Decimal(price_text) if price_text else frame.closes[-1]
     if order_type == "LIMIT" and price_text is None:
         raise ValueError("TEST_ONLY_SIGNAL_PRICE is required for LIMIT injection")
+    direction = side
     return TradeIntent(
         symbol=frame.symbol,
-        side=side,  # type: ignore[arg-type]
+        direction=direction,  # type: ignore[arg-type]
+        action="OPEN",
+        reduce_only=False,
+        leverage=Decimal(os.environ.get("DEFAULT_LEVERAGE", "1")),
         order_type=order_type,  # type: ignore[arg-type]
-        quantity=quantity if quote_quantity is None else None,
-        quote_quantity=quote_quantity,
+        quantity=quantity,
         price=price if order_type == "LIMIT" else None,
         confidence=Decimal("1"),
         reason="TEST_ONLY_SIGNAL_INJECTION",
@@ -180,7 +188,16 @@ def _market_frame(
 
 
 def _market_snapshot(frame: MarketFrame) -> MarketSnapshot:
-    return MarketSnapshot(last_price=frame.closes[-1])
+    last_price = frame.last_price or frame.closes[-1]
+    return MarketSnapshot(
+        last_price=last_price,
+        mark_price=frame.mark_price or last_price,
+        index_price=frame.index_price,
+        bid_price=frame.bid_price,
+        ask_price=frame.ask_price,
+        available_liquidity=frame.depth_25bps,
+        funding_rate=frame.funding_rate,
+    )
 
 
 def _positioning_frame_for_symbol(
@@ -322,20 +339,56 @@ def paper_shadow_attribution(
     return {"symbol": symbol.upper(), **payload}
 
 
+def _current_position(store: TradingStore, symbol: str) -> CurrentPosition:
+    position = store.get_position(symbol) if hasattr(store, "get_position") else None
+    if not position:
+        return CurrentPosition()
+    quantity = Decimal(str(position.get("quantity") or "0"))
+    side = str(position.get("position_side") or "FLAT")
+    if quantity == 0:
+        side = "FLAT"
+    elif side not in {"LONG", "SHORT"}:
+        side = "LONG"
+    leverage = Decimal(str(position.get("leverage") or "1"))
+    entry = position.get("entry_price") or position.get("average_price")
+    return CurrentPosition(
+        direction=side,  # type: ignore[arg-type]
+        quantity=quantity,
+        entry_price=Decimal(str(entry)) if entry is not None else None,
+        leverage=leverage if leverage > 0 else Decimal("1"),
+    )
+
+
 def _risk_context(
     store: TradingStore,
     intent: TradeIntent,
     market: MarketSnapshot,
     *,
     public_client: PublicClient | None = None,
+    executor: Executor | None = None,
 ) -> RiskContext:
-    quote = store.get_balance("USDT") or {"free": Decimal("0")}
-    base_asset = intent.symbol.removesuffix("USDT")
-    base = store.get_balance(base_asset) or {"free": Decimal("0")}
-    position = store.get_position(intent.symbol) or {
-        "quantity": Decimal("0"),
-        "average_price": Decimal("0"),
-    }
+    if executor is not None and hasattr(executor, "account_state"):
+        account = executor.account_state()
+    else:
+        quote = store.get_balance("USDT") or {}
+        wallet = Decimal(str(quote.get("wallet_balance") or quote.get("free") or "0"))
+        used = Decimal(str(quote.get("used_margin") or quote.get("locked") or "0"))
+        account = {
+            "wallet_balance": wallet,
+            "available_balance": Decimal(str(quote.get("available_balance") or quote.get("free") or "0")),
+            "used_margin": used,
+            "equity": wallet,
+            "unrealized_pnl": Decimal(str(quote.get("unrealized_pnl") or "0")),
+            "realized_pnl": Decimal("0"),
+            "funding_pnl": Decimal(str(quote.get("funding_pnl") or "0")),
+        }
+    position = store.get_position(intent.symbol) if hasattr(store, "get_position") else None
+    position = position or {}
+    quantity = Decimal(str(position.get("quantity") or "0"))
+    direction = str(position.get("position_side") or "FLAT")
+    if quantity == 0:
+        direction = "FLAT"
+    mark = market.mark_price or market.last_price
     rules = ExchangeRules(symbol=intent.symbol)
     if public_client is not None:
         raw_rules = public_client.get_symbol_rules(intent.symbol)
@@ -350,18 +403,39 @@ def _risk_context(
             min_notional=Decimal(raw_rules["min_notional"]),
         )
     return RiskContext(
-        available_quote_usdt=Decimal(str(quote["free"])),
-        available_base_quantity=Decimal(str(base["free"])),
-        position_usdt=abs(
-            Decimal(str(position["quantity"])) * market.last_price
+        wallet_balance=Decimal(str(account.get("wallet_balance") or "0")),
+        available_balance=Decimal(str(account.get("available_balance") or "0")),
+        equity=Decimal(str(account.get("equity") or "0")),
+        used_margin=Decimal(str(account.get("used_margin") or "0")),
+        position_direction=direction,  # type: ignore[arg-type]
+        position_quantity=quantity,
+        position_notional=abs(quantity * mark),
+        entry_price=(
+            Decimal(str(position["entry_price"]))
+            if position.get("entry_price") is not None
+            else Decimal(str(position.get("average_price") or "0"))
         ),
-        market_price=market.last_price,
+        mark_price=mark,
+        index_price=market.index_price,
+        unrealized_pnl=Decimal(str(account.get("unrealized_pnl") or position.get("unrealized_pnl") or "0")),
+        realized_pnl=Decimal(str(account.get("realized_pnl") or position.get("realized_pnl") or "0")),
+        funding_pnl=Decimal(str(account.get("funding_pnl") or position.get("funding_pnl") or "0")),
+        leverage=intent.leverage,
+        margin_type="ISOLATED",
+        position_mode="ONE_WAY",
+        liquidation_price=(
+            Decimal(str(position["liquidation_price"]))
+            if position.get("liquidation_price") is not None
+            else None
+        ),
+        liquidation_distance_percent=Decimal("50"),
         exchange_rules=rules,
-        positioning_confidence=intent.confidence if intent.direction is not None else None,
+        positioning_confidence=intent.confidence,
         crowding_score=intent.crowding_score,
         liquidity_score=intent.liquidity_score,
         data_quality_score=intent.data_quality_score,
         evidence_conflict=intent.positioning_state == "CONFLICTED",
+        meme_risk_tier=intent.meme_risk_tier or "TRADEABLE",
     )
 
 
@@ -392,7 +466,12 @@ def run_cycle(
         strict=False,
     )
     injected_intent = _test_only_signal_injection(frame, mode=mode)
-    intent = injected_intent or engine.evaluate(frame)
+    current = _current_position(store, symbol)
+    evaluate = getattr(engine, "evaluate")
+    try:
+        intent = injected_intent or evaluate(frame, current_position=current)
+    except TypeError:
+        intent = injected_intent or evaluate(frame)
     if intent is None:
         store.record_system_event(
             event_type="NO_SIGNAL",
@@ -416,7 +495,7 @@ def run_cycle(
         raise RuntimeError("engine returned intent without signal")
     store.record_signal(
         symbol=intent.symbol,
-        side=intent.side,
+        side=intent.exchange_side(),
         confidence=(
             intent.confidence if injected_intent is not None or positioning_intent else signal.confidence
         ),
@@ -436,7 +515,13 @@ def run_cycle(
     store.record_intent(intent, status="CREATED")
     decision = risk_gate.evaluate(
         intent,
-        _risk_context(store, intent, market, public_client=public_client),
+        _risk_context(
+            store,
+            intent,
+            market,
+            public_client=public_client,
+            executor=executor,
+        ),
     )
     result = executor.submit(intent, decision, market=market)
     store.update_intent_status(intent.id, result.status)
@@ -453,12 +538,38 @@ def run_cycle(
     }
 
 
+def _assert_account_risk_config(client: Any) -> None:
+    """Read-only account risk preflight. Never changes leverage/margin/position mode."""
+    raw_mode = client.get_position_mode()
+    dual = str(raw_mode.get("dualSidePosition", "")).lower()
+    actual_mode = "HEDGE" if dual in {"true", "1"} else "ONE_WAY"
+    if actual_mode != "ONE_WAY":
+        raise SystemExit(f"position mode mismatch: {actual_mode}")
+    symbols = _symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT"))
+    margin = client.get_margin_type(symbols[0])
+    actual_margin = str(margin.get("marginType") or "").upper()
+    if actual_margin and actual_margin != "ISOLATED":
+        raise SystemExit(f"margin mode mismatch: {actual_margin}")
+
+
 def _startup_recovery(mode: str, store: TradingStore) -> None:
     if mode == "live":
+        if os.environ.get("BIAN_MARKET", "").strip().upper() != "FUTURES":
+            raise SystemExit("live mode requires BIAN_MARKET=FUTURES")
+        if os.environ.get("POSITIONING_DECISION_ENABLED", "false").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            raise SystemExit("live mode requires POSITIONING_DECISION_ENABLED=true")
+        if os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() != "true":
+            raise SystemExit("live mode requires LIVE_TRADING_ENABLED=true")
         expected = os.environ.get("LIVE_CONFIRMATION_TOKEN")
         confirmed = os.environ.get("BIAN_LIVE_CONFIRMATION")
         if not expected or confirmed != expected:
             raise SystemExit("live mode requires explicit confirmation token")
+        if os.environ.get("FUTURES_POSITION_MODE", "ONE_WAY").strip().upper() != "ONE_WAY":
+            raise SystemExit("live mode requires FUTURES_POSITION_MODE=ONE_WAY")
+        if os.environ.get("FUTURES_MARGIN_MODE", "ISOLATED").strip().upper() != "ISOLATED":
+            raise SystemExit("live mode requires FUTURES_MARGIN_MODE=ISOLATED")
     store.initialize()
     if mode == "paper":
         result = Reconciler(store, mode=mode).recover()
@@ -466,6 +577,7 @@ def _startup_recovery(mode: str, store: TradingStore) -> None:
         from binance_client import FuturesPrivateClient
 
         client = FuturesPrivateClient(ClientConfig.from_env())
+        _assert_account_risk_config(client)
         result = Reconciler(store, client=client, mode=mode).recover()
     if not result.safe_to_trade:
         raise SystemExit(f"startup reconciliation blocked trading: {result.status}")

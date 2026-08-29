@@ -9,6 +9,8 @@ if [ ! -x "$python_bin" ]; then
   exit 1
 fi
 
+export BIAN_MARKET=FUTURES
 export BIAN_MODE=paper
+export LIVE_TRADING_ENABLED=false
 cd "$script_dir"
 exec "$python_bin" paper_runner.py "$@"

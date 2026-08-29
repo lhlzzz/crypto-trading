@@ -1,23 +1,26 @@
-"""Private Binance User Data Stream, isolated from public market streams."""
+"""Private Binance USD-M Futures User Data Stream."""
 from __future__ import annotations
 
 import asyncio
 import inspect
-import os
+import json
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
-from binance_client import BinanceAuthError, ClientConfig
-
+from binance_client import BinanceAuthError, ClientConfig, FuturesPrivateClient
 
 ReconcileCallback = Callable[[], Awaitable[None] | None]
 EventCallback = Callable[["UserStreamEvent"], Awaitable[None] | None]
+HaltCallback = Callable[[str], Awaitable[None] | None]
+
+FUTURES_LIVE_WS = "wss://fstream.binance.com"
+FUTURES_TESTNET_WS = "wss://stream.binancefuture.com"
 
 
 @dataclass(frozen=True)
 class UserStreamEvent:
-    """Stable event contract consumed by execution/reconciliation layers."""
+    """Futures-native event contract consumed by execution/reconciliation."""
 
     event_type: str
     event_time_ms: int | None = None
@@ -31,7 +34,12 @@ class UserStreamEvent:
     last_price: Decimal | None = None
     fee: Decimal = Decimal("0")
     fee_asset: str | None = None
-    balances: tuple[dict[str, str], ...] = ()
+    position_side: str | None = None
+    realized_pnl: Decimal | None = None
+    realized_pnl_asset: str | None = None
+    reduce_only: bool | None = None
+    balance_updates: tuple[dict[str, str], ...] = ()
+    position_updates: tuple[dict[str, str], ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -45,6 +53,12 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
 def _payload(event: Any) -> dict[str, Any]:
     if isinstance(event, dict):
         return dict(event)
+    if isinstance(event, (bytes, str)):
+        try:
+            parsed = json.loads(event)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
     actual = getattr(event, "actual_instance", None)
     if actual is not None:
         event = actual
@@ -57,40 +71,65 @@ def _payload(event: Any) -> dict[str, Any]:
 
 
 def normalize_user_event(event: Any) -> UserStreamEvent:
-    """Normalize raw SDK models and Binance JSON into one event contract."""
-
+    """Normalize Binance USD-M user-data JSON into one event contract."""
     raw = _payload(event)
-    event_type = str(raw.get("e") or raw.get("eventType") or raw.get("filterType") or "unknown")
-    if event_type == "executionReport":
+    if not raw:
+        return UserStreamEvent(event_type="malformed", raw={"raw": str(event)})
+    event_type = str(raw.get("e") or raw.get("eventType") or "unknown")
+    if event_type in {"executionReport", "outboundAccountPosition"}:
+        return UserStreamEvent(event_type="malformed", raw=raw)
+    if event_type == "ORDER_TRADE_UPDATE":
+        order = raw.get("o") if isinstance(raw.get("o"), dict) else {}
+        realized = order.get("rp")
         return UserStreamEvent(
             event_type=event_type,
             event_time_ms=_int_or_none(raw.get("E")),
-            symbol=_upper_or_none(raw.get("s")),
-            client_order_id=_str_or_none(raw.get("c")),
-            exchange_order_id=_str_or_none(raw.get("i")),
-            order_status=_str_or_none(raw.get("X")),
-            execution_type=_str_or_none(raw.get("x")),
-            executed_quantity=_decimal(raw.get("z")),
-            last_quantity=_decimal(raw.get("l")),
-            last_price=_decimal_or_none(raw.get("L")),
-            fee=_decimal(raw.get("n")),
-            fee_asset=_upper_or_none(raw.get("N")),
+            symbol=_upper_or_none(order.get("s")),
+            client_order_id=_str_or_none(order.get("c")),
+            exchange_order_id=_str_or_none(order.get("i")),
+            order_status=_str_or_none(order.get("X")),
+            execution_type=_str_or_none(order.get("x")),
+            executed_quantity=_decimal(order.get("z")),
+            last_quantity=_decimal(order.get("l")),
+            last_price=_decimal_or_none(order.get("L")),
+            fee=_decimal(order.get("n")),
+            fee_asset=_upper_or_none(order.get("N")),
+            position_side=_upper_or_none(order.get("ps")),
+            realized_pnl=_decimal_or_none(realized),
+            realized_pnl_asset="USDT" if realized is not None else None,
+            reduce_only=bool(order.get("R")) if order.get("R") is not None else None,
             raw=raw,
         )
-    if event_type == "outboundAccountPosition":
+    if event_type == "ACCOUNT_UPDATE":
+        account = raw.get("a") if isinstance(raw.get("a"), dict) else {}
         balances = tuple(
             {
                 "asset": _upper_or_none(row.get("a")) or "",
-                "free": str(row.get("f", "0")),
-                "locked": str(row.get("l", "0")),
+                "wallet_balance": str(row.get("wb", "0")),
+                "available_balance": str(row.get("cw", row.get("wb", "0"))),
+                "balance_change": str(row.get("bc", "0")),
             }
-            for row in raw.get("B", [])
+            for row in account.get("B", [])
+            if isinstance(row, dict)
+        )
+        positions = tuple(
+            {
+                "symbol": _upper_or_none(row.get("s")) or "",
+                "quantity": str(row.get("pa", "0")),
+                "entry_price": str(row.get("ep", "0")),
+                "unrealized_pnl": str(row.get("up", "0")),
+                "realized_pnl": str(row.get("cr", "0")),
+                "margin_type": str(row.get("mt", "")).upper(),
+                "position_side": _upper_or_none(row.get("ps")) or "",
+            }
+            for row in account.get("P", [])
             if isinstance(row, dict)
         )
         return UserStreamEvent(
             event_type=event_type,
             event_time_ms=_int_or_none(raw.get("E")),
-            balances=balances,
+            balance_updates=balances,
+            position_updates=positions,
             raw=raw,
         )
     return UserStreamEvent(
@@ -102,7 +141,7 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
 
 
 class UserStreamClient:
-    """Run the official SDK's private user stream with safe reconnect hooks."""
+    """USD-M user data stream with reconnect and fail-closed halt."""
 
     def __init__(
         self,
@@ -110,67 +149,113 @@ class UserStreamClient:
         *,
         on_event: EventCallback | None = None,
         on_reconcile: ReconcileCallback | None = None,
-        sdk_factory: Callable[[ClientConfig], Any] | None = None,
+        on_halt: HaltCallback | None = None,
+        rest_client: Any | None = None,
+        websocket_connect: Callable[[str], Any] | None = None,
+        reconnect_delay_sec: float = 2,
+        max_failures: int = 3,
+        keepalive_sec: float = 1800,
     ) -> None:
         self.config = config or ClientConfig.from_env()
         if self.config.mode == "paper":
             raise BinanceAuthError("UserStreamClient cannot run in paper mode")
         self.on_event = on_event
         self.on_reconcile = on_reconcile
-        self._sdk_factory = sdk_factory or _build_sdk
-        self._sdk: Any = None
-        self._stream: Any = None
+        self.on_halt = on_halt
+        self._rest = rest_client
+        self._websocket_connect = websocket_connect or _default_websocket_connect
         self._stopped = False
+        self._listen_key: str | None = None
+        self._reconnects = 0
+        self._reconnect_delay_sec = reconnect_delay_sec
+        self._max_failures = max_failures
+        self._keepalive_sec = max(0.01, float(keepalive_sec))
 
-    async def connect_once(self) -> None:
-        self._sdk = self._sdk_factory(self.config)
-        websocket_api = self._sdk.websocket_api
-        await websocket_api.create_connection()
-        websocket_api.on_connection("reconnect", self._connection_recovered)
-        websocket_api.on_connection("error", self._connection_lost)
-        websocket_api.on_connection("close", self._connection_lost)
-        response = await websocket_api.user_data_stream_subscribe_signature()
-        self._stream = response.stream
-        self._stream.on("message", self._message_received)
+    def _client(self) -> Any:
+        if self._rest is None:
+            self._rest = FuturesPrivateClient(self.config)
+        return self._rest
+
+    def _ws_url(self, listen_key: str) -> str:
+        host = FUTURES_TESTNET_WS if self.config.mode == "testnet" else FUTURES_LIVE_WS
+        return f"{host}/ws/{listen_key}"
+
+    async def connect_once(self) -> Any:
+        listen_key = self._client().create_listen_key()
+        self._listen_key = listen_key
+        websocket = await _maybe_await(self._websocket_connect(self._ws_url(listen_key)))
+        return websocket
 
     async def run_forever(self) -> None:
-        """Keep the stream alive; the SDK handles socket replacement."""
-
         self._stopped = False
+        failures = 0
+        keepalive_task = asyncio.create_task(self._keepalive_loop())
         try:
-            await self.connect_once()
             while not self._stopped:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            raise
+                websocket = None
+                try:
+                    websocket = await self.connect_once()
+                    failures = 0
+                    await self._consume(websocket)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures += 1
+                    _dispatch(self.on_reconcile)
+                    if failures >= self._max_failures:
+                        reason = f"futures user stream unrecoverable: {exc}"
+                        _dispatch(self.on_halt, reason)
+                        _dispatch(self.on_reconcile)
+                        raise
+                    self._reconnects += 1
+                    await asyncio.sleep(self._reconnect_delay_sec * failures)
+                finally:
+                    await _close_ws(websocket)
         finally:
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
             await self.close()
+
+    async def _consume(self, websocket: Any) -> None:
+        if hasattr(websocket, "on_message"):
+            websocket.on_message(self._message_received)
+            if hasattr(websocket, "wait_closed"):
+                await websocket.wait_closed()
+            return
+        async for message in websocket:
+            self._message_received(message)
+
+    def _message_received(self, event: Any) -> None:
+        try:
+            normalized = normalize_user_event(event)
+        except Exception:
+            normalized = UserStreamEvent(event_type="malformed", raw={"raw": str(event)})
+        if normalized.event_type == "listenKeyExpired":
+            _dispatch(self.on_reconcile)
+            raise RuntimeError("listenKey expired")
+        _dispatch(self.on_event, normalized)
+
+    async def _keepalive_loop(self) -> None:
+        while not self._stopped:
+            await asyncio.sleep(self._keepalive_sec)
+            if self._stopped:
+                return
+            try:
+                keeper = getattr(self._client(), "keepalive_listen_key", None)
+                if keeper is not None:
+                    keeper()
+            except Exception:
+                _dispatch(self.on_reconcile)
 
     async def close(self) -> None:
         self._stopped = True
-        if self._stream is not None:
-            try:
-                await self._stream.unsubscribe()
-            except Exception:
-                pass
-        if self._sdk is not None:
-            websocket_api = self._sdk.websocket_api
-            try:
-                await websocket_api.close_connection(close_session=True)
-            except Exception:
-                pass
-
-    def _message_received(self, event: Any) -> None:
-        normalized = normalize_user_event(event)
-        _dispatch(self.on_event, normalized)
-
-    def _connection_lost(self, *_: Any) -> None:
-        # Reconciliation is intentionally fail-closed and remains the source
-        # of truth; the callback may set HALT when REST is unavailable.
-        return None
-
-    def _connection_recovered(self, *_: Any) -> None:
-        _dispatch(self.on_reconcile)
+        if self._listen_key is not None:
+            closer = getattr(self._client(), "close_listen_key", None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception:
+                    pass
 
 
 def _dispatch(callback: Callable[..., Any] | None, *args: Any) -> None:
@@ -184,42 +269,30 @@ def _dispatch(callback: Callable[..., Any] | None, *args: Any) -> None:
             result.close() if inspect.iscoroutine(result) else None
 
 
-def _build_sdk(config: ClientConfig) -> Any:
-    from binance_common.configuration import ConfigurationRestAPI, ConfigurationWebSocketAPI
-    from binance_sdk_spot import Spot
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
-    if not config.api_key or not config.api_secret:
-        raise BinanceAuthError(
-            f"credentials are required for BIAN_MODE={config.mode}"
-        )
-    stream_url = (
-        "wss://ws-api.testnet.binance.vision/ws-api/v3"
-        if config.mode == "testnet"
-        else "wss://ws-api.binance.com:443/ws-api/v3"
-    )
-    rest_url = (
-        "https://testnet.binance.vision"
-        if config.mode == "testnet"
-        else "https://api.binance.com"
-    )
-    return Spot(
-        config_rest_api=ConfigurationRestAPI(
-            api_key=config.api_key,
-            api_secret=config.api_secret,
-            base_path=rest_url,
-            timeout=config.timeout_ms,
-            retries=config.retries,
-            backoff=config.backoff_ms,
-        ),
-        config_ws_api=ConfigurationWebSocketAPI(
-            api_key=config.api_key,
-            api_secret=config.api_secret,
-            stream_url=stream_url,
-            timeout=config.timeout_ms,
-            reconnect_attempts=max(1, min(10, config.retries or 1)),
-            reconnect_delay=max(100, config.backoff_ms),
-        ),
-    )
+
+async def _close_ws(websocket: Any) -> None:
+    if websocket is None:
+        return
+    close = getattr(websocket, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        try:
+            await result
+        except Exception:
+            pass
+
+
+async def _default_websocket_connect(url: str) -> Any:
+    import websockets
+
+    return await websockets.connect(url)
 
 
 def _str_or_none(value: Any) -> str | None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from engine import MarketDataEnvelope, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
+from engine import CurrentPosition, MarketDataEnvelope, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine, _map_position_action
 
 
 def _frame(closes: list[str]) -> MarketFrame:
@@ -32,9 +32,11 @@ def test_engine_creates_buy_intent_without_execution_dependencies() -> None:
     intent = engine.evaluate(_frame(["1", "1", "1", "1", "1", "2", "3"]))
 
     assert intent is not None
-    assert intent.side == "BUY"
+    assert intent.direction == "LONG"
+    assert intent.action == "OPEN"
+    assert intent.reduce_only is False
     assert intent.order_type == "MARKET"
-    assert intent.quote_quantity == Decimal("25")
+    assert intent.quantity > 0
     assert intent.strategy_version == "momentum-sma-1"
 
 
@@ -107,12 +109,24 @@ def test_positioning_building_is_explainable_but_shadow_only_by_default() -> Non
 
 def test_stale_positioning_data_fails_closed() -> None:
     captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
-    stale = SourceFreshness("spot", captured, captured, 1, captured.replace(hour=13))
+    stale = SourceFreshness(
+        "futures_open_interest", captured, captured, 1, captured.replace(hour=13)
+    )
     decision = StrategyEngine().positioning_decision(
         _positioning_frame(freshness=(stale,)), now=captured.replace(hour=13)
     )
     assert decision.state == "UNKNOWN"
     assert decision.direction == "FLAT"
+
+
+def test_stale_spot_confirmation_does_not_fail_futures() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    stale_spot = SourceFreshness("spot_trade", captured, captured, 1, captured.replace(hour=13))
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(freshness=(stale_spot,)), now=captured.replace(hour=13)
+    )
+    assert decision.state == "LONG_BUILDING"
+    assert "AUXILIARY_SPOT_STALE" in decision.reason_codes
 
 
 def test_one_stale_required_source_fails_closed_even_when_others_are_fresh() -> None:
@@ -221,21 +235,34 @@ def test_short_building_is_directionally_symmetric_with_long_building() -> None:
     assert decision.direction == "SHORT"
 
 
-def test_weak_transition_strength_cannot_create_an_intent() -> None:
-    engine = StrategyEngine(
-        StrategyConfig(
-            positioning_decision_enabled=True,
-            minimum_transition_strength=Decimal("1"),
-        )
-    )
+def test_directional_and_transition_strength_are_split() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
     frame = _positioning_frame()
-
     decision = engine.positioning_decision(frame)
-
     assert decision.state == "LONG_BUILDING"
-    assert decision.direction == "FLAT"
-    assert "TRANSITION_STRENGTH_LOW" in decision.reason_codes
-    assert engine.evaluate(frame) is None
+    assert decision.direction == "LONG"
+    assert decision.transition_strength == Decimal("0")
+    assert decision.directional_strength > Decimal("0")
+    assert decision.directional_strength != decision.transition_strength
+
+
+def test_engine_maps_flat_long_building_to_open_long() -> None:
+    assert _map_position_action("FLAT", "LONG", "LONG_BUILDING") == ("LONG", "OPEN")
+    assert _map_position_action("LONG", "LONG", "LONG_BUILDING") is None
+    assert _map_position_action("LONG", "FLAT", "EXHAUSTION_LONG") == ("LONG", "REDUCE")
+    assert _map_position_action("LONG", "SHORT", "SHORT_BUILDING") == ("LONG", "CLOSE")
+    assert _map_position_action("FLAT", "SHORT", "SHORT_BUILDING") == ("SHORT", "OPEN")
+    assert _map_position_action("SHORT", "LONG", "LONG_BUILDING") == ("SHORT", "CLOSE")
+
+
+def test_engine_does_not_repeat_open_when_already_long() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    frame = _positioning_frame()
+    intent = engine.evaluate(
+        frame,
+        current_position=CurrentPosition(direction="LONG", quantity=Decimal("0.1")),
+    )
+    assert intent is None
 
 
 def test_positioning_snapshot_id_is_replay_deterministic() -> None:
@@ -277,7 +304,7 @@ def test_received_after_decision_fails_closed() -> None:
     frame = _positioning_frame(
         freshness=(
             SourceFreshness(
-                "spot",
+                "futures_taker_flow",
                 datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
                 datetime(2026, 8, 26, 12, 0, 1, tzinfo=timezone.utc),
                 900,
@@ -296,7 +323,7 @@ def test_inconsistent_declared_latency_fails_closed() -> None:
     captured = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
     frame = _positioning_frame(
         source_timestamps={
-            "spot_trade": {
+            "futures_funding": {
                 "source_timestamp": captured.isoformat(),
                 "received_timestamp": captured.replace(second=1).isoformat(),
                 "latency_ms": 0,
@@ -328,3 +355,38 @@ def test_market_frame_rebuilds_from_normalized_evidence_snapshot() -> None:
     actual = StrategyEngine().positioning_decision(rebuilt)
 
     assert actual.as_dict() == expected.as_dict()
+
+
+def test_missing_core_futures_evidence_cannot_create_directional_intent() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    frame = _positioning_frame(oi_change=None, funding_rate=None, taker_buy_volume=None, taker_sell_volume=None)
+    decision = engine.positioning_decision(frame)
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+    assert engine.evaluate(frame) is None
+
+
+def test_missing_spot_confirmation_still_allows_futures_long_building() -> None:
+    frame = _positioning_frame(
+        net_spot_flow=None,
+        cvd_change=None,
+        spot_buy_volume=None,
+        spot_sell_volume=None,
+    )
+    decision = StrategyEngine().positioning_decision(frame)
+    assert decision.state == "LONG_BUILDING"
+    assert decision.direction == "LONG"
+    assert "AUXILIARY_SPOT_MISSING" in decision.reason_codes
+
+
+def test_unknown_cannot_create_executable_intent() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    frame = _positioning_frame(source_timestamps={})
+    assert engine.positioning_decision(frame).state == "UNKNOWN"
+    assert engine.evaluate(frame) is None
+
+
+def test_missing_sign_is_not_neutral() -> None:
+    from engine import _sign
+    assert _sign(None) is None
+    assert _sign(Decimal("0")) == 0

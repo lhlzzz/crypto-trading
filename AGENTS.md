@@ -10,8 +10,7 @@ Never read Polymarket data, add wallet/withdrawal access, or import code from
 another bot workspace. `bian_api.py` is read-only. `execution.py` is the only
 order-submission owner. `database.py` remains schema/connection owner only.
 `engine.py` only creates TradeIntent objects. `SpotPublicClient`/`PublicClient`
-and `FuturesPublicClient` are read-only. `FuturesPrivateClient` is the only
-authenticated USD-M order/account adapter; `PrivateClient` is a tombstone.
+and `FuturesPublicClient` are read-only. `FuturesPrivateClient` is the only authenticated USD-M order/account adapter. Spot `PrivateClient` is removed.
 Paper cannot construct `FuturesPrivateClient`. Paper, Testnet, and Live share
 the same Executor interface, and Live requires configuration plus explicit
 startup confirmation. Testnet and Live credentials are separate mode-specific

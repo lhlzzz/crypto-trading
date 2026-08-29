@@ -19,9 +19,11 @@ PositioningState = Literal[
     "NEUTRAL", "LONG_BUILDING", "SHORT_BUILDING", "LONG_UNWIND",
     "SHORT_COVERING", "ABSORPTION_LONG", "ABSORPTION_SHORT",
     "EXHAUSTION_LONG", "EXHAUSTION_SHORT", "FORCED_DELEVERAGING",
-    "TRANSITION", "CONFLICTED", "UNKNOWN",
+    "CONFLICTED", "UNKNOWN",
 ]
 Direction = Literal["LONG", "SHORT", "FLAT"]
+Action = Literal["OPEN", "REDUCE", "CLOSE"]
+MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
 MarketRegime = Literal[
     "RISK_ON", "RISK_OFF", "TRENDING_UP", "TRENDING_DOWN",
     "HIGH_VOL", "LOW_VOL", "NEUTRAL",
@@ -32,34 +34,125 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _sign(value: Decimal | None, threshold: Decimal = Decimal("0")) -> int:
+def _map_position_action(
+    current: Direction,
+    desired: Direction,
+    state: str,
+) -> tuple[Direction, Action] | None:
+    if current == "FLAT":
+        if state == "LONG_BUILDING" and desired == "LONG":
+            return "LONG", "OPEN"
+        if state == "SHORT_BUILDING" and desired == "SHORT":
+            return "SHORT", "OPEN"
+        return None
+    if current == "LONG":
+        if state == "LONG_BUILDING" and desired == "LONG":
+            return None
+        if state == "EXHAUSTION_LONG":
+            return "LONG", "REDUCE"
+        if state in {
+            "LONG_UNWIND", "SHORT_COVERING", "FORCED_DELEVERAGING",
+            "SHORT_BUILDING", "NEUTRAL",
+        } or desired in {"FLAT", "SHORT"}:
+            return "LONG", "CLOSE"
+        return None
+    if current == "SHORT":
+        if state == "SHORT_BUILDING" and desired == "SHORT":
+            return None
+        if state == "EXHAUSTION_SHORT":
+            return "SHORT", "REDUCE"
+        if state in {
+            "SHORT_COVERING", "LONG_UNWIND", "FORCED_DELEVERAGING",
+            "LONG_BUILDING", "NEUTRAL",
+        } or desired in {"FLAT", "LONG"}:
+            return "SHORT", "CLOSE"
+        return None
+    return None
+
+
+CORE_FUTURES_SOURCES = frozenset(
+    {
+        "futures_open_interest",
+        "futures_funding",
+        "futures_taker_flow",
+        "futures_mark_price",
+        "futures_index_price",
+        "futures_liquidation",
+        "futures_orderbook",
+        "futures_book_ticker",
+        "futures_force_order",
+    }
+)
+AUXILIARY_SPOT_SOURCES = frozenset(
+    {
+        "spot_trade",
+        "spot_book_ticker",
+        "spot_orderbook",
+        "spot",
+        "binance_spot_klines",
+    }
+)
+
+
+def _is_auxiliary_spot_source(source: str) -> bool:
+    name = source.lower()
+    return name in AUXILIARY_SPOT_SOURCES or name.startswith("spot")
+
+
+def _is_core_futures_source(source: str) -> bool:
+    name = source.lower()
+    if _is_auxiliary_spot_source(name):
+        return False
+    return name in CORE_FUTURES_SOURCES or name.startswith("futures")
+
+
+def _sign(value: Decimal | None, threshold: Decimal = Decimal("0")) -> int | None:
     if value is None:
-        return 0
+        return None
     return 1 if value > threshold else -1 if value < -threshold else 0
+
+
+def _positive(value: int | None) -> bool:
+    return value is not None and value > 0
+
+
+def _negative(value: int | None) -> bool:
+    return value is not None and value < 0
 
 
 def _timestamps_consistent(
     source_timestamps: Mapping[str, Mapping[str, Any]], now: datetime
-) -> bool:
-    """Verify normalized timestamp/latency provenance before a decision."""
+) -> tuple[bool, bool]:
+    """Return (core_ok, aux_ok) timestamp/latency provenance."""
     if not source_timestamps:
-        return False
-    for timestamps in source_timestamps.values():
+        return False, False
+    core_ok = True
+    aux_ok = True
+    saw_core = False
+    for source_name, timestamps in source_timestamps.items():
         try:
-            source = _aware(datetime.fromisoformat(str(timestamps["source_timestamp"])))
+            source_ts = _aware(datetime.fromisoformat(str(timestamps["source_timestamp"])))
             received = _aware(datetime.fromisoformat(str(timestamps["received_timestamp"])))
             declared_latency = int(timestamps["latency_ms"])
         except (KeyError, TypeError, ValueError):
-            return False
-        actual_latency = int((received - source).total_seconds() * 1000)
-        if (
+            if _is_core_futures_source(str(source_name)):
+                core_ok = False
+            else:
+                aux_ok = False
+            continue
+        actual_latency = int((received - source_ts).total_seconds() * 1000)
+        consistent = not (
             actual_latency < 0
             or declared_latency != actual_latency
-            or source > _aware(now)
+            or source_ts > _aware(now)
             or received > _aware(now)
-        ):
-            return False
-    return True
+        )
+        if _is_core_futures_source(str(source_name)):
+            saw_core = True
+            core_ok = core_ok and consistent
+        elif not consistent:
+            aux_ok = False
+    return (core_ok and saw_core), aux_ok
 
 
 @dataclass(frozen=True)
@@ -122,17 +215,17 @@ class SourceFreshness:
 
 @dataclass(frozen=True)
 class EvidenceVector:
-    price: int = 0
-    spot_flow: int = 0
-    cvd: int = 0
-    oi: int = 0
-    funding: int = 0
-    taker: int = 0
-    orderbook: int = 0
-    liquidation: int = 0
-    basis: int = 0
-    relative_strength: int = 0
-    market_regime: int = 0
+    price: int | None = None
+    spot_flow: int | None = None
+    cvd: int | None = None
+    oi: int | None = None
+    funding: int | None = None
+    taker: int | None = None
+    orderbook: int | None = None
+    liquidation: int | None = None
+    basis: int | None = None
+    relative_strength: int | None = None
+    market_regime: int | None = None
     quality: Decimal = Decimal("0")
     freshness: Decimal = Decimal("0")
 
@@ -161,6 +254,7 @@ class PositioningDecision:
     transition: str
     previous_state: PositioningState | None
     transition_strength: Decimal
+    directional_strength: Decimal
     confidence: Decimal
     long_score: Decimal
     short_score: Decimal
@@ -183,6 +277,7 @@ class PositioningDecision:
             "transition": self.transition,
             "previous_state": self.previous_state,
             "transition_strength": str(self.transition_strength),
+            "directional_strength": str(self.directional_strength),
             "confidence": str(self.confidence),
             "long_score": str(self.long_score),
             "short_score": str(self.short_score),
@@ -196,6 +291,15 @@ class PositioningDecision:
             "source_timestamps": dict(self.source_timestamps),
             "input_features": dict(self.input_features),
         }
+
+
+@dataclass(frozen=True)
+class CurrentPosition:
+    direction: Direction = "FLAT"
+    quantity: Decimal = Decimal("0")
+    entry_price: Decimal | None = None
+    leverage: Decimal = Decimal("1")
+    meme_risk_tier: MemeRiskTier = "TRADEABLE"
 
 
 @dataclass(frozen=True)
@@ -358,6 +462,7 @@ class StrategyConfig:
     minimum_confidence: Decimal = Decimal("0.6")
     strategy_version: str = "momentum-sma-1"
     order_quote_usdt: Decimal = Decimal("25")
+    default_leverage: Decimal = Decimal("1")
     positioning_strategy_version: str = "positioning-v1"
     positioning_decision_enabled: bool = False
     minimum_positioning_confidence: Decimal = Decimal("0.6")
@@ -384,6 +489,7 @@ class StrategyConfig:
             positioning_strategy_version=os.environ.get(
                 "POSITIONING_STRATEGY_VERSION", "positioning-v1"
             ),
+            default_leverage=decimal("DEFAULT_LEVERAGE", Decimal("1")),
             positioning_decision_enabled=os.environ.get(
                 "POSITIONING_DECISION_ENABLED", "false"
             ).strip().lower() in {"1", "true", "yes", "on"},
@@ -414,6 +520,8 @@ class StrategyConfig:
             raise ValueError("minimum_confidence must be between 0 and 1")
         if self.order_quote_usdt <= 0:
             raise ValueError("order_quote_usdt must be positive")
+        if self.default_leverage <= 0:
+            raise ValueError("default_leverage must be positive")
         for value in (
             self.minimum_positioning_confidence,
             self.minimum_positioning_edge,
@@ -447,20 +555,38 @@ class StrategyEngine:
         self.config = config or StrategyConfig()
         self._previous_states: dict[str, PositioningState] = {}
 
-    def evaluate(self, frame: MarketFrame) -> TradeIntent | None:
+    def evaluate(
+        self,
+        frame: MarketFrame,
+        *,
+        current_position: CurrentPosition | None = None,
+    ) -> TradeIntent | None:
+        current = current_position or CurrentPosition()
+        if current.meme_risk_tier in {"BLOCK", "OBSERVE"}:
+            return None
         if not self.config.positioning_decision_enabled:
-            return self._legacy_intent(frame)
-        return self._intent_from_positioning(self.positioning_decision(frame))
+            return self._legacy_intent(frame, current_position=current)
+        return self._intent_from_positioning(
+            self.positioning_decision(frame),
+            frame,
+            current_position=current,
+        )
 
-    def _legacy_intent(self, frame: MarketFrame) -> TradeIntent | None:
+    def _legacy_intent(
+        self,
+        frame: MarketFrame,
+        current_position: CurrentPosition | None = None,
+    ) -> TradeIntent | None:
         signal = self.signal(frame)
         if signal is None:
             return None
-        return TradeIntent(
+        desired: Direction = "LONG" if signal.side == "BUY" else "SHORT"
+        return self._intent_for_action(
             symbol=signal.symbol,
-            side=signal.side,
-            order_type="MARKET",
-            quote_quantity=self.config.order_quote_usdt,
+            desired=desired,
+            state="LONG_BUILDING" if desired == "LONG" else "SHORT_BUILDING",
+            frame=frame,
+            current=current_position or CurrentPosition(),
             confidence=signal.confidence,
             reason=signal.reason,
             strategy_version=self.config.strategy_version,
@@ -509,7 +635,12 @@ class StrategyEngine:
         prior = previous_state or self._previous_states.get(frame.symbol.upper())
         transition = f"{prior}->{state}" if prior and prior != state else "NONE"
         edge = long_score - short_score
-        transition_strength = min(Decimal("1"), abs(edge) * quality)
+        directional_strength = min(Decimal("1"), abs(edge) * quality)
+        transition_strength = (
+            Decimal("0")
+            if prior is None or prior == state
+            else Decimal("1")
+        )
         confidence = min(
             Decimal("1"),
             abs(edge) * Decimal("1.5") * quality * (
@@ -519,7 +650,7 @@ class StrategyEngine:
         direction: Direction = "FLAT"
         passes = (
             confidence >= self.config.minimum_positioning_confidence
-            and transition_strength >= self.config.minimum_transition_strength
+            and directional_strength >= self.config.minimum_transition_strength
             and quality >= self.config.minimum_data_quality
             and liquidity >= self.config.minimum_liquidity_score
             and crowding <= self.config.maximum_crowding
@@ -546,7 +677,11 @@ class StrategyEngine:
             reasons.append("LIQUIDITY_LOW")
         if quality < self.config.minimum_data_quality:
             reasons.append("DATA_QUALITY_LOW")
-        if transition_strength < self.config.minimum_transition_strength:
+        if (
+            prior is not None
+            and prior != state
+            and transition_strength < self.config.minimum_transition_strength
+        ):
             reasons.append("TRANSITION_STRENGTH_LOW")
         self._previous_states[frame.symbol.upper()] = state
         snapshot_id = self._snapshot_id(frame, timestamp, evidence)
@@ -558,6 +693,7 @@ class StrategyEngine:
             transition=transition,
             previous_state=prior,
             transition_strength=transition_strength,
+            directional_strength=directional_strength,
             confidence=confidence,
             long_score=long_score,
             short_score=short_score,
@@ -579,7 +715,8 @@ class StrategyEngine:
         return PositioningDecision(
             symbol=frame.symbol.upper(), timestamp=timestamp, direction="FLAT",
             state="UNKNOWN", transition="NONE", previous_state=None,
-            transition_strength=Decimal("0"), confidence=Decimal("0"),
+            transition_strength=Decimal("0"), directional_strength=Decimal("0"),
+            confidence=Decimal("0"),
             long_score=Decimal("0"), short_score=Decimal("0"),
             crowding_score=Decimal("0"), liquidity_score=Decimal("0"),
             data_quality_score=Decimal("0"), reason_codes=(reason,),
@@ -636,38 +773,92 @@ class StrategyEngine:
         )
         return {name: getattr(frame, name) for name in names}
 
-    def _intent_from_positioning(self, decision: PositioningDecision) -> TradeIntent | None:
-        required_direction = {
-            "LONG_BUILDING": "LONG",
-            "SHORT_BUILDING": "SHORT",
-        }.get(decision.state)
-        if (
-            decision.direction == "FLAT"
-            or decision.direction != required_direction
-            or decision.transition_strength < self.config.minimum_transition_strength
-        ):
+    def _intent_from_positioning(
+        self,
+        decision: PositioningDecision,
+        frame: MarketFrame,
+        current_position: CurrentPosition | None = None,
+    ) -> TradeIntent | None:
+        current = current_position or CurrentPosition()
+        if current.meme_risk_tier in {"BLOCK", "OBSERVE"}:
             return None
-        return TradeIntent(
+        return self._intent_for_action(
             symbol=decision.symbol,
-            side="BUY" if decision.direction == "LONG" else "SELL",
-            order_type="MARKET",
-            quote_quantity=self.config.order_quote_usdt,
+            desired=decision.direction,
+            state=decision.state,
+            frame=frame,
+            current=current,
             confidence=decision.confidence,
             reason="; ".join(decision.reason_codes) or decision.state,
             strategy_version=self.config.positioning_strategy_version,
             created_at=decision.timestamp,
-            direction=decision.direction,
-            positioning_state=decision.state,
-            transition=decision.transition,
-            long_score=decision.long_score,
-            short_score=decision.short_score,
-            crowding_score=decision.crowding_score,
-            liquidity_score=decision.liquidity_score,
-            data_quality_score=decision.data_quality_score,
-            reason_codes=decision.reason_codes,
-            evidence_snapshot_id=decision.evidence_snapshot_id,
-            market_regime=decision.market_regime,
+            positioning=decision,
         )
+
+    def _intent_for_action(
+        self,
+        *,
+        symbol: str,
+        desired: Direction,
+        state: str,
+        frame: MarketFrame,
+        current: CurrentPosition,
+        confidence: Decimal,
+        reason: str,
+        strategy_version: str,
+        created_at,
+        positioning: PositioningDecision | None = None,
+    ) -> TradeIntent | None:
+        mapped = _map_position_action(current.direction, desired, state)
+        if mapped is None:
+            return None
+        direction, action = mapped
+        price = frame.mark_price or frame.last_price or frame.closes[-1]
+        if price <= 0:
+            return None
+        if action == "OPEN":
+            quantity = self.config.order_quote_usdt / price
+            reduce_only = False
+        elif action == "REDUCE":
+            quantity = current.quantity / Decimal("2")
+            reduce_only = True
+        else:
+            quantity = current.quantity
+            reduce_only = True
+        if quantity <= 0:
+            return None
+        values = {
+            "symbol": symbol,
+            "direction": direction,
+            "action": action,
+            "reduce_only": reduce_only,
+            "leverage": self.config.default_leverage,
+            "order_type": "MARKET",
+            "quantity": quantity,
+            "confidence": confidence,
+            "reason": reason,
+            "strategy_version": strategy_version,
+            "created_at": created_at,
+            "meme_risk_tier": current.meme_risk_tier,
+        }
+        if positioning is not None:
+            values.update(
+                positioning_state=positioning.state,
+                previous_state=positioning.previous_state,
+                transition=positioning.transition,
+                long_score=positioning.long_score,
+                short_score=positioning.short_score,
+                crowding_score=positioning.crowding_score,
+                liquidity_score=positioning.liquidity_score,
+                data_quality_score=positioning.data_quality_score,
+                directional_strength=positioning.directional_strength,
+                transition_strength=positioning.transition_strength,
+                reason_codes=positioning.reason_codes,
+                evidence_snapshot_id=positioning.evidence_snapshot_id,
+                market_regime=positioning.market_regime,
+            )
+        return TradeIntent(**values)
+
 
     def _evidence(
         self, frame: MarketFrame, now: datetime
@@ -675,32 +866,52 @@ class StrategyEngine:
         reasons: list[str] = []
         if not frame.freshness:
             return EvidenceVector(), Decimal("0"), ["MISSING_FRESHNESS"]
-        fresh_items = [
-            _aware(item.received_timestamp) <= now
-            and _aware(item.source_timestamp) <= now
-            and (now - _aware(item.source_timestamp)).total_seconds() <= max(1, item.max_age_sec)
-            for item in frame.freshness
+
+        def _item_fresh(item: SourceFreshness) -> bool:
+            return (
+                _aware(item.received_timestamp) <= now
+                and _aware(item.source_timestamp) <= now
+                and (now - _aware(item.source_timestamp)).total_seconds() <= max(1, item.max_age_sec)
+            )
+
+        core_freshness_items = [
+            item for item in frame.freshness if _is_core_futures_source(item.source)
         ]
-        freshness = Decimal(sum(fresh_items)) / Decimal(len(fresh_items))
-        if not all(fresh_items):
-            reasons.append("STALE_DATA")
-        timestamp_consistent = _timestamps_consistent(frame.source_timestamps, now)
-        if not timestamp_consistent:
+        aux_freshness_items = [
+            item for item in frame.freshness if _is_auxiliary_spot_source(item.source)
+        ]
+        core_fresh_flags = [_item_fresh(item) for item in core_freshness_items]
+        aux_fresh_flags = [_item_fresh(item) for item in aux_freshness_items]
+        if core_fresh_flags:
+            freshness = Decimal(sum(core_fresh_flags)) / Decimal(len(core_fresh_flags))
+            if not all(core_fresh_flags):
+                reasons.append("STALE_DATA")
+        else:
+            freshness = Decimal("1")
+        if aux_fresh_flags and not all(aux_fresh_flags):
+            reasons.append("AUXILIARY_SPOT_STALE")
+        core_ok, aux_ok = _timestamps_consistent(frame.source_timestamps, now)
+        if not core_ok:
             reasons.append("TIMESTAMP_INCONSISTENT")
-        required_features = (
-            frame.net_spot_flow, frame.cvd_change, frame.oi_change,
-            frame.funding_rate, frame.taker_buy_volume, frame.taker_sell_volume,
+        elif not aux_ok:
+            reasons.append("AUXILIARY_SPOT_TIMESTAMP_INCONSISTENT")
+        core_features = (
+            frame.oi_change, frame.funding_rate,
+            frame.taker_buy_volume, frame.taker_sell_volume,
             frame.spread_bps, frame.depth_25bps,
         )
-        if any(value is None for value in required_features):
-            reasons.append("MISSING_REQUIRED_POSITIONING_SOURCE")
+        if any(value is None for value in core_features):
+            reasons.append("MISSING_CORE_FUTURES_EVIDENCE")
+        auxiliary_features = (
+            frame.net_spot_flow, frame.cvd_change,
+            frame.spot_buy_volume, frame.spot_sell_volume,
+        )
+        if any(value is None for value in auxiliary_features):
+            reasons.append("AUXILIARY_SPOT_MISSING")
         required_timestamp_sources = (
-            "spot_trade",
             "futures_open_interest",
             "futures_funding",
             "futures_taker_flow",
-            "spot_book_ticker",
-            "spot_orderbook",
         )
         timestamp_provenance_complete = all(
             source in frame.source_timestamps
@@ -708,29 +919,24 @@ class StrategyEngine:
         )
         if not timestamp_provenance_complete:
             reasons.append("MISSING_TIMESTAMP_PROVENANCE")
-        supplied = sum(value is not None for value in (
-            frame.spot_buy_volume, frame.spot_sell_volume, frame.net_spot_flow,
-            frame.cvd_change, frame.oi_change, frame.funding_rate,
-            frame.taker_buy_volume, frame.taker_sell_volume, frame.spread_bps,
-            frame.depth_25bps,
-        ))
-        completeness = Decimal(supplied) / Decimal("10")
+        supplied = sum(value is not None for value in core_features)
+        completeness = Decimal(supplied) / Decimal(len(core_features))
         quality = min(
             Decimal("1"), freshness * (Decimal("0.5") + completeness / Decimal("2"))
         )
         if frame.data_quality_score is not None:
             quality = min(quality, max(Decimal("0"), frame.data_quality_score))
-        if frame.price_cvd_divergence:
+        if frame.price_cvd_divergence and frame.cvd_change is not None:
             # Price and aggressive-flow direction disagree. Keep the raw
             # evidence for audit, but do not let a partially aligned subset
             # manufacture a directional trade.
             quality *= Decimal("0.85")
             reasons.append("PRICE_CVD_DIVERGENCE")
-        if not all(fresh_items):
+        if core_fresh_flags and not all(core_fresh_flags):
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
-        if not timestamp_consistent:
+        if not core_ok:
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
-        if any(value is None for value in required_features):
+        if any(value is None for value in core_features):
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
         if not timestamp_provenance_complete:
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
@@ -752,23 +958,23 @@ class StrategyEngine:
             else -1 if frame.market_regime in {"RISK_OFF", "TRENDING_DOWN"}
             else 0
         )
-        if flow_signal > 0:
+        if _positive(flow_signal):
             reasons.append("SPOT_BUYING")
-        elif flow_signal < 0:
+        elif _negative(flow_signal):
             reasons.append("SPOT_SELLING")
-        if cvd_signal > 0:
+        if _positive(cvd_signal):
             reasons.append("POSITIVE_CVD")
-        elif cvd_signal < 0:
+        elif _negative(cvd_signal):
             reasons.append("NEGATIVE_CVD")
         if frame.volume_ratio_5m is not None and frame.volume_ratio_5m >= Decimal("2"):
             reasons.append("VOLUME_EXCEPTIONAL")
-        if oi_signal > 0:
+        if _positive(oi_signal):
             reasons.append("OI_EXPANSION")
-        elif oi_signal < 0:
+        elif _negative(oi_signal):
             reasons.append("OI_CONTRACTION")
-        if taker_signal > 0:
+        if _positive(taker_signal):
             reasons.append("TAKER_BUY")
-        elif taker_signal < 0:
+        elif _negative(taker_signal):
             reasons.append("TAKER_SELL")
         return EvidenceVector(
             price=price_signal, spot_flow=flow_signal, cvd=cvd_signal, oi=oi_signal,
@@ -788,10 +994,11 @@ class StrategyEngine:
             (evidence.relative_strength, weights.relative_strength),
             (evidence.market_regime, weights.market_regime),
         )
-        total = sum(weight for _, weight in values)
+        present = [(value, weight) for value, weight in values if value is not None]
+        total = sum(weight for _, weight in present) or Decimal("1")
         return (
-            sum(weight for value, weight in values if value > 0) / total,
-            sum(weight for value, weight in values if value < 0) / total,
+            sum(weight for value, weight in present if value > 0) / total,
+            sum(weight for value, weight in present if value < 0) / total,
         )
 
     def _state(
@@ -807,26 +1014,26 @@ class StrategyEngine:
             return "FORCED_DELEVERAGING"
         price, oi = evidence.price, evidence.oi
         flow, taker, cvd = evidence.spot_flow, evidence.taker, evidence.cvd
-        if frame.price_cvd_divergence and price and cvd and price != cvd:
+        if frame.price_cvd_divergence and price is not None and cvd is not None and price != cvd:
             return "CONFLICTED"
-        positive = sum(value > 0 for value in (price, flow, cvd, taker))
-        negative = sum(value < 0 for value in (price, flow, cvd, taker))
+        positive = sum(_positive(value) for value in (price, flow, cvd, taker))
+        negative = sum(_negative(value) for value in (price, flow, cvd, taker))
         if positive >= 2 and negative >= 2:
             return "CONFLICTED"
-        if price > 0 and oi < 0:
+        if _positive(price) and _negative(oi):
             return "SHORT_COVERING"
-        if price < 0 and oi < 0:
+        if _negative(price) and _negative(oi):
             return "LONG_UNWIND"
-        if price > 0 and oi > 0 and flow > 0 and taker > 0:
+        if _positive(price) and _positive(oi) and _positive(taker):
             if crowding > self.config.maximum_crowding and (
-                cvd <= 0
+                cvd is not None and cvd <= 0
                 or (frame.cvd_acceleration is not None and frame.cvd_acceleration < 0)
             ):
                 return "EXHAUSTION_LONG"
             return "LONG_BUILDING"
-        if price < 0 and oi > 0 and flow < 0 and taker < 0:
+        if _negative(price) and _positive(oi) and _negative(taker):
             if crowding > self.config.maximum_crowding and (
-                cvd >= 0
+                cvd is not None and cvd >= 0
                 or (frame.cvd_acceleration is not None and frame.cvd_acceleration > 0)
             ):
                 return "EXHAUSTION_SHORT"
@@ -835,14 +1042,14 @@ class StrategyEngine:
             frame.price_impact_sell is not None
             and frame.price_impact_sell <= Decimal("0.001")
             and (frame.volume_ratio_5m or Decimal("0")) >= Decimal("2")
-            and flow < 0 and taker < 0
+            and _negative(flow) and _negative(taker)
         ):
             return "ABSORPTION_LONG"
         if (
             frame.price_impact_buy is not None
             and frame.price_impact_buy <= Decimal("0.001")
             and (frame.volume_ratio_5m or Decimal("0")) >= Decimal("2")
-            and flow > 0 and taker > 0
+            and _positive(flow) and _positive(taker)
         ):
             return "ABSORPTION_SHORT"
         return "NEUTRAL"

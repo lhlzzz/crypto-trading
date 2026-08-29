@@ -48,6 +48,9 @@ def test_paper_startup_recovery_allows_clean_store() -> None:
 
 
 def test_live_startup_requires_explicit_confirmation(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_MARKET", "FUTURES")
+    monkeypatch.setenv("POSITIONING_DECISION_ENABLED", "true")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
     monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret-token")
     monkeypatch.delenv("BIAN_LIVE_CONFIRMATION", raising=False)
 
@@ -82,7 +85,8 @@ def test_test_only_signal_injection_still_creates_intent_in_paper(monkeypatch) -
 
     assert intent is not None
     assert intent.reason == "TEST_ONLY_SIGNAL_INJECTION"
-    assert intent.side == "BUY"
+    assert intent.direction == "LONG"
+    assert intent.action == "OPEN"
 
 
 def test_test_only_signal_injection_is_hard_blocked_outside_paper(monkeypatch) -> None:

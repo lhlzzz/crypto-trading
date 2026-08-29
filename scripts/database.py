@@ -193,7 +193,6 @@ def _create_trading_tables(cursor: Any) -> None:
             side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
             order_type TEXT NOT NULL CHECK (order_type IN ('MARKET', 'LIMIT')),
             quantity NUMERIC,
-            quote_quantity NUMERIC,
             price NUMERIC,
             confidence NUMERIC NOT NULL,
             reason TEXT NOT NULL,
@@ -230,7 +229,6 @@ def _create_trading_tables(cursor: Any) -> None:
             client_order_id TEXT NOT NULL UNIQUE,
             exchange_order_id TEXT,
             quantity NUMERIC,
-            quote_quantity NUMERIC,
             price NUMERIC,
             executed_quantity NUMERIC NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
@@ -433,6 +431,104 @@ def _create_trading_tables(cursor: Any) -> None:
         ON liquidation_events(symbol, event_timestamp DESC)
         """
     )
+    _migrate_futures_columns(cursor)
+
+
+def _migrate_futures_columns(cursor: Any) -> None:
+    """Add futures fields to the existing trading tables."""
+    statements = (
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS direction TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS action TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS reduce_only BOOLEAN",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS leverage NUMERIC",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS margin_type TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS position_mode TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS positioning_state TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS previous_state TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS transition TEXT",
+        "ALTER TABLE trade_intents ADD COLUMN IF NOT EXISTS evidence_snapshot_id UUID",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS market TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS position_side TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS position_action TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS reduce_only BOOLEAN",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS leverage NUMERIC",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS margin_type TEXT",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS market TEXT",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS position_side TEXT",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS funding NUMERIC NOT NULL DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS market TEXT",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS position_side TEXT",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_price NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mark_price NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS notional NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS leverage NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS margin_type TEXT",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS initial_margin NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS maintenance_margin NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS liquidation_price NUMERIC",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS funding_pnl NUMERIC NOT NULL DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS index_price NUMERIC",
+        "ALTER TABLE balances ADD COLUMN IF NOT EXISTS wallet_balance NUMERIC",
+        "ALTER TABLE balances ADD COLUMN IF NOT EXISTS available_balance NUMERIC",
+        "ALTER TABLE balances ADD COLUMN IF NOT EXISTS margin_balance NUMERIC",
+        "ALTER TABLE balances ADD COLUMN IF NOT EXISTS used_margin NUMERIC",
+        "ALTER TABLE balances ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC",
+    )
+    for statement in statements:
+        cursor.execute(statement)
+    cursor.execute(
+        """
+        UPDATE trade_intents
+        SET payload = COALESCE(payload, CAST('{}' AS JSONB))
+            || CAST('{"legacy": true}' AS JSONB)
+        WHERE direction IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'trade_intents' AND column_name = 'quote_quantity'
+        """
+    )
+    if cursor.fetchone() is not None:
+        cursor.execute(
+            """
+            UPDATE trade_intents
+            SET payload = COALESCE(payload, CAST('{}' AS JSONB))
+                || jsonb_build_object('legacy_quote_quantity', quote_quantity::text)
+            WHERE quote_quantity IS NOT NULL
+            """
+        )
+        cursor.execute("ALTER TABLE trade_intents DROP COLUMN IF EXISTS quote_quantity")
+    cursor.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'orders' AND column_name = 'quote_quantity'
+        """
+    )
+    if cursor.fetchone() is not None:
+        cursor.execute(
+            """
+            UPDATE orders
+            SET payload = COALESCE(payload, CAST('{}' AS JSONB))
+                || jsonb_build_object('legacy_quote_quantity', quote_quantity::text)
+            WHERE quote_quantity IS NOT NULL
+            """
+        )
+        cursor.execute("ALTER TABLE orders DROP COLUMN IF EXISTS quote_quantity")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positions_market_symbol_side_uidx
+        ON positions (
+            COALESCE(market, 'FUTURES'),
+            symbol,
+            COALESCE(position_side, 'BOTH')
+        )
+        """
+    )
+
 
 def schema_status(dsn: str | None = None) -> dict[str, object]:
     dsn = dsn or configured_dsn()

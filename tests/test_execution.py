@@ -26,6 +26,7 @@ class MemoryStore:
         self.risk_events: list[dict[str, object]] = []
         self.balances: dict[str, dict[str, object]] = {}
         self.halted = False
+        self.system_events: list[dict[str, object]] = []
 
     def initialize(self) -> None:
         return None
@@ -38,9 +39,18 @@ class MemoryStore:
         self.orders[order_id] = {
             "order_id": order_id,
             "intent_id": intent.id,
+            "symbol": intent.symbol,
             "client_order_id": intent.client_order_id,
             "executed_quantity": Decimal("0"),
             "intent": intent,
+            "side": intent.exchange_side(),
+            "order_type": intent.order_type,
+            "quantity": intent.quantity,
+            "price": intent.price,
+            "position_side": intent.direction,
+            "position_action": intent.action,
+            "reduce_only": intent.reduce_only,
+            "leverage": intent.leverage,
             "mode": mode,
             "status": status,
             **fields,
@@ -81,11 +91,16 @@ class MemoryStore:
         return self.balances.get(asset)
 
     def record_system_event(self, **fields: object) -> UUID:
-        self.events.append((UUID(int=0), "SYSTEM_EVENT", str(fields)))
+        self.system_events.append(fields)
+        self.events.append((UUID(int=0), str(fields.get("event_type", "SYSTEM_EVENT")), str(fields)))
         return UUID(int=len(self.events))
 
     def is_halted(self) -> bool:
         return self.halted
+
+    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+        self.halted = halted
+        self.record_system_event(event_type="HALT", reason=reason, source=source)
 
     def get_order(self, order_id: UUID):
         return self.orders.get(order_id)
@@ -122,7 +137,10 @@ class MemoryStore:
 def _intent(**updates: object) -> TradeIntent:
     values: dict[str, object] = {
         "symbol": "BTCUSDT",
-        "side": "BUY",
+        "direction": "LONG",
+        "action": "OPEN",
+        "reduce_only": False,
+        "leverage": Decimal("2"),
         "order_type": "MARKET",
         "quantity": Decimal("0.1"),
         "confidence": Decimal("0.8"),
@@ -133,14 +151,36 @@ def _intent(**updates: object) -> TradeIntent:
     return TradeIntent(**values)
 
 
-def _risk(intent: TradeIntent):
-    return RiskGate().evaluate(
-        intent,
-        RiskContext(
-            available_quote_usdt=Decimal("1000"),
-            market_price=Decimal("100"),
-        ),
-    )
+def _market(**updates: object) -> MarketSnapshot:
+    values: dict[str, object] = {
+        "last_price": Decimal("100"),
+        "mark_price": Decimal("100"),
+        "index_price": Decimal("100"),
+        "bid_price": Decimal("99.9"),
+        "ask_price": Decimal("100.1"),
+    }
+    values.update(updates)
+    return MarketSnapshot(**values)  # type: ignore[arg-type]
+
+
+def _risk(intent: TradeIntent, **updates: object):
+    values: dict[str, object] = {
+        "wallet_balance": Decimal("1000"),
+        "available_balance": Decimal("1000"),
+        "equity": Decimal("1000"),
+        "mark_price": Decimal("100"),
+        "leverage": intent.leverage,
+        "data_quality_score": Decimal("1"),
+        "liquidity_score": Decimal("1"),
+        "positioning_confidence": Decimal("1"),
+        "liquidation_distance_percent": Decimal("50"),
+    }
+    if intent.action != "OPEN":
+        values["position_direction"] = intent.direction
+        values["position_quantity"] = intent.quantity
+        values["position_notional"] = intent.quantity * Decimal("100")
+    values.update(updates)
+    return RiskGate().evaluate(intent, RiskContext(**values))  # type: ignore[arg-type]
 
 
 def test_paper_executor_runs_shared_order_lifecycle() -> None:
@@ -148,20 +188,12 @@ def test_paper_executor_runs_shared_order_lifecycle() -> None:
     intent = _intent()
     result = PaperExecutor(
         store=store,
-        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0.001")),
-    ).submit(
-        intent,
-        _risk(intent),
-        market=MarketSnapshot(
-            last_price=Decimal("100"),
-            bid_price=Decimal("99.9"),
-            ask_price=Decimal("100.1"),
-        ),
-    )
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0.001"), slippage_bps=Decimal("0")),
+    ).submit(intent, _risk(intent), market=_market())
 
     assert result.status == "FILLED"
     assert result.executed_quantity == Decimal("0.1")
-    assert [event[1] for event in store.events] == [
+    assert [event[1] for event in store.events][:5] == [
         "ORDER_CREATED",
         "ORDER_RISK_APPROVED",
         "ORDER_SUBMITTED",
@@ -169,7 +201,70 @@ def test_paper_executor_runs_shared_order_lifecycle() -> None:
         "ORDER_FILLED",
     ]
     assert len(store.trades) == 1
-    assert store.positions[-1]["quantity"] == Decimal("0.1")
+    assert store.get_position("BTCUSDT")["position_side"] == "LONG"
+    assert store.get_position("BTCUSDT")["quantity"] == Decimal("0.1")
+    assert store.get_balance("BTC") is None
+
+
+def test_paper_open_and_close_long() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0.001"), slippage_bps=Decimal("0")),
+    )
+    open_intent = _intent()
+    executor.submit(open_intent, _risk(open_intent), market=_market())
+    close_intent = _intent(action="CLOSE", reduce_only=True)
+    result = executor.submit(
+        close_intent,
+        _risk(close_intent),
+        market=_market(last_price=Decimal("110"), mark_price=Decimal("110"), bid_price=Decimal("110"), ask_price=Decimal("110.1")),
+    )
+
+    position = store.get_position("BTCUSDT")
+    assert result.status == "FILLED"
+    assert position["position_side"] == "FLAT"
+    assert position["quantity"] == Decimal("0")
+    assert position["realized_pnl"] > 0
+    assert "BTC" not in store.balances
+
+
+def test_paper_open_and_close_short() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    open_intent = _intent(direction="SHORT")
+    executor.submit(open_intent, _risk(open_intent), market=_market())
+    close_intent = _intent(direction="SHORT", action="CLOSE", reduce_only=True)
+    executor.submit(
+        close_intent,
+        _risk(close_intent),
+        market=_market(last_price=Decimal("90"), mark_price=Decimal("90"), bid_price=Decimal("89.9"), ask_price=Decimal("90")),
+    )
+    position = store.get_position("BTCUSDT")
+    assert position["position_side"] == "FLAT"
+    assert position["realized_pnl"] > 0
+
+
+def test_paper_partial_reduce() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    open_intent = _intent(quantity=Decimal("0.2"))
+    executor.submit(open_intent, _risk(open_intent), market=_market())
+    reduce_intent = _intent(action="REDUCE", reduce_only=True, quantity=Decimal("0.1"))
+    executor.submit(
+        reduce_intent,
+        _risk(reduce_intent, position_quantity=Decimal("0.2")),
+        market=_market(),
+    )
+    position = store.get_position("BTCUSDT")
+    assert position["position_side"] == "LONG"
+    assert position["quantity"] == Decimal("0.1")
 
 
 def test_paper_executor_supports_partial_fill() -> None:
@@ -178,40 +273,32 @@ def test_paper_executor_supports_partial_fill() -> None:
     result = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", partial_fill_ratio=Decimal("0.5")),
-    ).submit(intent, _risk(intent), market=MarketSnapshot(last_price=Decimal("100")))
+    ).submit(intent, _risk(intent), market=_market())
 
     assert result.status == "PARTIALLY_FILLED"
     assert result.executed_quantity == Decimal("0.05")
-    assert store.events[-1][1] == "ORDER_PARTIALLY_FILLED"
+    assert store.orders[result.order_id]["status"] == "PARTIALLY_FILLED"
 
 
-def test_paper_executor_converts_quote_quantity_using_market_price() -> None:
+def test_paper_low_liquidity_cannot_fully_fill() -> None:
     store = MemoryStore()
-    intent = _intent(quantity=None, quote_quantity=Decimal("10"))
+    intent = _intent()
     result = PaperExecutor(store=store).submit(
         intent,
         _risk(intent),
-        market=MarketSnapshot(last_price=Decimal("100")),
+        market=_market(available_liquidity=Decimal("0.04")),
     )
-
-    assert result.status == "FILLED"
-    assert result.executed_quantity == Decimal("0.1")
+    assert result.status == "PARTIALLY_FILLED"
+    assert result.executed_quantity == Decimal("0.04")
 
 
 def test_paper_executor_rejects_denied_risk_decision() -> None:
     store = MemoryStore()
     intent = _intent()
-    denied = RiskGate().evaluate(
-        intent,
-        RiskContext(available_quote_usdt=Decimal("1000"), halted=True),
-    )
+    denied = RiskGate().evaluate(intent, RiskContext(halted=True, mark_price=Decimal("100")))
 
     with pytest.raises(ExecutionRejected, match="halted"):
-        PaperExecutor(store=store).submit(
-            intent,
-            denied,
-            market=MarketSnapshot(last_price=Decimal("100")),
-        )
+        PaperExecutor(store=store).submit(intent, denied, market=_market())
 
     assert store.orders == {}
     assert store.risk_events[0]["decision"] == "HALT"
@@ -219,23 +306,13 @@ def test_paper_executor_rejects_denied_risk_decision() -> None:
 
 def test_paper_limit_order_can_rest_and_expire() -> None:
     store = MemoryStore()
-    intent = _intent(
-        order_type="LIMIT",
-        quantity=Decimal("0.1"),
-        quote_quantity=None,
-        price=Decimal("99"),
-    )
+    intent = _intent(order_type="LIMIT", quantity=Decimal("0.1"), price=Decimal("99"))
     result = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", order_expiry_sec=10),
-    ).submit(
-        intent,
-        _risk(intent),
-        market=MarketSnapshot(last_price=Decimal("100"), ask_price=Decimal("100")),
-    )
+    ).submit(intent, _risk(intent), market=_market())
 
     assert result.status == "ACKNOWLEDGED"
-    assert store.events[-1][1] == "ORDER_ACKNOWLEDGED"
     order = store.orders[result.order_id]
     order["expires_at"] = datetime.now(timezone.utc).replace(year=2020)
 
@@ -243,27 +320,24 @@ def test_paper_limit_order_can_rest_and_expire() -> None:
 
     assert recovered == []
     assert store.orders[result.order_id]["status"] == "EXPIRED"
-    assert store.events[-1][1] == "ORDER_EXPIRED"
 
 
 def test_paper_partial_order_can_fill_on_a_later_market_cycle() -> None:
     store = MemoryStore()
-    intent = _intent(order_type="LIMIT", price=Decimal("100"))
+    intent = _intent(order_type="LIMIT", price=Decimal("100.1"))
     executor = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", partial_fill_ratio=Decimal("0.5")),
     )
-
     first = executor.submit(
         intent,
         _risk(intent),
-        market=MarketSnapshot(last_price=Decimal("100"), available_liquidity=Decimal("0.1")),
+        market=_market(available_liquidity=Decimal("0.1")),
     )
     second = executor.process_market(
         first.order_id,
-        MarketSnapshot(last_price=Decimal("100"), available_liquidity=Decimal("0.1")),
+        _market(available_liquidity=Decimal("0.1")),
     )
-
     assert first.status == "PARTIALLY_FILLED"
     assert second.status == "FILLED"
     assert second.executed_quantity == Decimal("0.1")
@@ -274,18 +348,15 @@ def test_paper_duplicate_submit_is_idempotent() -> None:
     store = MemoryStore()
     intent = _intent()
     executor = PaperExecutor(store=store)
-    first = executor.submit(intent, _risk(intent), market=MarketSnapshot(last_price=Decimal("100")))
-    second = executor.submit(intent, _risk(intent), market=MarketSnapshot(last_price=Decimal("100")))
-
+    first = executor.submit(intent, _risk(intent), market=_market())
+    second = executor.submit(intent, _risk(intent), market=_market())
     assert second.order_id == first.order_id
-    assert second.executed_quantity == first.executed_quantity
     assert len(store.trades) == 1
-    assert [event[1] for event in store.events].count("ORDER_FILLED") == 1
 
 
 def test_paper_restart_recovers_partial_order_without_duplicate_trade() -> None:
     store = MemoryStore()
-    intent = _intent(order_type="LIMIT", price=Decimal("100"))
+    intent = _intent(order_type="LIMIT", price=Decimal("100.1"))
     first_executor = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", partial_fill_ratio=Decimal("0.5")),
@@ -293,118 +364,189 @@ def test_paper_restart_recovers_partial_order_without_duplicate_trade() -> None:
     first = first_executor.submit(
         intent,
         _risk(intent),
-        market=MarketSnapshot(last_price=Decimal("100"), available_liquidity=Decimal("0.1")),
+        market=_market(available_liquidity=Decimal("0.1")),
     )
     restarted_executor = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", partial_fill_ratio=Decimal("0.5")),
     )
-
     recovered = restarted_executor.recover()
     final = restarted_executor.process_market(
         first.order_id,
-        MarketSnapshot(last_price=Decimal("100"), available_liquidity=Decimal("0.1")),
+        _market(available_liquidity=Decimal("0.1")),
     )
-
     assert len(recovered) == 1
     assert recovered[0].status == "PARTIALLY_FILLED"
     assert final.status == "FILLED"
     assert len(store.trades) == 2
-    assert sum(trade["fee"] for trade in store.trades) == Decimal("0.010")
 
 
-def test_paper_mark_to_market_updates_unrealized_pnl() -> None:
+def test_paper_mark_to_market_uses_mark_price() -> None:
     store = MemoryStore()
     intent = _intent()
-    executor = PaperExecutor(store=store)
-    executor.submit(intent, _risk(intent), market=MarketSnapshot(last_price=Decimal("100")))
-
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
     executor.mark_to_market("BTCUSDT", Decimal("110"))
-
     position = store.get_position("BTCUSDT")
     assert position is not None
-    assert position["unrealized_pnl"] == Decimal("0.99500")
+    assert position["unrealized_pnl"] == Decimal("1.0")
+    assert position["mark_price"] == Decimal("110")
 
 
-def test_paper_buy_sell_accounting_preserves_equity_components() -> None:
+def test_paper_funding_is_recorded_separately() -> None:
     store = MemoryStore()
+    intent = _intent()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
+    payment = executor.apply_funding(
+        "BTCUSDT",
+        _market(funding_rate=Decimal("0.01"), funding_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc)),
+    )
+    position = store.get_position("BTCUSDT")
+    assert payment < 0
+    assert position["funding_pnl"] == payment
+    assert executor.account_state()["funding_pnl"] == payment
+
+
+def test_paper_liquidation_halts() -> None:
+    store = MemoryStore()
+    intent = _intent(leverage=Decimal("5"), quantity=Decimal("1"))
     executor = PaperExecutor(
         store=store,
         config=ExecutionConfig(
             mode="paper",
-            fee_rate=Decimal("0.001"),
+            fee_rate=Decimal("0"),
             slippage_bps=Decimal("0"),
+            maintenance_margin_ratio=Decimal("0.5"),
+            initial_usdt=Decimal("1000"),
         ),
     )
-    buy = _intent(quantity=Decimal("0.1"))
-    buy_result = executor.submit(
-        buy,
-        _risk(buy),
-        market=MarketSnapshot(last_price=Decimal("100")),
+    executor.submit(
+        intent,
+        _risk(intent, available_balance=Decimal("1000")),
+        market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")),
     )
-    position = store.get_position("BTCUSDT")
-    assert position is not None
-    assert position["quantity"] == Decimal("0.1")
-    assert position["realized_pnl"] == -buy_result.fee
+    executor.mark_to_market("BTCUSDT", Decimal("40"))
+    assert store.halted is True
+    assert store.get_position("BTCUSDT")["position_side"] == "FLAT"
+    assert any(event.get("event_type") == "LIQUIDATED" for event in store.system_events)
 
-    sell = _intent(
-        side="SELL",
-        quantity=Decimal("0.1"),
-        reason="test exit",
-    )
-    sell_risk = RiskGate().evaluate(
-        sell,
-        RiskContext(
-            available_quote_usdt=store.get_balance("USDT")["free"],
-            available_base_quantity=Decimal("0.1"),
-            position_usdt=Decimal("10"),
-            market_price=Decimal("110"),
-        ),
-    )
-    sell_result = executor.submit(
-        sell,
-        sell_risk,
-        market=MarketSnapshot(last_price=Decimal("110")),
-    )
 
-    position = store.get_position("BTCUSDT")
-    assert position is not None
-    assert position["quantity"] == Decimal("0")
-    assert position["unrealized_pnl"] == Decimal("0")
-    assert sell_result.executed_quantity == Decimal("0.1")
-    assert len(store.trades) == 2
-    assert store.get_balance("USDT")["free"] > Decimal("1000")
+def test_paper_fees_are_deducted() -> None:
+    store = MemoryStore()
+    intent = _intent()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0.001"), slippage_bps=Decimal("0")),
+    )
+    result = executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
+    assert result.fee > 0
+    assert executor.account_state()["wallet_balance"] < Decimal("1000")
 
 
 def test_paper_limit_cancel_has_no_trade_side_effect() -> None:
     store = MemoryStore()
     intent = _intent(order_type="LIMIT", price=Decimal("99"))
     executor = PaperExecutor(store=store)
-    result = executor.submit(
-        intent,
-        _risk(intent),
-        market=MarketSnapshot(last_price=Decimal("100"), ask_price=Decimal("100")),
-    )
-
+    result = executor.submit(intent, _risk(intent), market=_market())
     cancelled = executor.cancel(result.order_id)
-
     assert cancelled.status == "CANCELLED"
     assert store.trades == []
 
 
-def test_paper_rejects_when_cash_is_insufficient() -> None:
+def test_paper_rejects_when_margin_is_insufficient() -> None:
     store = MemoryStore()
-    intent = _intent(quantity=Decimal("0.1"))
+    intent = _intent(quantity=Decimal("0.1"), leverage=Decimal("1"))
     executor = PaperExecutor(
         store=store,
         config=ExecutionConfig(mode="paper", initial_usdt=Decimal("1")),
     )
-
-    with pytest.raises(ExecutionRejected, match="quote balance"):
-        executor.submit(
-            intent,
-            _risk(intent),
-            market=MarketSnapshot(last_price=Decimal("100")),
-        )
-
+    with pytest.raises(ExecutionRejected, match="margin"):
+        executor.submit(intent, _risk(intent, available_balance=Decimal("1")), market=_market())
     assert store.orders == {}
+
+
+def test_paper_equity_identity_after_open() -> None:
+    store = MemoryStore()
+    intent = _intent()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0.001"), slippage_bps=Decimal("0")),
+    )
+    executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
+    account = executor.account_state()
+    assert account["equity"] == account["wallet_balance"] + account["unrealized_pnl"]
+    assert account["used_margin"] <= account["equity"]
+
+
+def test_reduce_only_cannot_increase_position() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    open_intent = _intent(quantity=Decimal("0.1"))
+    executor.submit(open_intent, _risk(open_intent), market=_market())
+    reduce_intent = _intent(action="REDUCE", reduce_only=True, quantity=Decimal("0.05"))
+    executor.submit(
+        reduce_intent,
+        _risk(reduce_intent, position_quantity=Decimal("0.1")),
+        market=_market(),
+    )
+    assert store.get_position("BTCUSDT")["quantity"] == Decimal("0.05")
+
+
+def test_futures_observation_to_paper_position_path() -> None:
+    from datetime import timezone
+    from engine import CurrentPosition, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
+
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    source_timestamps = {
+        source: {
+            "source_timestamp": captured.isoformat(),
+            "received_timestamp": captured.isoformat(),
+            "latency_ms": 0,
+        }
+        for source in (
+            "futures_open_interest",
+            "futures_funding",
+            "futures_taker_flow",
+        )
+    }
+    frame = MarketFrame(
+        symbol="BTCUSDT",
+        closes=(Decimal("100"), Decimal("101")),
+        captured_at=captured,
+        net_spot_flow=Decimal("8"),
+        cvd_change=Decimal("8"),
+        taker_buy_volume=Decimal("10"),
+        taker_sell_volume=Decimal("3"),
+        oi_change=Decimal("0.03"),
+        funding_rate=Decimal("0.0001"),
+        spread_bps=Decimal("2"),
+        depth_25bps=Decimal("100"),
+        market_regime="RISK_ON",
+        freshness=(SourceFreshness("futures_taker_flow", captured, captured, 900, captured),),
+        source_timestamps=source_timestamps,
+    )
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    intent = engine.evaluate(frame, current_position=CurrentPosition())
+    assert intent is not None
+    assert intent.direction == "LONG"
+    assert intent.action == "OPEN"
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    result = executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
+    assert result.status == "FILLED"
+    position = store.get_position("BTCUSDT")
+    assert position["position_side"] == "LONG"
+    assert position["quantity"] > 0

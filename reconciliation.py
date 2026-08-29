@@ -1,4 +1,4 @@
-"""Startup and recovery reconciliation for local trading state."""
+"""Startup and recovery reconciliation for local futures trading state."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,9 +8,12 @@ from typing import Any, Protocol
 
 from trading_store import TradingStore
 
+_TERMINAL_STATES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
+
 
 class ReconciliationClient(Protocol):
     def get_account(self) -> dict[str, Any]: ...
+    def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
     def get_order(
         self,
@@ -18,6 +21,7 @@ class ReconciliationClient(Protocol):
         order_id: int | str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]: ...
+    def get_user_trades(self, symbol: str, limit: int | None = None) -> list[dict[str, Any]]: ...
 
 
 @dataclass(frozen=True)
@@ -27,13 +31,11 @@ class ReconciliationResult:
     differences: tuple[str, ...] = ()
     recovered_orders: int = 0
     recovered_balances: int = 0
-
-
-_TERMINAL_STATES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
+    recovered_positions: int = 0
 
 
 class Reconciler:
-    """Compare broker state with local state and fail closed on uncertainty."""
+    """Compare Binance futures truth with local state and fail closed."""
 
     def __init__(
         self,
@@ -68,62 +70,128 @@ class Reconciler:
 
     def _recover_exchange(self) -> ReconciliationResult:
         assert self.client is not None
+        differences: list[str] = []
         account = self.client.get_account()
-        broker_balances = {
-            str(row.get("asset")): {
-                "free": Decimal(str(row.get("free", "0"))),
-                "locked": Decimal(str(row.get("locked", "0"))),
+        recovered_balances = self._reconcile_balances(account, differences)
+        recovered_positions = self._reconcile_positions(differences)
+        recovered_orders = self._reconcile_orders(differences)
+        if differences:
+            self._record_differences(differences)
+            return self._fail("; ".join(differences))
+        return ReconciliationResult(
+            "SAFE",
+            True,
+            recovered_orders=recovered_orders,
+            recovered_balances=recovered_balances,
+            recovered_positions=recovered_positions,
+        )
+
+    def _reconcile_balances(self, account: dict[str, Any], differences: list[str]) -> int:
+        broker_balances = {}
+        for row in account.get("assets") or account.get("balances") or []:
+            asset = str(row.get("asset") or "")
+            if not asset:
+                continue
+            broker_balances[asset] = {
+                "wallet_balance": Decimal(str(row.get("walletBalance") or row.get("free") or "0")),
+                "available_balance": Decimal(str(row.get("availableBalance") or row.get("free") or "0")),
+                "margin_balance": Decimal(str(row.get("marginBalance") or row.get("walletBalance") or "0")),
+                "unrealized_pnl": Decimal(str(row.get("unrealizedProfit") or "0")),
             }
-            for row in account.get("balances", [])
-            if row.get("asset")
-        }
         local_balances = {
-            str(row["asset"]): {
-                "free": Decimal(str(row.get("free", "0"))),
-                "locked": Decimal(str(row.get("locked", "0"))),
-            }
+            str(row["asset"]): row
             for row in self.store.list_balances()
             if row.get("mode") == self.mode
         }
-        differences: list[str] = []
-        # An empty local balance set is a first-run bootstrap, not a broker
-        # mismatch. Once local state exists, every balance is compared.
         if local_balances:
             for asset in set(broker_balances) | set(local_balances):
-                if broker_balances.get(asset, _empty_balance()) != local_balances.get(
-                    asset, _empty_balance()
-                ):
+                local = local_balances.get(asset, {})
+                broker = broker_balances.get(asset)
+                if broker is None:
                     differences.append(f"balance mismatch: {asset}")
-
-        recovered_balances = 0
+                    continue
+                local_wallet = Decimal(str(local.get("wallet_balance") or local.get("free") or "0"))
+                if local_wallet != broker["wallet_balance"]:
+                    differences.append(f"balance mismatch: {asset}")
+        recovered = 0
         upsert = getattr(self.store, "upsert_balance", None)
         if upsert is not None:
             for asset, balance in broker_balances.items():
                 upsert(
                     asset,
-                    free=balance["free"],
-                    locked=balance["locked"],
+                    free=balance["available_balance"],
+                    locked=balance["wallet_balance"] - balance["available_balance"],
+                    wallet_balance=balance["wallet_balance"],
+                    available_balance=balance["available_balance"],
+                    margin_balance=balance["margin_balance"],
+                    unrealized_pnl=balance["unrealized_pnl"],
                     mode=self.mode,
                     payload={"source": "binance_rest", "reconciled": True},
                 )
-                recovered_balances += 1
+                recovered += 1
+        return recovered
 
+    def _reconcile_positions(self, differences: list[str]) -> int:
+        assert self.client is not None
+        getter = getattr(self.client, "get_positions", None)
+        broker_rows = getter() if getter is not None else []
+        broker = {
+            str(row.get("symbol")): row
+            for row in broker_rows
+            if row.get("symbol")
+        }
+        local_rows = []
+        lister = getattr(self.store, "list_positions", None)
+        if lister is not None:
+            local_rows = lister()
+        recovered = 0
+        local_by_symbol = {str(row["symbol"]): row for row in local_rows}
+        for symbol in set(broker) | set(local_by_symbol):
+            exchange = broker.get(symbol)
+            local = local_by_symbol.get(symbol)
+            exchange_dir, exchange_qty = _exchange_position(exchange)
+            local_qty = abs(Decimal(str((local or {}).get("quantity") or "0")))
+            local_dir = str((local or {}).get("position_side") or "FLAT")
+            if local_qty == 0:
+                local_dir = "FLAT"
+            elif local_dir not in {"LONG", "SHORT"}:
+                local_dir = "LONG"
+            if exchange is None and local_qty == 0:
+                continue
+            if local is None and exchange_qty == 0:
+                continue
+            if exchange is None or local is None:
+                differences.append(f"position mismatch: {symbol}")
+                continue
+            if local_dir != exchange_dir or local_qty != exchange_qty:
+                differences.append(f"position mismatch: {symbol}")
+                continue
+            entry = Decimal(str(exchange.get("entryPrice") or "0"))
+            local_entry = Decimal(str(local.get("entry_price") or local.get("average_price") or "0"))
+            if entry != local_entry:
+                differences.append(f"position mismatch: {symbol}")
+                continue
+            recovered += 1
+        return recovered
+
+    def _reconcile_orders(self, differences: list[str]) -> int:
+        assert self.client is not None
         broker_orders = self.client.get_open_orders()
         broker_by_client_id = {
-            str(row.get("clientOrderId")): row
+            str(row.get("clientOrderId") or row.get("origClientOrderId")): row
             for row in broker_orders
-            if row.get("clientOrderId")
+            if row.get("clientOrderId") or row.get("origClientOrderId")
         }
         local_orders = self.store.list_open_local_orders()
         local_client_ids = {str(row["client_order_id"]) for row in local_orders}
         recovered_orders = 0
-
         for order in local_orders:
             local_id = str(order["client_order_id"])
+            if order.get("status") == "UNKNOWN":
+                differences.append(f"order status is UNKNOWN: {local_id}")
+                continue
             exchange_order = broker_by_client_id.get(local_id)
             if exchange_order is None:
-                # A missing open order may already be FILLED/CANCELED. Query
-                # by clientOrderId; never submit a replacement here.
                 try:
                     exchange_order = self.client.get_order(
                         str(order["symbol"]), client_order_id=local_id
@@ -137,20 +205,11 @@ class Reconciler:
                 continue
             self._restore_order(order, exchange_order, status)
             recovered_orders += 1
-
         unexpected = sorted(set(broker_by_client_id) - local_client_ids)
         differences.extend(
             f"exchange order has no local intent: {value}" for value in unexpected
         )
-        if differences:
-            self._record_differences(differences)
-            return self._fail("; ".join(differences))
-        return ReconciliationResult(
-            "SAFE",
-            True,
-            recovered_orders=recovered_orders,
-            recovered_balances=recovered_balances,
-        )
+        return recovered_orders
 
     def _restore_order(
         self,
@@ -207,19 +266,24 @@ class Reconciler:
 
 
 def apply_user_stream_event(store: TradingStore, event: Any) -> None:
-    """Apply a private event as a local observation, never as final truth."""
-
+    """Apply a private futures event as a local observation, never as final truth."""
+    event_type = getattr(event, "event_type", None)
+    if event_type == "ACCOUNT_UPDATE":
+        for balance in getattr(event, "balance_updates", ()):
+            store.upsert_balance(
+                balance["asset"],
+                free=Decimal(str(balance.get("available_balance") or "0")),
+                locked=Decimal("0"),
+                wallet_balance=Decimal(str(balance.get("wallet_balance") or "0")),
+                available_balance=Decimal(str(balance.get("available_balance") or "0")),
+                mode=os.environ.get("BIAN_MODE", "testnet"),
+                payload={"source": "user_stream"},
+            )
+        return
+    if event_type in {"malformed", "unknown"}:
+        return
     client_order_id = getattr(event, "client_order_id", None)
     if not client_order_id:
-        if getattr(event, "event_type", None) == "outboundAccountPosition":
-            for balance in getattr(event, "balances", ()):
-                store.upsert_balance(
-                    balance["asset"],
-                    free=Decimal(str(balance["free"])),
-                    locked=Decimal(str(balance["locked"])),
-                    mode=os.environ.get("BIAN_MODE", "testnet"),
-                    payload={"source": "user_stream"},
-                )
         return
     local = store.get_order_by_client_order_id(str(client_order_id))
     if local is None:
@@ -252,8 +316,19 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
     )
 
 
-def _empty_balance() -> dict[str, Decimal]:
-    return {"free": Decimal("0"), "locked": Decimal("0")}
+def _exchange_position(row: dict[str, Any] | None) -> tuple[str, Decimal]:
+    """Map exchange positionAmt/positionSide onto abs quantity + direction."""
+    if not row:
+        return "FLAT", Decimal("0")
+    amount = Decimal(str(row.get("positionAmt") or "0"))
+    side = str(row.get("positionSide") or "").upper()
+    if side in {"LONG", "SHORT"}:
+        return side, abs(amount)
+    if amount > 0:
+        return "LONG", amount
+    if amount < 0:
+        return "SHORT", abs(amount)
+    return "FLAT", Decimal("0")
 
 
 def _normal_status(status: str) -> str:

@@ -8,6 +8,14 @@ if [ "${BIAN_MODE:-}" != "live" ]; then
   echo "LIVE HARD BLOCK: BIAN_MODE must equal live" >&2
   exit 1
 fi
+if [ "${BIAN_MARKET:-}" != "FUTURES" ]; then
+  echo "LIVE HARD BLOCK: BIAN_MARKET must equal FUTURES" >&2
+  exit 1
+fi
+if [ "${POSITIONING_DECISION_ENABLED:-false}" != "true" ]; then
+  echo "LIVE HARD BLOCK: POSITIONING_DECISION_ENABLED must equal true" >&2
+  exit 1
+fi
 if [ "${LIVE_TRADING_ENABLED:-false}" != "true" ]; then
   echo "LIVE HARD BLOCK: LIVE_TRADING_ENABLED must equal true" >&2
   exit 1
@@ -24,13 +32,21 @@ if [ -z "${BIAN_LIVE_API_KEY:-}" ] || [ -z "${BIAN_LIVE_API_SECRET:-}" ]; then
   echo "BIAN_LIVE_API_KEY and BIAN_LIVE_API_SECRET are required for Live" >&2
   exit 1
 fi
+if [ "${FUTURES_POSITION_MODE:-ONE_WAY}" != "ONE_WAY" ]; then
+  echo "LIVE HARD BLOCK: FUTURES_POSITION_MODE must equal ONE_WAY" >&2
+  exit 1
+fi
+if [ "${FUTURES_MARGIN_MODE:-ISOLATED}" != "ISOLATED" ]; then
+  echo "LIVE HARD BLOCK: FUTURES_MARGIN_MODE must equal ISOLATED" >&2
+  exit 1
+fi
 
 cat <<BANNER
 ================================
 BIAN LIVE TRADING
 MODE: LIVE
 LIVE_TRADING_ENABLED: TRUE
-ACCOUNT: Binance Spot API account
+ACCOUNT: Binance USD-M Futures
 RISK LIMITS: environment configured
 MAX ORDER: ${MAX_ORDER_USDT:-100}
 MAX POSITION: ${MAX_POSITION_USDT:-500}

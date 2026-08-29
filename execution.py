@@ -28,6 +28,7 @@ OrderStatus = Literal[
     "FAILED",
     "UNKNOWN",
 ]
+PositionDirection = Literal["LONG", "SHORT", "FLAT"]
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,13 @@ class MarketSnapshot:
     """Market inputs used by paper execution."""
 
     last_price: Decimal
+    mark_price: Decimal | None = None
+    index_price: Decimal | None = None
     bid_price: Decimal | None = None
     ask_price: Decimal | None = None
     available_liquidity: Decimal | None = None
+    funding_rate: Decimal | None = None
+    funding_timestamp: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,8 @@ class ExecutionConfig:
     partial_fill_ratio: Decimal = Decimal("1")
     initial_usdt: Decimal = Decimal("1000")
     order_expiry_sec: int = 0
+    maintenance_margin_ratio: Decimal = Decimal("0.5")
+    default_leverage: Decimal = Decimal("1")
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "ExecutionConfig":
@@ -63,6 +70,10 @@ class ExecutionConfig:
             ),
             initial_usdt=Decimal(os.environ.get("PAPER_INITIAL_USDT", "1000")),
             order_expiry_sec=max(0, int(os.environ.get("PAPER_ORDER_EXPIRY_SEC", "0"))),
+            maintenance_margin_ratio=Decimal(
+                os.environ.get("PAPER_MAINTENANCE_MARGIN_RATIO", "0.5")
+            ),
+            default_leverage=Decimal(os.environ.get("PAPER_DEFAULT_LEVERAGE", "1")),
         )
 
     def __post_init__(self) -> None:
@@ -74,6 +85,10 @@ class ExecutionConfig:
             raise ValueError("partial_fill_ratio must be in (0, 1]")
         if self.latency_ms < 0 or self.initial_usdt < 0 or self.order_expiry_sec < 0:
             raise ValueError("latency and initial balance cannot be negative")
+        if not Decimal("0") < self.maintenance_margin_ratio <= Decimal("1"):
+            raise ValueError("maintenance_margin_ratio must be in (0, 1]")
+        if self.default_leverage <= 0:
+            raise ValueError("default_leverage must be positive")
 
 
 @dataclass(frozen=True)
@@ -173,8 +188,26 @@ class ExecutionRejected(RuntimeError):
     """The risk decision did not permit order submission."""
 
 
+def _decimal_field(row: dict[str, Any] | None, *names: str, default: str = "0") -> Decimal:
+    if not row:
+        return Decimal(default)
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    for name in names:
+        if row.get(name) is not None:
+            return Decimal(str(row[name]))
+        if payload.get(name) is not None:
+            return Decimal(str(payload[name]))
+    return Decimal(default)
+
+
+def _mark_price(market: MarketSnapshot) -> Decimal:
+    if market.mark_price is not None and market.mark_price > 0:
+        return market.mark_price
+    raise ValueError("paper mark-to-market requires a positive mark_price")
+
+
 class PaperExecutor(_BaseExecutor):
-    """Deterministic paper broker with an order lifecycle and accounting."""
+    """Deterministic futures paper broker with margin, funding, and liquidation."""
 
     def __init__(
         self,
@@ -196,18 +229,12 @@ class PaperExecutor(_BaseExecutor):
     ) -> ExecutionResult:
         if market is None or market.last_price <= 0:
             raise ValueError("paper execution requires a positive market snapshot")
+        if market.mark_price is None or market.mark_price <= 0:
+            raise ValueError("paper execution requires a positive mark_price")
         if self.store.is_halted():
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
-        requested_quantity = self._requested_quantity(approved, market.last_price)
-        if approved.quote_quantity is not None:
-            approved = approved.model_copy(
-                update={
-                    "quantity": requested_quantity,
-                    "quote_quantity": None,
-                }
-            )
-            self.store.record_intent(approved, status="RISK_APPROVED")
+        requested_quantity = approved.quantity
         existing_getter = getattr(self.store, "get_order_by_client_order_id", None)
         existing = (
             existing_getter(approved.client_order_id)
@@ -218,42 +245,30 @@ class PaperExecutor(_BaseExecutor):
             return self.get_order(UUID(str(existing["order_id"])))
         estimated_price = self._fill_price(approved, market)
         estimated_notional = requested_quantity * estimated_price
+        required_margin = (
+            estimated_notional / approved.leverage
+            if approved.action == "OPEN"
+            else Decimal("0")
+        )
+        account = self.account_state()
+        fee_estimate = estimated_notional * self.config.fee_rate
+        if approved.action == "OPEN" and account["available_balance"] < required_margin + fee_estimate:
+            self.store.record_system_event(
+                event_type="ORDER_REJECTED",
+                severity="WARNING",
+                message="paper margin is insufficient",
+                payload={
+                    "intent_id": str(approved.id),
+                    "required": str(required_margin + fee_estimate),
+                    "available": str(account["available_balance"]),
+                },
+            )
+            raise ExecutionRejected("paper margin is insufficient")
         expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=self.config.order_expiry_sec)
             if approved.order_type == "LIMIT" and self.config.order_expiry_sec > 0
             else None
         )
-        quote_balance = self.store.get_balance("USDT")
-        if approved.side == "BUY" and (
-            quote_balance is None
-            or quote_balance["free"] < estimated_notional
-        ):
-            self.store.record_system_event(
-                event_type="ORDER_REJECTED",
-                severity="WARNING",
-                message="paper quote balance is insufficient",
-                payload={
-                    "intent_id": str(approved.id),
-                    "required": str(estimated_notional),
-                    "available": str(quote_balance["free"] if quote_balance else 0),
-                },
-            )
-            raise ExecutionRejected("paper quote balance is insufficient")
-        if approved.side == "SELL":
-            base_asset = approved.symbol.removesuffix("USDT")
-            base_balance = self.store.get_balance(base_asset)
-            if base_balance is None or base_balance["free"] < requested_quantity:
-                self.store.record_system_event(
-                    event_type="ORDER_REJECTED",
-                    severity="WARNING",
-                    message="paper base balance is insufficient",
-                    payload={
-                        "intent_id": str(approved.id),
-                        "required": str(requested_quantity),
-                        "available": str(base_balance["free"] if base_balance else 0),
-                    },
-                )
-                raise ExecutionRejected("paper base balance is insufficient")
         if self.config.latency_ms:
             time.sleep(self.config.latency_ms / 1000)
         order_id = self._create_order(
@@ -353,34 +368,190 @@ class PaperExecutor(_BaseExecutor):
         }:
             return _result_from_local(local)
         intent = self._intent_from_order(local)
-        requested_quantity = self._requested_quantity(intent, market.last_price)
-        return self._apply_fill(
+        requested_quantity = intent.quantity
+        result = self._apply_fill(
             order_id,
             intent,
             market,
             requested_quantity=requested_quantity,
             current_executed=Decimal(str(local.get("executed_quantity", "0"))),
         )
+        self.apply_funding(intent.symbol, market)
+        self.mark_to_market(intent.symbol, _mark_price(market))
+        return result
 
-    def mark_to_market(self, symbol: str, market_price: Decimal) -> None:
-        if market_price <= 0:
+    def account_state(self) -> dict[str, Decimal]:
+        row = self.store.get_balance("USDT") or {}
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        wallet = _decimal_field(row, "wallet_balance", default=str(row.get("free", self.config.initial_usdt)))
+        used = _decimal_field(row, "used_margin", default=str(row.get("locked", "0")))
+        unrealized = _decimal_field(row, "unrealized_pnl", default="0")
+        funding = _decimal_field(row, "funding_pnl", default="0")
+        realized = _decimal_field(row, "realized_pnl", default="0")
+        available = wallet - used
+        equity = wallet + unrealized
+        return {
+            "wallet_balance": wallet,
+            "available_balance": available,
+            "used_margin": used,
+            "unrealized_pnl": unrealized,
+            "realized_pnl": realized,
+            "funding_pnl": funding,
+            "equity": equity,
+            "margin_balance": wallet + unrealized,
+        }
+
+    def mark_to_market(self, symbol: str, mark_price: Decimal) -> None:
+        if mark_price <= 0:
             raise ValueError("mark price must be positive")
         position = self.store.get_position(symbol)
         if position is None:
             return
-        quantity = Decimal(str(position["quantity"]))
-        average_price = Decimal(str(position["average_price"]))
+        quantity = _decimal_field(position, "quantity")
+        direction = str(position.get("position_side") or position.get("direction") or "FLAT")
+        if quantity == 0 or direction == "FLAT":
+            self._persist_position(symbol, direction="FLAT", quantity=Decimal("0"), entry_price=Decimal("0"),
+                                   mark_price=mark_price, realized_pnl=_decimal_field(position, "realized_pnl"),
+                                   unrealized_pnl=Decimal("0"), funding_pnl=_decimal_field(position, "funding_pnl"),
+                                   leverage=_decimal_field(position, "leverage", default=str(self.config.default_leverage)),
+                                   initial_margin=Decimal("0"), maintenance_margin=Decimal("0"),
+                                   liquidation_price=None, fee_pnl=_decimal_field(position, "fee_pnl"))
+            self._sync_account_unrealized(Decimal("0"))
+            return
+        entry = _decimal_field(position, "entry_price", "average_price")
         unrealized = (
-            (market_price - average_price) * quantity if quantity > 0 else Decimal("0")
+            (mark_price - entry) * quantity
+            if direction == "LONG"
+            else (entry - mark_price) * quantity
         )
+        leverage = _decimal_field(position, "leverage", default=str(self.config.default_leverage))
+        notional = quantity * mark_price
+        initial_margin = _decimal_field(position, "initial_margin", default=str(notional / leverage if leverage else notional))
+        maintenance_margin = initial_margin * self.config.maintenance_margin_ratio
+        liquidation_price = self._liquidation_price(direction, entry, leverage)
+        remaining = initial_margin + unrealized
+        self._persist_position(
+            symbol,
+            direction=direction,  # type: ignore[arg-type]
+            quantity=quantity,
+            entry_price=entry,
+            mark_price=mark_price,
+            realized_pnl=_decimal_field(position, "realized_pnl"),
+            unrealized_pnl=unrealized,
+            funding_pnl=_decimal_field(position, "funding_pnl"),
+            leverage=leverage,
+            initial_margin=initial_margin,
+            maintenance_margin=maintenance_margin,
+            liquidation_price=liquidation_price,
+            fee_pnl=_decimal_field(position, "fee_pnl"),
+        )
+        self._sync_account_unrealized(unrealized)
+        if remaining <= maintenance_margin:
+            self._liquidate(symbol, mark_price, direction=direction, quantity=quantity, entry=entry)
+
+    def apply_funding(self, symbol: str, market: MarketSnapshot) -> Decimal:
+        if market.funding_rate is None:
+            return Decimal("0")
+        position = self.store.get_position(symbol)
+        if position is None:
+            return Decimal("0")
+        quantity = _decimal_field(position, "quantity")
+        direction = str(position.get("position_side") or "FLAT")
+        if quantity <= 0 or direction == "FLAT":
+            return Decimal("0")
+        payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
+        last = payload.get("funding_timestamp")
+        stamp = market.funding_timestamp.isoformat() if market.funding_timestamp is not None else None
+        if stamp is not None and last == stamp:
+            return Decimal("0")
+        mark = _mark_price(market)
+        notional = quantity * mark
+        payment = notional * market.funding_rate
+        signed = payment if direction == "LONG" else -payment
+        account = self.account_state()
+        wallet = account["wallet_balance"] - signed
+        funding_pnl = _decimal_field(position, "funding_pnl") - signed
+        self._write_account(
+            wallet_balance=wallet,
+            used_margin=account["used_margin"],
+            unrealized_pnl=account["unrealized_pnl"],
+            realized_pnl=account["realized_pnl"],
+            funding_pnl=account["funding_pnl"] - signed,
+        )
+        extra = dict(payload)
+        extra["funding_timestamp"] = stamp
+        extra["funding_pnl"] = str(funding_pnl)
         self.store.upsert_position(
             symbol,
             quantity=quantity,
-            average_price=average_price,
-            realized_pnl=Decimal(str(position["realized_pnl"])),
-            unrealized_pnl=unrealized,
-            payload={"mode": "paper", "mark_price": str(market_price)},
+            average_price=_decimal_field(position, "entry_price", "average_price"),
+            realized_pnl=_decimal_field(position, "realized_pnl"),
+            unrealized_pnl=_decimal_field(position, "unrealized_pnl"),
+            position_side=direction,
+            entry_price=_decimal_field(position, "entry_price", "average_price"),
+            mark_price=mark,
+            funding_pnl=funding_pnl,
+            leverage=_decimal_field(position, "leverage", default="1"),
+            payload=extra,
         )
+        return -signed
+
+    def _liquidate(
+        self,
+        symbol: str,
+        mark_price: Decimal,
+        *,
+        direction: str,
+        quantity: Decimal,
+        entry: Decimal,
+    ) -> None:
+        realized = (
+            (mark_price - entry) * quantity
+            if direction == "LONG"
+            else (entry - mark_price) * quantity
+        )
+        account = self.account_state()
+        wallet = account["wallet_balance"] + realized
+        self._write_account(
+            wallet_balance=wallet,
+            used_margin=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=account["realized_pnl"] + realized,
+            funding_pnl=account["funding_pnl"],
+        )
+        self._persist_position(
+            symbol,
+            direction="FLAT",
+            quantity=Decimal("0"),
+            entry_price=Decimal("0"),
+            mark_price=mark_price,
+            realized_pnl=_decimal_field(self.store.get_position(symbol), "realized_pnl") + realized,
+            unrealized_pnl=Decimal("0"),
+            funding_pnl=_decimal_field(self.store.get_position(symbol), "funding_pnl"),
+            leverage=Decimal("1"),
+            initial_margin=Decimal("0"),
+            maintenance_margin=Decimal("0"),
+            liquidation_price=None,
+            fee_pnl=_decimal_field(self.store.get_position(symbol), "fee_pnl"),
+            extra={"liquidated": True},
+        )
+        self.store.record_system_event(
+            event_type="LIQUIDATED",
+            severity="CRITICAL",
+            message=f"{symbol} paper position liquidated at mark {mark_price}",
+            payload={"symbol": symbol, "mark_price": str(mark_price)},
+        )
+        setter = getattr(self.store, "set_halt", None)
+        if setter is not None:
+            setter(True, reason="LIQUIDATED", source="paper")
+        elif hasattr(self.store, "halted"):
+            self.store.halted = True
+
+    def _liquidation_price(self, direction: str, entry: Decimal, leverage: Decimal) -> Decimal:
+        buffer = (Decimal("1") / leverage) * (Decimal("1") - self.config.maintenance_margin_ratio)
+        if direction == "LONG":
+            return max(Decimal("0"), entry * (Decimal("1") - buffer))
+        return entry * (Decimal("1") + buffer)
 
     def _local_order(self, order_id: UUID) -> dict[str, Any] | None:
         getter = getattr(self.store, "get_order", None)
@@ -408,41 +579,24 @@ class PaperExecutor(_BaseExecutor):
     def _is_marketable(self, intent: TradeIntent, market: MarketSnapshot) -> bool:
         if intent.order_type != "LIMIT" or intent.price is None:
             return True
-        reference = market.ask_price or market.last_price if intent.side == "BUY" else market.bid_price or market.last_price
-        return intent.price >= reference if intent.side == "BUY" else intent.price <= reference
+        side = intent.exchange_side()
+        reference = market.ask_price or market.last_price if side == "BUY" else market.bid_price or market.last_price
+        return intent.price >= reference if side == "BUY" else intent.price <= reference
 
     def _fill_price(self, intent: TradeIntent, market: MarketSnapshot) -> Decimal:
+        side = intent.exchange_side()
         if intent.order_type == "LIMIT" and intent.price is not None:
             return intent.price
-        if intent.side == "BUY":
+        if side == "BUY":
             base = market.ask_price or market.last_price
         else:
             base = market.bid_price or market.last_price
         slippage = self.config.slippage_bps / Decimal("10000")
-        return base * (Decimal("1") + slippage if intent.side == "BUY" else Decimal("1") - slippage)
-
-    def _requested_quantity(
-        self,
-        intent: TradeIntent,
-        market_price: Decimal | None = None,
-    ) -> Decimal:
-        if intent.quantity is not None:
-            return intent.quantity
-        if intent.quote_quantity is not None and market_price is not None:
-            return intent.quote_quantity / market_price
-        return Decimal("0")
-
-    def _fill_quantity(self, intent: TradeIntent, market: MarketSnapshot) -> Decimal:
-        requested = (
-            intent.quantity
-            if intent.quantity is not None
-            else intent.quote_quantity / market.last_price
-            if intent.quote_quantity is not None
-            else Decimal("0")
-        )
-        if market.available_liquidity is not None:
-            requested = min(requested, market.available_liquidity)
-        return requested * self.config.partial_fill_ratio
+        price = base * (Decimal("1") + slippage if side == "BUY" else Decimal("1") - slippage)
+        if market.available_liquidity is not None and market.available_liquidity > 0:
+            impact = min(Decimal("1"), intent.quantity / market.available_liquidity) * slippage
+            price = price * (Decimal("1") + impact if side == "BUY" else Decimal("1") - impact)
+        return price
 
     def _apply_fill(
         self,
@@ -481,9 +635,7 @@ class PaperExecutor(_BaseExecutor):
 
         fill_price = self._fill_price(intent, market)
         cumulative = current_executed + fill_quantity
-        status: OrderStatus = (
-            "FILLED" if cumulative >= requested_quantity else "PARTIALLY_FILLED"
-        )
+        status = "FILLED" if cumulative >= requested_quantity else "PARTIALLY_FILLED"
         self.store.update_order(
             order_id,
             status=status,
@@ -498,19 +650,29 @@ class PaperExecutor(_BaseExecutor):
             price=str(fill_price),
         )
         fee = fill_quantity * fill_price * self.config.fee_rate
-        realized_delta = self._update_account(intent, fill_quantity, fill_price, fee)
+        mid = ( (market.bid_price or market.last_price) + (market.ask_price or market.last_price) ) / Decimal("2")
+        slippage = (fill_price - mid) * fill_quantity if intent.exchange_side() == "BUY" else (mid - fill_price) * fill_quantity
+        realized_delta = self._update_account(intent, fill_quantity, fill_price, fee, slippage)
         trade_id = self.store.record_trade(
             order_id,
             symbol=intent.symbol,
-            side=intent.side,
+            side=intent.exchange_side(),
             quantity=fill_quantity,
             price=fill_price,
             fee=fee,
             fee_asset="USDT",
             realized_pnl=realized_delta,
-            payload={"mode": "paper"},
+            position_side=intent.direction,
+            funding=Decimal("0"),
+            payload={
+                "mode": "paper",
+                "action": intent.action,
+                "fee_pnl": str(-fee),
+                "slippage": str(slippage),
+            },
         )
-        self.mark_to_market(intent.symbol, market.last_price)
+        self.apply_funding(intent.symbol, market)
+        self.mark_to_market(intent.symbol, _mark_price(market))
         return ExecutionResult(
             order_id=order_id,
             intent_id=intent.id,
@@ -526,17 +688,20 @@ class PaperExecutor(_BaseExecutor):
         stored = order.get("intent")
         if isinstance(stored, TradeIntent):
             return stored
-        quantity = order.get("quantity")
-        quote_quantity = order.get("quote_quantity")
+        payload = order.get("payload") if isinstance(order.get("payload"), dict) else {}
+        intent_payload = payload.get("intent") if isinstance(payload.get("intent"), dict) else payload
+        direction = str(order.get("position_side") or intent_payload.get("direction") or "LONG")
+        action = str(order.get("position_action") or intent_payload.get("action") or "OPEN")
+        reduce_only = bool(order.get("reduce_only") if order.get("reduce_only") is not None else action != "OPEN")
         return TradeIntent(
             id=UUID(str(order["intent_id"])),
             symbol=str(order["symbol"]),
-            side=str(order["side"]),  # type: ignore[arg-type]
+            direction=direction,  # type: ignore[arg-type]
+            action=action,  # type: ignore[arg-type]
+            reduce_only=reduce_only,
+            leverage=Decimal(str(order.get("leverage") or intent_payload.get("leverage") or "1")),
             order_type=str(order["order_type"]),  # type: ignore[arg-type]
-            quantity=Decimal(str(quantity)) if quantity is not None else None,
-            quote_quantity=(
-                Decimal(str(quote_quantity)) if quote_quantity is not None else None
-            ),
+            quantity=Decimal(str(order["quantity"])),
             price=Decimal(str(order["price"])) if order.get("price") is not None else None,
             confidence=Decimal("0"),
             reason="recovered paper order",
@@ -546,12 +711,115 @@ class PaperExecutor(_BaseExecutor):
 
     def _ensure_initial_balance(self) -> None:
         if self.store.get_balance("USDT") is None:
-            self.store.upsert_balance(
-                "USDT",
-                free=self.config.initial_usdt,
-                mode="paper",
-                payload={"initial": True},
+            self._write_account(
+                wallet_balance=self.config.initial_usdt,
+                used_margin=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                funding_pnl=Decimal("0"),
+                initial=True,
             )
+
+    def _write_account(
+        self,
+        *,
+        wallet_balance: Decimal,
+        used_margin: Decimal,
+        unrealized_pnl: Decimal,
+        realized_pnl: Decimal,
+        funding_pnl: Decimal,
+        initial: bool = False,
+    ) -> None:
+        available = wallet_balance - used_margin
+        self.store.upsert_balance(
+            "USDT",
+            free=available,
+            locked=used_margin,
+            wallet_balance=wallet_balance,
+            available_balance=available,
+            margin_balance=wallet_balance + unrealized_pnl,
+            used_margin=used_margin,
+            unrealized_pnl=unrealized_pnl,
+            mode="paper",
+            payload={
+                "updated_by": "paper_execution",
+                "initial": initial,
+                "wallet_balance": str(wallet_balance),
+                "available_balance": str(available),
+                "margin_balance": str(wallet_balance + unrealized_pnl),
+                "used_margin": str(used_margin),
+                "unrealized_pnl": str(unrealized_pnl),
+                "realized_pnl": str(realized_pnl),
+                "funding_pnl": str(funding_pnl),
+            },
+        )
+
+    def _sync_account_unrealized(self, unrealized: Decimal) -> None:
+        account = self.account_state()
+        self._write_account(
+            wallet_balance=account["wallet_balance"],
+            used_margin=account["used_margin"],
+            unrealized_pnl=unrealized,
+            realized_pnl=account["realized_pnl"],
+            funding_pnl=account["funding_pnl"],
+        )
+
+    def _persist_position(
+        self,
+        symbol: str,
+        *,
+        direction: PositionDirection,
+        quantity: Decimal,
+        entry_price: Decimal,
+        mark_price: Decimal,
+        realized_pnl: Decimal,
+        unrealized_pnl: Decimal,
+        funding_pnl: Decimal,
+        leverage: Decimal,
+        initial_margin: Decimal,
+        maintenance_margin: Decimal,
+        liquidation_price: Decimal | None,
+        fee_pnl: Decimal,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        notional = quantity * mark_price
+        payload = {
+            "mode": "paper",
+            "market": "FUTURES",
+            "position_side": direction,
+            "entry_price": str(entry_price),
+            "mark_price": str(mark_price),
+            "notional": str(notional),
+            "leverage": str(leverage),
+            "margin_type": "ISOLATED",
+            "initial_margin": str(initial_margin),
+            "maintenance_margin": str(maintenance_margin),
+            "liquidation_price": str(liquidation_price) if liquidation_price is not None else None,
+            "funding_pnl": str(funding_pnl),
+            "fee_pnl": str(fee_pnl),
+            "trading_pnl": str(realized_pnl + unrealized_pnl),
+            "net_pnl": str(realized_pnl + unrealized_pnl + funding_pnl + fee_pnl),
+            **(extra or {}),
+        }
+        self.store.upsert_position(
+            symbol,
+            quantity=quantity,
+            average_price=entry_price,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            market="FUTURES",
+            position_side=direction,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            notional=notional,
+            leverage=leverage,
+            margin_type="ISOLATED",
+            initial_margin=initial_margin,
+            maintenance_margin=maintenance_margin,
+            liquidation_price=liquidation_price,
+            funding_pnl=funding_pnl,
+            payload=payload,
+        )
 
     def _update_account(
         self,
@@ -559,53 +827,91 @@ class PaperExecutor(_BaseExecutor):
         quantity: Decimal,
         price: Decimal,
         fee: Decimal,
+        slippage: Decimal,
     ) -> Decimal:
-        quote_asset = "USDT"
-        base_asset = intent.symbol.removesuffix(quote_asset)
-        quote_balance = self.store.get_balance(quote_asset)
-        current_quote = quote_balance["free"] if quote_balance else Decimal("0")
         position = self.store.get_position(intent.symbol)
-        current_quantity = position["quantity"] if position else Decimal("0")
-        current_average = position["average_price"] if position else Decimal("0")
-        current_realized = position["realized_pnl"] if position else Decimal("0")
-        gross = quantity * price
-        if intent.side == "BUY":
-            signed_quantity = current_quantity + quantity
-            average_price = (
-                (current_quantity * current_average + gross) / signed_quantity
-                if signed_quantity > 0
+        current_direction = str((position or {}).get("position_side") or "FLAT")
+        current_quantity = _decimal_field(position, "quantity")
+        current_entry = _decimal_field(position, "entry_price", "average_price")
+        current_realized = _decimal_field(position, "realized_pnl")
+        current_funding = _decimal_field(position, "funding_pnl")
+        current_fee = _decimal_field(position, "fee_pnl")
+        current_im = _decimal_field(position, "initial_margin")
+        account = self.account_state()
+        wallet = account["wallet_balance"] - fee
+        used = account["used_margin"]
+        fee_pnl = current_fee - fee
+        realized_delta = -fee
+        direction: PositionDirection = current_direction if current_direction in {"LONG", "SHORT", "FLAT"} else "FLAT"
+        next_quantity = current_quantity
+        next_entry = current_entry
+        next_im = current_im
+        leverage = intent.leverage
+
+        if intent.action == "OPEN":
+            if current_quantity > 0 and current_direction not in {"FLAT", "", intent.direction}:
+                raise ExecutionRejected("cannot open over existing opposite position")
+            direction = intent.direction
+            next_quantity = current_quantity + quantity
+            next_entry = (
+                ((current_quantity * current_entry) + (quantity * price)) / next_quantity
+                if current_quantity > 0
                 else price
             )
-            realized_pnl = current_realized - fee
-            realized_delta = -fee
-            next_quote = current_quote - gross - fee
+            added_im = (quantity * price) / leverage
+            next_im = current_im + added_im
+            used = used + added_im
         else:
-            signed_quantity = current_quantity - quantity
-            realized_delta = (price - current_average) * quantity - fee
-            realized_pnl = current_realized + realized_delta
-            average_price = current_average if signed_quantity > 0 else Decimal("0")
-            next_quote = current_quote + gross - fee
-        self.store.upsert_balance(
-            quote_asset,
-            free=next_quote,
-            mode="paper",
-            payload={"updated_by": "paper_execution"},
-        )
-        base_balance = self.store.get_balance(base_asset)
-        current_base = base_balance["free"] if base_balance else Decimal("0")
-        self.store.upsert_balance(
-            base_asset,
-            free=current_base + quantity if intent.side == "BUY" else current_base - quantity,
-            mode="paper",
-            payload={"updated_by": "paper_execution"},
-        )
-        self.store.upsert_position(
-            intent.symbol,
-            quantity=signed_quantity,
-            average_price=average_price,
-            realized_pnl=realized_pnl,
+            if current_direction != intent.direction or current_quantity <= 0:
+                raise ExecutionRejected("no matching position to reduce or close")
+            close_qty = min(quantity, current_quantity)
+            trading_pnl = (
+                (price - current_entry) * close_qty
+                if current_direction == "LONG"
+                else (current_entry - price) * close_qty
+            )
+            realized_delta = trading_pnl - fee
+            current_realized = current_realized + trading_pnl
+            released = current_im * (close_qty / current_quantity) if current_quantity else current_im
+            used = max(Decimal("0"), used - released)
+            next_quantity = current_quantity - close_qty
+            next_im = max(Decimal("0"), current_im - released)
+            if next_quantity <= 0:
+                direction = "FLAT"
+                next_quantity = Decimal("0")
+                next_entry = Decimal("0")
+                next_im = Decimal("0")
+                used = Decimal("0")
+            else:
+                direction = current_direction  # type: ignore[assignment]
+                next_entry = current_entry
+
+        self._write_account(
+            wallet_balance=wallet,
+            used_margin=used,
             unrealized_pnl=Decimal("0"),
-            payload={"mode": "paper"},
+            realized_pnl=account["realized_pnl"] + (realized_delta + fee if intent.action != "OPEN" else Decimal("0")),
+            funding_pnl=account["funding_pnl"],
+        )
+        self._persist_position(
+            intent.symbol,
+            direction=direction,
+            quantity=next_quantity,
+            entry_price=next_entry,
+            mark_price=price,
+            realized_pnl=current_realized,
+            unrealized_pnl=Decimal("0"),
+            funding_pnl=current_funding,
+            leverage=leverage,
+            initial_margin=next_im,
+            maintenance_margin=next_im * self.config.maintenance_margin_ratio,
+            liquidation_price=(
+                self._liquidation_price(direction, next_entry, leverage)
+                if direction != "FLAT"
+                else None
+            ),
+            fee_pnl=fee_pnl,
+            extra={"slippage": str(slippage)},
         )
         return realized_delta
 
@@ -638,8 +944,6 @@ class BinanceExecutor(_BaseExecutor):
         if self.store.is_halted():
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
-        if approved.quantity is None:
-            raise ExecutionRejected("Futures orders require quantity")
         order_id = self._create_order(approved, status="CREATED")
         self._event(order_id, "ORDER_CREATED", "CREATED")
         self.store.update_order(order_id, status="RISK_APPROVED")
@@ -647,11 +951,12 @@ class BinanceExecutor(_BaseExecutor):
         try:
             response = self.client.create_order(
                 symbol=approved.symbol,
-                side=approved.side,
+                side=approved.exchange_side(),
                 order_type=approved.order_type,
                 quantity=approved.quantity,
                 price=approved.price,
                 client_order_id=approved.client_order_id,
+                reduce_only=approved.reduce_only,
             )
         except Exception as exc:
             self.store.update_order(order_id, status="UNKNOWN", payload={"error": str(exc)})
@@ -787,11 +1092,12 @@ class BinanceExecutor(_BaseExecutor):
             self.store.record_trade(
                 order_id,
                 symbol=intent.symbol,
-                side=intent.side,
+                side=intent.exchange_side(),
                 quantity=quantity,
                 price=price,
                 fee=fee,
                 fee_asset=str(fill.get("commissionAsset") or "USDT"),
+                position_side=intent.direction,
                 payload={"mode": self.config.mode, "source": "order_response"},
             )
 

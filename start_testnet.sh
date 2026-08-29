@@ -17,6 +17,7 @@ if [ -z "${BIAN_TESTNET_API_KEY:-}" ] || [ -z "${BIAN_TESTNET_API_SECRET:-}" ]; 
   exit 1
 fi
 
+export BIAN_MARKET=FUTURES
 export BIAN_MODE=testnet
 cd "$script_dir"
 exec "$python_bin" paper_runner.py --mode testnet "$@"

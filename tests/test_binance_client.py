@@ -18,7 +18,6 @@ from binance_client import (
     ClientConfig,
     FuturesPrivateClient,
     FuturesPublicClient,
-    PrivateClient,
     PublicClient,
     _translate_error,
 )
@@ -89,10 +88,8 @@ def test_private_live_client_requires_confirmation_token() -> None:
 
 
 def test_spot_private_client_is_removed() -> None:
-    with pytest.raises(BinanceAuthError, match="Spot private execution is removed"):
-        PrivateClient(
-            ClientConfig(mode="testnet", api_key="key", api_secret="secret")
-        )
+    import binance_client
+    assert not hasattr(binance_client, "PrivateClient")
 
 
 def test_environment_credentials_are_mode_specific(monkeypatch) -> None:

@@ -631,10 +631,13 @@ class FuturesPrivateClient:
         return payload if isinstance(payload, list) else [payload]
 
 
-class PrivateClient:
-    """Removed Spot private execution. Production orders use FuturesPrivateClient."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise BinanceAuthError(
-            "Spot private execution is removed; use FuturesPrivateClient"
-        )
+    def create_listen_key(self) -> str:
+        payload = self._signed("POST", "/fapi/v1/listenKey", operation="create_listen_key")
+        return str(payload["listenKey"])
+
+    def keepalive_listen_key(self) -> None:
+        self._signed("PUT", "/fapi/v1/listenKey", operation="keepalive_listen_key")
+
+    def close_listen_key(self) -> None:
+        self._signed("DELETE", "/fapi/v1/listenKey", operation="close_listen_key")

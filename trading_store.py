@@ -87,11 +87,14 @@ class TradingStore:
                     """
                     INSERT INTO trade_intents(
                         intent_id, symbol, side, order_type, quantity,
-                        quote_quantity, price, confidence, reason,
+                        price, confidence, reason,
                         strategy_version, status, created_at, client_order_id,
-                        payload
+                        direction, action, reduce_only, leverage, margin_type,
+                        position_mode, positioning_state, previous_state,
+                        transition, evidence_snapshot_id, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, CAST(%s AS JSONB))
+                              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              %s, %s, CAST(%s AS JSONB))
                     ON CONFLICT (intent_id) DO UPDATE SET
                         status = EXCLUDED.status,
                         client_order_id = EXCLUDED.client_order_id,
@@ -100,10 +103,9 @@ class TradingStore:
                     (
                         str(intent.id),
                         intent.symbol,
-                        intent.side,
+                        intent.exchange_side(),
                         intent.order_type,
                         intent.quantity,
-                        intent.quote_quantity,
                         intent.price,
                         intent.confidence,
                         intent.reason,
@@ -111,6 +113,16 @@ class TradingStore:
                         status,
                         intent.created_at,
                         intent.client_order_id,
+                        intent.direction,
+                        intent.action,
+                        intent.reduce_only,
+                        intent.leverage,
+                        intent.margin_type,
+                        intent.position_mode,
+                        intent.positioning_state,
+                        intent.previous_state,
+                        intent.transition,
+                        str(intent.evidence_snapshot_id) if intent.evidence_snapshot_id else None,
                         _json(intent.model_dump(mode="json")),
                     ),
                 )
@@ -765,10 +777,13 @@ class TradingStore:
                     INSERT INTO orders(
                         order_id, intent_id, symbol, side, order_type,
                         client_order_id, exchange_order_id, quantity,
-                        quote_quantity, price, status, mode, created_at,
-                        updated_at, expires_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        price, status, mode, created_at,
+                        updated_at, expires_at, market, position_side,
+                        position_action, reduce_only, leverage, margin_type,
+                        payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              CAST(%s AS JSONB))
                     ON CONFLICT (client_order_id) DO UPDATE SET
                         updated_at = EXCLUDED.updated_at
                     RETURNING order_id
@@ -777,18 +792,23 @@ class TradingStore:
                         str(order_id),
                         str(intent.id),
                         intent.symbol,
-                        intent.side,
+                        intent.exchange_side(),
                         intent.order_type,
                         intent.client_order_id,
                         exchange_order_id,
                         intent.quantity,
-                        intent.quote_quantity,
                         intent.price,
                         status,
                         mode,
                         now,
                         now,
                         expires_at,
+                        "FUTURES",
+                        intent.direction,
+                        intent.action,
+                        intent.reduce_only,
+                        intent.leverage,
+                        intent.margin_type,
                         _json(intent.model_dump(mode="json")),
                     ),
                 )
@@ -834,8 +854,9 @@ class TradingStore:
                     """
                     SELECT order_id, intent_id, symbol, side, order_type,
                            client_order_id, exchange_order_id, quantity,
-                           quote_quantity, price, executed_quantity, status,
-                           mode, created_at, updated_at, expires_at
+                           price, executed_quantity, status,
+                           mode, created_at, updated_at, expires_at,
+                           position_side, position_action, reduce_only, leverage
                     FROM orders
                     WHERE client_order_id = %s
                     """,
@@ -847,8 +868,9 @@ class TradingStore:
         columns = (
             "order_id", "intent_id", "symbol", "side", "order_type",
             "client_order_id", "exchange_order_id", "quantity",
-            "quote_quantity", "price", "executed_quantity", "status",
+            "price", "executed_quantity", "status",
             "mode", "created_at", "updated_at", "expires_at",
+            "position_side", "position_action", "reduce_only", "leverage",
         )
         return _row_dict(columns, row)
 
@@ -861,8 +883,9 @@ class TradingStore:
                     """
                     SELECT order_id, intent_id, symbol, side, order_type,
                            client_order_id, exchange_order_id, quantity,
-                           quote_quantity, price, executed_quantity, status,
-                           mode, created_at, updated_at, expires_at
+                           price, executed_quantity, status,
+                           mode, created_at, updated_at, expires_at,
+                           position_side, position_action, reduce_only, leverage
                     FROM orders
                     WHERE order_id = %s
                     """,
@@ -874,8 +897,9 @@ class TradingStore:
         columns = (
             "order_id", "intent_id", "symbol", "side", "order_type",
             "client_order_id", "exchange_order_id", "quantity",
-            "quote_quantity", "price", "executed_quantity", "status",
+            "price", "executed_quantity", "status",
             "mode", "created_at", "updated_at", "expires_at",
+            "position_side", "position_action", "reduce_only", "leverage",
         )
         return _row_dict(columns, row)
 
@@ -911,6 +935,9 @@ class TradingStore:
         fee: Decimal,
         fee_asset: str,
         realized_pnl: Decimal = Decimal("0"),
+        market: str = "FUTURES",
+        position_side: str | None = None,
+        funding: Decimal = Decimal("0"),
         payload: dict[str, Any] | None = None,
     ) -> UUID:
         import psycopg2
@@ -922,9 +949,10 @@ class TradingStore:
                     """
                     INSERT INTO trades(
                         trade_id, order_id, symbol, side, quantity, price,
-                        fee, fee_asset, realized_pnl, executed_at, payload
+                        fee, fee_asset, realized_pnl, executed_at, market,
+                        position_side, funding, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB))
+                              %s, %s, %s, CAST(%s AS JSONB))
                     RETURNING trade_id
                     """,
                     (
@@ -938,6 +966,9 @@ class TradingStore:
                         fee_asset,
                         realized_pnl,
                         _now(),
+                        market,
+                        position_side,
+                        funding,
                         _json(payload),
                     ),
                 )
@@ -952,25 +983,52 @@ class TradingStore:
         average_price: Decimal,
         realized_pnl: Decimal,
         unrealized_pnl: Decimal,
+        market: str = "FUTURES",
+        position_side: str | None = None,
+        entry_price: Decimal | None = None,
+        mark_price: Decimal | None = None,
+        notional: Decimal | None = None,
+        leverage: Decimal | None = None,
+        margin_type: str = "ISOLATED",
+        initial_margin: Decimal | None = None,
+        maintenance_margin: Decimal | None = None,
+        liquidation_price: Decimal | None = None,
+        funding_pnl: Decimal = Decimal("0"),
         payload: dict[str, Any] | None = None,
     ) -> None:
         import psycopg2
 
+        resolved_entry = entry_price if entry_price is not None else average_price
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO positions(
                         symbol, quantity, average_price, realized_pnl,
-                        unrealized_pnl, updated_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        unrealized_pnl, updated_at, payload, market,
+                        position_side, entry_price, mark_price, notional,
+                        leverage, margin_type, initial_margin,
+                        maintenance_margin, liquidation_price, funding_pnl
+                    ) VALUES (%s, %s, %s, %s, %s, %s, CAST(%s AS JSONB),
+                              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (symbol) DO UPDATE SET
                         quantity = EXCLUDED.quantity,
                         average_price = EXCLUDED.average_price,
                         realized_pnl = EXCLUDED.realized_pnl,
                         unrealized_pnl = EXCLUDED.unrealized_pnl,
                         updated_at = EXCLUDED.updated_at,
-                        payload = EXCLUDED.payload
+                        payload = EXCLUDED.payload,
+                        market = EXCLUDED.market,
+                        position_side = EXCLUDED.position_side,
+                        entry_price = EXCLUDED.entry_price,
+                        mark_price = EXCLUDED.mark_price,
+                        notional = EXCLUDED.notional,
+                        leverage = EXCLUDED.leverage,
+                        margin_type = EXCLUDED.margin_type,
+                        initial_margin = EXCLUDED.initial_margin,
+                        maintenance_margin = EXCLUDED.maintenance_margin,
+                        liquidation_price = EXCLUDED.liquidation_price,
+                        funding_pnl = EXCLUDED.funding_pnl
                     """,
                     (
                         symbol,
@@ -980,6 +1038,17 @@ class TradingStore:
                         unrealized_pnl,
                         _now(),
                         _json(payload),
+                        market,
+                        position_side,
+                        resolved_entry,
+                        mark_price,
+                        notional,
+                        leverage,
+                        margin_type,
+                        initial_margin,
+                        maintenance_margin,
+                        liquidation_price,
+                        funding_pnl,
                     ),
                 )
 
@@ -991,7 +1060,10 @@ class TradingStore:
                 cursor.execute(
                     """
                     SELECT symbol, quantity, average_price, realized_pnl,
-                           unrealized_pnl, updated_at
+                           unrealized_pnl, updated_at, market, position_side,
+                           entry_price, mark_price, notional, leverage,
+                           margin_type, initial_margin, maintenance_margin,
+                           liquidation_price, funding_pnl, payload
                     FROM positions
                     WHERE symbol = %s
                     """,
@@ -1007,6 +1079,18 @@ class TradingStore:
             "realized_pnl": Decimal(str(row[3])),
             "unrealized_pnl": Decimal(str(row[4])),
             "updated_at": row[5],
+            "market": row[6],
+            "position_side": row[7],
+            "entry_price": Decimal(str(row[8] if row[8] is not None else row[2])),
+            "mark_price": Decimal(str(row[9])) if row[9] is not None else None,
+            "notional": Decimal(str(row[10])) if row[10] is not None else None,
+            "leverage": Decimal(str(row[11])) if row[11] is not None else None,
+            "margin_type": row[12],
+            "initial_margin": Decimal(str(row[13])) if row[13] is not None else None,
+            "maintenance_margin": Decimal(str(row[14])) if row[14] is not None else None,
+            "liquidation_price": Decimal(str(row[15])) if row[15] is not None else None,
+            "funding_pnl": Decimal(str(row[16] if row[16] is not None else "0")),
+            "payload": row[17] if isinstance(row[17], dict) else {},
         }
 
     def upsert_balance(
@@ -1016,25 +1100,47 @@ class TradingStore:
         free: Decimal,
         locked: Decimal = Decimal("0"),
         mode: str,
+        wallet_balance: Decimal | None = None,
+        available_balance: Decimal | None = None,
+        margin_balance: Decimal | None = None,
+        used_margin: Decimal | None = None,
+        unrealized_pnl: Decimal | None = None,
         payload: dict[str, Any] | None = None,
     ) -> None:
         import psycopg2
 
+        resolved_wallet = wallet_balance if wallet_balance is not None else free + locked
+        resolved_available = available_balance if available_balance is not None else free
+        resolved_used = used_margin if used_margin is not None else locked
+        resolved_margin = margin_balance if margin_balance is not None else resolved_wallet
+        resolved_upnl = unrealized_pnl if unrealized_pnl is not None else Decimal("0")
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO balances(
-                        asset, free, locked, mode, updated_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        asset, free, locked, mode, updated_at, payload,
+                        wallet_balance, available_balance, margin_balance,
+                        used_margin, unrealized_pnl
+                    ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB),
+                              %s, %s, %s, %s, %s)
                     ON CONFLICT (asset) DO UPDATE SET
                         free = EXCLUDED.free,
                         locked = EXCLUDED.locked,
                         mode = EXCLUDED.mode,
                         updated_at = EXCLUDED.updated_at,
-                        payload = EXCLUDED.payload
+                        payload = EXCLUDED.payload,
+                        wallet_balance = EXCLUDED.wallet_balance,
+                        available_balance = EXCLUDED.available_balance,
+                        margin_balance = EXCLUDED.margin_balance,
+                        used_margin = EXCLUDED.used_margin,
+                        unrealized_pnl = EXCLUDED.unrealized_pnl
                     """,
-                    (asset, free, locked, mode, _now(), _json(payload)),
+                    (
+                        asset, free, locked, mode, _now(), _json(payload),
+                        resolved_wallet, resolved_available, resolved_margin,
+                        resolved_used, resolved_upnl,
+                    ),
                 )
 
     def get_balance(self, asset: str) -> dict[str, Any] | None:
@@ -1044,7 +1150,9 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT asset, free, locked, mode, updated_at
+                    SELECT asset, free, locked, mode, updated_at,
+                           wallet_balance, available_balance, margin_balance,
+                           used_margin, unrealized_pnl
                     FROM balances
                     WHERE asset = %s
                     """,
@@ -1059,6 +1167,11 @@ class TradingStore:
             "locked": Decimal(str(row[2])),
             "mode": row[3],
             "updated_at": row[4],
+            "wallet_balance": Decimal(str(row[5] if row[5] is not None else row[1])),
+            "available_balance": Decimal(str(row[6] if row[6] is not None else row[1])),
+            "margin_balance": Decimal(str(row[7] if row[7] is not None else row[1])),
+            "used_margin": Decimal(str(row[8] if row[8] is not None else row[2])),
+            "unrealized_pnl": Decimal(str(row[9] if row[9] is not None else "0")),
         }
 
     def list_orders(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -1071,8 +1184,9 @@ class TradingStore:
                     """
                     SELECT order_id, intent_id, symbol, side, order_type,
                            client_order_id, exchange_order_id, quantity,
-                           quote_quantity, price, executed_quantity, status,
-                           mode, created_at, updated_at, expires_at
+                           price, executed_quantity, status,
+                           mode, created_at, updated_at, expires_at,
+                           position_side, position_action, reduce_only, leverage
                     FROM orders
                     ORDER BY created_at DESC
                     LIMIT %s
@@ -1083,8 +1197,9 @@ class TradingStore:
         columns = (
             "order_id", "intent_id", "symbol", "side", "order_type",
             "client_order_id", "exchange_order_id", "quantity",
-            "quote_quantity", "price", "executed_quantity", "status",
+            "price", "executed_quantity", "status",
             "mode", "created_at", "updated_at", "expires_at",
+            "position_side", "position_action", "reduce_only", "leverage",
         )
         return [_row_dict(columns, row) for row in rows]
 
@@ -1126,7 +1241,10 @@ class TradingStore:
                 cursor.execute(
                     """
                     SELECT symbol, quantity, average_price, realized_pnl,
-                           unrealized_pnl, updated_at
+                           unrealized_pnl, updated_at, market, position_side,
+                           entry_price, mark_price, notional, leverage,
+                           margin_type, initial_margin, maintenance_margin,
+                           liquidation_price, funding_pnl
                     FROM positions
                     ORDER BY symbol
                     """
@@ -1134,7 +1252,10 @@ class TradingStore:
                 rows = cursor.fetchall()
         columns = (
             "symbol", "quantity", "average_price", "realized_pnl",
-            "unrealized_pnl", "updated_at",
+            "unrealized_pnl", "updated_at", "market", "position_side",
+            "entry_price", "mark_price", "notional", "leverage",
+            "margin_type", "initial_margin", "maintenance_margin",
+            "liquidation_price", "funding_pnl",
         )
         return [_row_dict(columns, row) for row in rows]
 
@@ -1145,13 +1266,19 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT asset, free, locked, mode, updated_at
+                    SELECT asset, free, locked, mode, updated_at,
+                           wallet_balance, available_balance, margin_balance,
+                           used_margin, unrealized_pnl
                     FROM balances
                     ORDER BY asset
                     """
                 )
                 rows = cursor.fetchall()
-        columns = ("asset", "free", "locked", "mode", "updated_at")
+        columns = (
+            "asset", "free", "locked", "mode", "updated_at",
+            "wallet_balance", "available_balance", "margin_balance",
+            "used_margin", "unrealized_pnl",
+        )
         return [_row_dict(columns, row) for row in rows]
 
     def list_risk_events(self, limit: int = 50) -> list[dict[str, Any]]:

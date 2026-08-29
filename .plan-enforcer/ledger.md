@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 50 total  |  0 done  |  36 verified  |  0 skipped  |  0 blocked  |  14 remaining
- Drift: 4  |  Last reconcile: T50 |  Tier: structural
+ 62 total  |  0 done  |  48 verified  |  0 skipped  |  0 blocked  |  14 remaining
+ Drift: 5  |  Last reconcile: T62 |  Tier: structural
 
 ## Task Ledger
 
@@ -61,6 +61,18 @@
 | T48 | Phase O limited live | pending |  | D12 | Hard block until gates pass |
 | T49 | Legacy Spot assumption audit | verified | STATE KEEP/REPLACE/DELETE table | D14,A:I6 | Adapter first |
 | T50 | USD-M private adapter | verified | 124 tests; HMAC/400/tombstone | D14,A:I3,A:I6,V33 | HMAC stdlib; no quoteOrderQty |
+| T51 | TradeIntent futures contract | verified | 18 intent tests pass | D15,V34 | quantity-only OPEN/REDUCE/CLOSE |
+| T52 | Futures-native RiskGate | verified | risk tests cover margin/liq | D15,V34 | delete spot quote/base checks |
+| T53 | Futures paper executor | verified | paper tests + inject fill | D15,T43,V34 | margin, funding, liquidation |
+| T54 | paper_runner futures context | verified | cycle no_signal + fill | D15,V34 | position action + MarketSnapshot |
+| T55 | Futures user stream | verified | stream unit tests pass | D15,V34 | ACCOUNT_UPDATE / ORDER_TRADE_UPDATE |
+| T56 | Futures reconciliation | verified | mismatch HALT tests pass | D15,V34 | account/position/order truth |
+| T57 | Store and schema futures fields | verified | ALTER + store writes | D15,V34 | modify existing tables |
+| T58 | Engine TradeIntent generation | verified | OPEN/HOLD/CLOSE mapping | D15,V34 | current position + strength split |
+| T59 | Replace obsolete spot tests | verified | 185 pytest passed | D15,V34 | intent/risk/paper/stream/recon |
+| T60 | Delete Spot private leftovers | verified | PrivateClient removed | D15,V34 | migrate callers then drop alias |
+| T61 | Live switches and paper smoke | verified | paper fill; live blocked | D15,V34 | HARD BLOCK until gates pass |
+| T62 | Full pytest/compile/diff | verified | 185 pass; compile; diffcheck | D15,V34 | no commit without evidence |
 
 ## Decision Log
 
@@ -80,6 +92,7 @@
 | D12 | T34-T48 | Continue from d75a795; no rollback | User locked Meme Futures production constraints |
 | D13 | T33,T42 | Do not skip elapsed-time gates | 1h/6h/24h/7d remain required evidence |
 | D14 | T36,T49,T50 | Pivot: adapter/audit before orderbook | New pack requires Spot deletion and FuturesPrivateClient first |
+| D15 | T51-T62 | Unplanned: targeted futures semantic reset | User locked TradeIntent/risk/paper/stream/recon rewrite; do not replan T1-T50 |
 
 ## Reconciliation History
 
@@ -95,6 +108,7 @@
 | R14 | T1-T48 | 15 | T34 verified; T33 elapsed gates remain; T35-T48 pending; no duplicate owners |
 | R15 | T1-T48 | 14 | T35 verified; native 30m + distinct last/mark/index; T33 remains |
 | R16 | T1-T50 | 14 | T49/T50 verified; T36 deferred; T33 elapsed gates remain |
+| R17 | T1-T62 | 14 | T51-T62 verified; T33 elapsed + T36-T48 remain; Testnet BLOCKED_BY_EXTERNAL_CREDENTIALS |
 
 ## Reconciliation History
 
