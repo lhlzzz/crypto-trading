@@ -4,7 +4,7 @@
 
 ## Scoreboard
 
- 69 total  |  1 done  |  61 verified  |  0 skipped  |  1 blocked  |  6 remaining
+ 69 total  |  1 done  |  61 verified  |  0 skipped  |  2 blocked  |  5 remaining
  Drift: 5  |  Last reconcile: T63 |  Tier: structural
 
 ## Task Ledger
@@ -75,7 +75,7 @@
 | T62 | Full pytest/compile/diff | verified | 210 pass; compile; diffcheck | D15,V38 | no commit without evidence |
 | T63 | Restore and validate Futures realtime sources | verified | 76 tests; nine BTCUSDT sources FRESH | D16,V39,V40 | Real REST/stream evidence retained |
 | T64 | Validate data, orderbook, flow, funding contracts | verified | 233 tests; py3.12 compile; diffcheck | D16,V40,V41,V42,V44 | Accounting, backtest, recon, stream covered |
-| T65 | Run 30-minute Futures realtime smoke | in_progress | real resync GAP and REST disconnects observed | D16,D17,V43,V45,V46 | External transport unstable; no duration pass |
+| T65 | Run 30-minute Futures realtime smoke | blocked | real WS reset and REST disconnect | D16,D17,V43,V45,V46 | External transport unstable; no duration pass |
 | T66 | Run 24-hour Futures paper validation | pending |  | D16 | Simulated execution on real market data |
 | T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
 | T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
