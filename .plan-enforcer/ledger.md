@@ -74,8 +74,8 @@
 | T61 | Live switches and paper smoke | verified | paper fill; live blocked | D15,V34 | HARD BLOCK until gates pass |
 | T62 | Full pytest/compile/diff | verified | 210 pass; compile; diffcheck | D15,V38 | no commit without evidence |
 | T63 | Restore and validate Futures realtime sources | verified | 76 tests; nine BTCUSDT sources FRESH | D16,V39,V40 | Real REST/stream evidence retained |
-| T64 | Validate data, orderbook, flow, funding contracts | verified | 232 tests; compile; diffcheck | D16,V40,V41,V42 | Accounting, backtest, recon, stream covered |
-| T65 | Run 30-minute Futures realtime smoke | in_progress | pre-fix attempt stopped; symbol bug fixed | D16,V43 | Restart pinned to final commit; retain raw evidence |
+| T64 | Validate data, orderbook, flow, funding contracts | verified | 233 tests; py3.12 compile; diffcheck | D16,V40,V41,V42,V44 | Accounting, backtest, recon, stream covered |
+| T65 | Run 30-minute Futures realtime smoke | in_progress | resync GAP audit bug fixed; restart required | D16,D17,V43,V45 | No duration gate accepted from aborted runs |
 | T66 | Run 24-hour Futures paper validation | pending |  | D16 | Simulated execution on real market data |
 | T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
 | T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
@@ -101,6 +101,7 @@
 | D14 | T36,T49,T50 | Pivot: adapter/audit before orderbook | New pack requires Spot deletion and FuturesPrivateClient first |
 | D15 | T51-T62 | Unplanned: targeted futures semantic reset | User locked TradeIntent/risk/paper/stream/recon rewrite; do not replan T1-T50 |
 | D16 | T63-T69 | Continue existing readiness ledger | User supplied final validation pack; preserve external gates |
+| D17 | T65 | Persist resync GAP before fresh book coalescing | Real WS reset exposed overwritten fault evidence |
 
 ## Reconciliation History
 
@@ -120,6 +121,7 @@
 | R18 | T1-T62 | 4 | 210 tests; elapsed/Testnet/Live remain external |
 | R19 | T63 | 0 | Futures source recovery has real DB evidence |
 | R20 | T63-T65 | 0 | Contract suite verified; smoke restart follows symbol fix |
+| R21 | T63-T65 | 0 | Real reset found lost GAP audit event; fixed and tested |
 
 ## Reconciliation History
 

@@ -808,6 +808,30 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertIsNone(normalized)
         self.assertNotIn("BTC-USDT", books)
 
+    def test_orderbook_gap_is_not_overwritten_by_a_later_fresh_snapshot(self):
+        pending_events: list[dict] = []
+        pending_observations: dict[tuple[str, str], dict] = {}
+        gap = {
+            "symbol": "BTCUSDT",
+            "event_type": "ORDERBOOK",
+            "metadata": {"health_status": "GAP"},
+        }
+        fresh = {
+            "symbol": "BTCUSDT",
+            "event_type": "ORDERBOOK",
+            "metadata": {"bid_depth_5": "1"},
+        }
+
+        bian_market._queue_orderbook_observation(
+            pending_events, pending_observations, gap
+        )
+        bian_market._queue_orderbook_observation(
+            pending_events, pending_observations, fresh
+        )
+
+        self.assertEqual(pending_events, [gap])
+        self.assertEqual(pending_observations[("BTCUSDT", "ORDERBOOK")], fresh)
+
     def test_force_order_is_observation_with_explicit_side_semantics(self):
         liquidation = SimpleNamespace(
             symbol="BTC-USDT", side="SELL", price=Decimal("100"),

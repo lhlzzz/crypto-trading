@@ -1744,6 +1744,19 @@ def _stream_orderbook(
     )
 
 
+def _queue_orderbook_observation(
+    pending_events: list[dict[str, Any]],
+    pending_observations: dict[tuple[str, str], dict[str, Any]],
+    event: dict[str, Any],
+) -> None:
+    """Keep order book faults as immutable evidence through a later resync."""
+    health_status = str((event.get("metadata") or {}).get("health_status", "")).upper()
+    if health_status in {"GAP", "ERROR"}:
+        pending_events.append(event)
+        return
+    pending_observations[(event["symbol"], event["event_type"])] = event
+
+
 def _orderbook_event(
     standard_symbol: str,
     local_book: LocalOrderBook,
@@ -1958,7 +1971,9 @@ async def stream(
         )
         if normalized is not None:
             _, event = normalized
-            pending_observations[(event["symbol"], event["event_type"])] = event
+            _queue_orderbook_observation(
+                pending_events, pending_observations, event
+            )
 
     async def on_book(book: Any, receipt_timestamp: float) -> None:
         raw = getattr(book, "raw", None)
