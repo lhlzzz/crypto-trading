@@ -564,6 +564,11 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
     def test_futures_observation_preserves_each_native_aggregate_period(self):
         class FakeFuturesClient:
+            def get_aggregate_trades(self, symbol: str, *, limit: int):
+                self.assert_symbol(symbol)
+                assert limit == 1000
+                return [{"a": 7, "p": "99.5", "q": "3", "T": 2_000, "m": False}]
+
             def get_klines(self, symbol: str, *, interval: str, limit: int):
                 self.assert_symbol(symbol)
                 assert interval == "1m"
@@ -616,10 +621,15 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "TAKER_RATIO", "GLOBAL_LONG_SHORT", "TOP_TRADER_LONG_SHORT",
             }
         ]
-        self.assertEqual(len(report["events"]), 17)
+        self.assertEqual(len(report["events"]), 18)
         self.assertIn(
             "FUTURES_KLINES", {event["event_type"] for event in report["events"]}
         )
+        trade_event = next(
+            event for event in report["events"] if event["event_type"] == "FUTURES_TRADE"
+        )
+        self.assertEqual(trade_event["direction"], "BUY")
+        self.assertEqual(trade_event["notional"], "298.5")
         self.assertEqual(
             {event["metadata"]["observationPeriod"] for event in period_events},
             {"5m", "15m", "30m", "1h"},
@@ -820,7 +830,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         with patch.object(Symbols, "populated", return_value=True), patch.object(
             Symbols,
             "get",
-            return_value=({"BTC-USDT": "BTCUSDT"}, None),
+            return_value=({"BTC-USDT-PERP": "BTCUSDT"}, None),
         ):
             handler = bian_market._build_futures_stream_handler(["BTC-USDT"], callback)
         feed = handler.feeds[0]
@@ -836,7 +846,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         with patch.object(Symbols, "populated", return_value=True), patch.object(
             Symbols,
             "get",
-            return_value=({"BTC-USDT": "BTCUSDT"}, None),
+            return_value=({"BTC-USDT-PERP": "BTCUSDT"}, None),
         ):
             handler = bian_market._build_futures_stream_handler(
                 ["BTC-USDT"],
@@ -853,6 +863,45 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             {"aggTrade", "bookTicker", "depth", "markPrice", "forceOrder"},
         )
         self.assertTrue(all(value == ["BTCUSDT"] for value in subscription.values()))
+
+    def test_futures_perpetual_feed_symbols_keep_rest_storage_symbols(self):
+        trade = SimpleNamespace(
+            symbol="BTC-USDT-PERP", price=Decimal("100"), amount=Decimal("2"),
+            side="buy", timestamp=1_786_493_000.0, exchange="BINANCE_FUTURES",
+        )
+
+        _, snapshot = bian_market._stream_market(
+            trade, 1_786_493_001.0, market="FUTURES"
+        )
+
+        self.assertEqual(bian_market._futures_feed_symbol("BTC-USDT"), "BTC-USDT-PERP")
+        self.assertEqual(snapshot["symbol"], "BTCUSDT")
+        self.assertEqual(snapshot["market_data_event"]["symbol"], "BTCUSDT")
+        self.assertEqual(bian_market._storage_symbol("BTCUSDTPERP"), "BTCUSDT")
+
+    def test_futures_depth_snapshot_uses_binance_rest_symbol(self):
+        with patch.object(
+            bian_market, "_get_json", return_value={"lastUpdateId": 1, "bids": [], "asks": []}
+        ) as get_json:
+            bian_market._depth_snapshot("BTC-USDT-PERP", market="FUTURES")
+
+        self.assertIn("symbol=BTCUSDT", get_json.call_args.args[0])
+
+    def test_orderbook_exchange_symbol_uses_rest_storage_symbol(self):
+        book = bian_market.LocalOrderBook.from_snapshot(
+            {"lastUpdateId": 1, "bids": [["100", "2"]], "asks": [["101", "3"]]},
+        )
+
+        _, event = bian_market._orderbook_event(
+            "BTCUSDTPERP",
+            book,
+            source_timestamp=datetime(2026, 8, 30, tzinfo=timezone.utc),
+            received_at=datetime(2026, 8, 30, tzinfo=timezone.utc),
+            timestamp_semantics="rest_snapshot",
+            market="FUTURES",
+        )
+
+        self.assertEqual(event["symbol"], "BTCUSDT")
 
     def test_futures_mark_index_funding_event_has_provenance(self):
         funding = SimpleNamespace(

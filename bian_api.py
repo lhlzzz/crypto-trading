@@ -274,6 +274,7 @@ def get_trading_status() -> dict[str, Any]:
         "live_ready": gate.live_ready,
         "live_allowed": gate.live_allowed,
         "observation_gate_status": gate.observation_gate_status,
+        "paper_gate_status": gate.paper_gate_status,
         "shadow_gate_status": gate.shadow_gate_status,
         "testnet_gate_status": gate.testnet_gate_status,
         "alpha_gate_status": gate.alpha_gate_status,

@@ -60,6 +60,27 @@ def test_futures_public_client_retries_transient_timeout() -> None:
     sleep.assert_called_once_with(0.025)
 
 
+def test_futures_public_client_reads_aggregate_trades(monkeypatch) -> None:
+    client = FuturesPublicClient(ClientConfig(mode="paper"))
+    calls = []
+
+    def fake_get(path, **params):
+        calls.append((path, params))
+        return [{"a": 1, "p": "100", "q": "2"}]
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    assert client.get_aggregate_trades("BTCUSDT", limit=2000) == [
+        {"a": 1, "p": "100", "q": "2"}
+    ]
+    assert calls == [
+        (
+            "https://fapi.binance.com/fapi/v1/aggTrades",
+            {"symbol": "BTCUSDT", "limit": 1000},
+        )
+    ]
+
+
 def test_private_client_is_hard_blocked_in_paper_mode() -> None:
     with pytest.raises(BinanceAuthError, match="paper mode"):
         FuturesPrivateClient(ClientConfig(mode="paper"))

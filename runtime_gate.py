@@ -47,19 +47,29 @@ def max_data_age_sec() -> int:
 
 
 _GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
-_EXTERNAL_GATES = ("observation", "shadow", "testnet")
+_EXTERNAL_GATES = ("observation", "paper", "shadow", "testnet")
 REQUIRED_FUTURES_SOURCES = frozenset(
     {
-        "futures_klines",
-        "futures_trade_flow",
-        "futures_taker_ratio",
-        "futures_open_interest",
-        "futures_funding",
-        "futures_mark_price",
-        "futures_index_price",
-        "futures_orderbook",
-        "futures_book_ticker",
-        "futures_liquidation",
+        "FUTURES_TRADE",
+        "FUTURES_BOOK_TICKER",
+        "FUTURES_DEPTH",
+        "FUTURES_MARK_PRICE",
+        "FUTURES_INDEX_PRICE",
+        "FUTURES_OPEN_INTEREST",
+        "FUTURES_FUNDING",
+        "FUTURES_TAKER",
+        "FUTURES_LIQUIDATION",
+    }
+)
+_REALTIME_FUTURES_SOURCES = frozenset(
+    {
+        "FUTURES_TRADE",
+        "FUTURES_BOOK_TICKER",
+        "FUTURES_DEPTH",
+        "FUTURES_MARK_PRICE",
+        "FUTURES_INDEX_PRICE",
+        "FUTURES_FUNDING",
+        "FUTURES_LIQUIDATION",
     }
 )
 
@@ -118,6 +128,7 @@ class GateResult:
     testnet_ready: bool = False
     live_ready: bool = False
     observation_gate_status: str = "NOT_STARTED"
+    paper_gate_status: str = "NOT_STARTED"
     shadow_gate_status: str = "NOT_STARTED"
     testnet_gate_status: str = "NOT_STARTED"
     paper_db_ok: bool = False
@@ -213,6 +224,7 @@ class GateResult:
             "testnet_ready": self.testnet_ready,
             "live_ready": self.live_ready,
             "observation_gate_status": self.observation_gate_status,
+            "paper_gate_status": self.paper_gate_status,
             "shadow_gate_status": self.shadow_gate_status,
             "testnet_gate_status": self.testnet_gate_status,
             "paper_db_ok": self.paper_db_ok,
@@ -227,35 +239,45 @@ class GateResult:
         }
 
 
-def _data_health(store: Any | None, *, max_age_sec: int) -> bool:
+def _data_health(
+    store: Any | None,
+    *,
+    max_age_sec: int,
+    symbols: Iterable[str],
+) -> bool:
     if store is None or not hasattr(store, "market_data_freshness"):
         return False
-    rows = store.market_data_freshness(max_age_sec=max_age_sec)
-    by_source = {str(row.get("event_type", "")).lower(): row for row in rows}
-    if not REQUIRED_FUTURES_SOURCES.issubset(by_source):
-        return False
+    rows = store.market_data_freshness(max_age_sec=max_age_sec, symbols=symbols)
     now = datetime.now(timezone.utc)
     for source in REQUIRED_FUTURES_SOURCES:
-        row = by_source[source]
-        if str(row.get("status", "")).upper() != "FRESH":
+        source_rows = [
+            row for row in rows
+            if str(row.get("source") or row.get("event_type") or "").upper() == source
+        ]
+        if not source_rows or any(not str(row.get("symbol", "")).strip() for row in source_rows):
             return False
-        if row.get("latency_ms") is None or int(row["latency_ms"]) > int(
-            os.environ.get("MAX_DATA_LATENCY_MS", "2000")
-        ):
-            return False
-        try:
-            source_at = datetime.fromisoformat(str(row["source_timestamp"]))
-            received_at = datetime.fromisoformat(str(row["received_timestamp"]))
-            if source_at.tzinfo is None:
-                source_at = source_at.replace(tzinfo=timezone.utc)
-            if received_at.tzinfo is None:
-                received_at = received_at.replace(tzinfo=timezone.utc)
-            if received_at < source_at or source_at > now or received_at > now:
+        for row in source_rows:
+            if str(row.get("status", "")).upper() != "FRESH":
                 return False
-            if int(row["latency_ms"]) != int((received_at - source_at).total_seconds() * 1000):
+            if row.get("latency_ms") is None:
                 return False
-        except (KeyError, TypeError, ValueError):
-            return False
+            try:
+                source_at = datetime.fromisoformat(str(row["source_timestamp"]))
+                received_at = datetime.fromisoformat(str(row["received_timestamp"]))
+                if source_at.tzinfo is None:
+                    source_at = source_at.replace(tzinfo=timezone.utc)
+                if received_at.tzinfo is None:
+                    received_at = received_at.replace(tzinfo=timezone.utc)
+                if received_at < source_at or source_at > now or received_at > now:
+                    return False
+                if int(row["latency_ms"]) != int((received_at - source_at).total_seconds() * 1000):
+                    return False
+                if source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
+                    os.environ.get("MAX_DATA_LATENCY_MS", "2000")
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
     return True
 
 
@@ -401,7 +423,7 @@ def evaluate_runtime_gate(
 
     if data_health_ok is None:
         data_health_ok = _data_health(
-            store, max_age_sec=max_data_age_sec()
+            store, max_age_sec=max_data_age_sec(), symbols=selected_symbols
         )
     if not data_health_ok:
         reasons.append("DATA_HEALTH_NOT_VERIFIED")
@@ -426,6 +448,7 @@ def evaluate_runtime_gate(
 
     statuses = _persisted_gate_statuses(store, gate_evidence)
     observation_gate_status = statuses["observation"]
+    paper_gate_status = statuses["paper"]
     shadow_gate_status = statuses["shadow"]
     testnet_gate_status = statuses["testnet"]
     observation_gates_ok = (
@@ -444,7 +467,7 @@ def evaluate_runtime_gate(
             paper_accounting_ok = False
     paper_ready = all(
         (paper_db_ok, paper_accounting_ok, bool(data_health_ok), bool(reconciliation_ok),
-         risk_config_ok, kill_switch_ok)
+         risk_config_ok, kill_switch_ok, paper_gate_status == "PASSED")
     )
     exchange_ready = all(
         (
@@ -461,6 +484,7 @@ def evaluate_runtime_gate(
     live_ready = all(
         (
             exchange_ready,
+            paper_ready,
             positioning_enabled,
             observation_gates_ok,
             testnet_lifecycle_ok,
@@ -505,6 +529,7 @@ def evaluate_runtime_gate(
         testnet_ready=testnet_ready,
         live_ready=live_ready,
         observation_gate_status=observation_gate_status,
+        paper_gate_status=paper_gate_status,
         shadow_gate_status=shadow_gate_status,
         testnet_gate_status=testnet_gate_status,
         paper_db_ok=paper_db_ok,

@@ -437,72 +437,118 @@ class TradingStore:
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def market_data_freshness(self, *, max_age_sec: int = 900) -> list[dict[str, Any]]:
+    def market_data_freshness(
+        self,
+        *,
+        max_age_sec: int = 900,
+        symbols: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one source-health record per required Futures source/symbol.
+
+        Health tracks whether an observation is arriving, while source payloads
+        retain their own measurement or settlement timestamps. In particular,
+        the mark-price stream is the liveness source for funding; a prior
+        funding settlement is not a stale realtime observation.
+        """
         import psycopg2
+        from runtime_gate import REQUIRED_FUTURES_SOURCES
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT DISTINCT ON (market, event_type)
-                           market, event_type, event_timestamp,
-                           received_timestamp, latency_ms
+                    SELECT DISTINCT ON (symbol, event_type)
+                           symbol, market, event_type, event_timestamp,
+                           received_timestamp, latency_ms, metadata
                     FROM market_flow_events
                     WHERE market = 'FUTURES'
-                    ORDER BY market, event_type, event_timestamp DESC,
-                             received_timestamp DESC
+                    ORDER BY symbol, event_type, received_timestamp DESC,
+                             event_timestamp DESC
                     """
                 )
                 rows = cursor.fetchall()
-                cursor.execute(
-                    """
-                    SELECT captured_at, payload
-                    FROM bian_market_snapshots
-                    ORDER BY captured_at DESC, id DESC
-                    LIMIT 1
-                    """
-                )
-                kline_row = cursor.fetchone()
         now = _now()
-        canonical: dict[str, tuple[str, Any, Any, int]] = {}
-        for market, event_type, source_at, received_at, latency_ms in rows:
+        source_events = {
+            "FUTURES_TRADE": ("FUTURES_TRADE",),
+            "BOOK_TICKER": ("FUTURES_BOOK_TICKER",),
+            "ORDERBOOK": ("FUTURES_DEPTH",),
+            "OPEN_INTEREST": ("FUTURES_OPEN_INTEREST",),
+            "TAKER_RATIO": ("FUTURES_TAKER",),
+            "MARK_INDEX_FUNDING": (
+                "FUTURES_MARK_PRICE",
+                "FUTURES_INDEX_PRICE",
+                "FUTURES_FUNDING",
+            ),
+            "LIQUIDATION_HEARTBEAT": ("FUTURES_LIQUIDATION",),
+        }
+        requested_symbols = {
+            str(symbol).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
+            for symbol in (symbols or ())
+            if str(symbol).strip()
+        }
+        canonical: dict[str, dict[str, tuple[str, Any, Any, int, dict[str, Any]]]] = {}
+        symbols: set[str] = set()
+        for symbol, market, event_type, source_at, received_at, latency_ms, metadata in rows:
+            normalized_symbol = str(symbol).upper()
+            if requested_symbols and normalized_symbol not in requested_symbols:
+                continue
+            symbols.add(normalized_symbol)
+            payload = metadata if isinstance(metadata, dict) else {}
             aliases = {
-                "FUTURES_KLINES": ("futures_klines",),
-                "FUTURES_TRADE": ("futures_trade_flow",),
-                "TAKER_RATIO": ("futures_taker_ratio",),
-                "OPEN_INTEREST": ("futures_open_interest",),
-                "FUNDING": ("futures_funding",),
-                "MARK_INDEX_FUNDING": ("futures_mark_price", "futures_index_price"),
-                "BOOK_TICKER": ("futures_book_ticker",),
-                "ORDERBOOK": ("futures_orderbook",),
-                "FORCE_ORDER": ("futures_liquidation",),
+                **source_events,
+                "FORCE_ORDER": (),
             }.get(str(event_type), ())
-            for alias in aliases:
-                canonical[alias] = (str(market), source_at, received_at, int(latency_ms))
-        if kline_row is not None:
-            source_at, payload = kline_row
-            stored = payload if isinstance(payload, dict) else {}
-            received_at = stored.get("received_timestamp", source_at)
-            canonical["futures_klines"] = ("FUTURES", source_at, received_at, int(
-                (self._datetime(received_at) - _as_utc(source_at)).total_seconds() * 1000
-            ))
+            for source in aliases:
+                existing = canonical.setdefault(source, {}).get(normalized_symbol)
+                if existing is None or _as_utc(received_at) > _as_utc(existing[2]):
+                    canonical[source][normalized_symbol] = (
+                        str(market), source_at, received_at, int(latency_ms), payload
+                    )
 
         result = []
-        for event_type, (market, source_at, received_at, latency_ms) in sorted(canonical.items()):
-            source_dt = _as_utc(source_at)
-            received_dt = _as_utc(received_at)
-            age_sec = max(0, int((now - source_dt).total_seconds()))
-            valid_timestamps = received_dt >= source_dt and source_dt <= now and received_dt <= now
-            valid_latency = latency_ms >= 0 and latency_ms == int((received_dt - source_dt).total_seconds() * 1000)
-            result.append({
-                "market": market,
-                "event_type": event_type,
-                "source_timestamp": source_dt.isoformat(),
-                "received_timestamp": received_dt.isoformat(),
-                "latency_ms": latency_ms,
-                "age_sec": age_sec,
-                "status": "FRESH" if age_sec <= max(1, max_age_sec) and valid_timestamps and valid_latency else "STALE",
-            })
+        for source in sorted(REQUIRED_FUTURES_SOURCES):
+            for symbol in sorted(requested_symbols or symbols):
+                record = canonical.get(source, {}).get(symbol)
+                if record is None:
+                    result.append({
+                        "source": source,
+                        "event_type": source,
+                        "symbol": symbol,
+                        "market": "FUTURES",
+                        "source_timestamp": None,
+                        "received_timestamp": None,
+                        "latency_ms": None,
+                        "age_sec": None,
+                        "status": "MISSING",
+                    })
+                    continue
+                market, source_at, received_at, latency_ms, payload = record
+                source_dt = _as_utc(source_at)
+                received_dt = _as_utc(received_at)
+                age_sec = max(0, int((now - received_dt).total_seconds()))
+                valid_timestamps = received_dt >= source_dt and source_dt <= now and received_dt <= now
+                valid_latency = latency_ms >= 0 and latency_ms == int((received_dt - source_dt).total_seconds() * 1000)
+                reported_status = str(payload.get("health_status", "")).upper()
+                if reported_status in {"GAP", "ERROR"}:
+                    status = reported_status
+                elif not valid_timestamps or not valid_latency:
+                    status = "ERROR"
+                elif age_sec > max(1, max_age_sec):
+                    status = "STALE"
+                else:
+                    status = "FRESH"
+                result.append({
+                    "source": source,
+                    "event_type": source,
+                    "symbol": symbol,
+                    "market": market,
+                    "source_timestamp": source_dt.isoformat(),
+                    "received_timestamp": received_dt.isoformat(),
+                    "latency_ms": latency_ms,
+                    "age_sec": age_sec,
+                    "status": status,
+                    "transport_source": payload.get("source"),
+                })
         return result
 
     @staticmethod
@@ -1392,7 +1438,7 @@ class TradingStore:
         """Persist externally verified readiness evidence for one gate."""
         normalized_gate = gate.strip().lower()
         normalized_status = status.strip().upper()
-        if normalized_gate not in {"observation", "shadow", "testnet"}:
+        if normalized_gate not in {"observation", "paper", "shadow", "testnet"}:
             raise ValueError("unsupported runtime gate")
         if normalized_status not in {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}:
             raise ValueError("unsupported runtime gate status")
@@ -1408,7 +1454,12 @@ class TradingStore:
         """Return the latest persisted status for each external acceptance gate."""
         import psycopg2
 
-        values = {"observation": "NOT_STARTED", "shadow": "NOT_STARTED", "testnet": "NOT_STARTED"}
+        values = {
+            "observation": "NOT_STARTED",
+            "paper": "NOT_STARTED",
+            "shadow": "NOT_STARTED",
+            "testnet": "NOT_STARTED",
+        }
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1416,7 +1467,7 @@ class TradingStore:
                     SELECT DISTINCT ON ((payload->>'gate')) payload->>'gate', payload->>'status'
                     FROM system_events
                     WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
-                      AND payload->>'gate' IN ('observation', 'shadow', 'testnet')
+                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet')
                     ORDER BY (payload->>'gate'), event_at DESC
                     """
                 )

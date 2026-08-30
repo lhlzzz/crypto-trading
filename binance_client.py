@@ -466,6 +466,16 @@ class FuturesPublicClient:
     def get_ticker_price(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/ticker/price", symbol=symbol.upper())
 
+    def get_aggregate_trades(
+        self, symbol: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        payload = self._get(
+            f"{self.base_url}/aggTrades",
+            symbol=symbol.upper(),
+            limit=max(1, min(limit, 1000)),
+        )
+        return payload if isinstance(payload, list) else []
+
     def get_open_interest(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/openInterest", symbol=symbol.upper())
 

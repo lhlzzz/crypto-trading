@@ -860,7 +860,11 @@ def _depth_snapshot(
     symbol: str, *, market: str = "SPOT", limit: int = 1000
 ) -> dict[str, Any]:
     """Fetch the Binance REST depth snapshot used to initialize a local book."""
-    normalized_symbol = symbol.replace("-", "").upper()
+    normalized_symbol = (
+        _storage_symbol(symbol)
+        if market.upper() == "FUTURES"
+        else symbol.replace("-", "").upper()
+    )
     bounded_limit = max(5, min(int(limit), 5000))
     host = SPOT_HOSTS[0] if market.upper() == "SPOT" else FUTURES_HOSTS[0]
     payload = _get_json(f"{host}/depth?symbol={normalized_symbol}&limit={bounded_limit}")
@@ -1267,6 +1271,45 @@ def collect_futures_observations(
 
     for raw_symbol in symbols:
         symbol = raw_symbol.replace("-", "").upper()
+        get_aggregate_trades = getattr(client, "get_aggregate_trades", None)
+        if get_aggregate_trades is not None:
+            for trade in get_aggregate_trades(symbol, limit=1000):
+                price = _decimal(trade.get("p"))
+                quantity = _decimal(trade.get("q"))
+                timestamp = trade.get("T")
+                if (
+                    price is None
+                    or quantity is None
+                    or price <= 0
+                    or quantity <= 0
+                    or timestamp is None
+                ):
+                    continue
+                source = _event_datetime(timestamp)
+                received = datetime.now(timezone.utc)
+                buyer_maker = bool(trade.get("m"))
+                aggregate_id = str(trade.get("a"))
+                events.append(
+                    {
+                        "event_id": str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"bian:futures-aggregate-trade:{symbol}:{aggregate_id}",
+                        )),
+                        "symbol": symbol,
+                        "source": "binance_futures_agg_trades_rest",
+                        "market": "FUTURES",
+                        "event_type": "FUTURES_TRADE",
+                        "source_timestamp": source.isoformat(),
+                        "received_timestamp": received.isoformat(),
+                        "latency_ms": _latency_ms(source, received),
+                        "price": str(price),
+                        "quantity": str(quantity),
+                        "notional": str(price * quantity),
+                        "buyer_maker": buyer_maker,
+                        "direction": "SELL" if buyer_maker else "BUY",
+                        "metadata": dict(trade),
+                    }
+                )
         get_klines = getattr(client, "get_klines", None)
         klines = get_klines(symbol, interval="1m", limit=2) if get_klines else []
         if klines:
@@ -1486,6 +1529,21 @@ def _stream_symbols(value: str) -> list[str]:
     return list(dict.fromkeys(symbols))
 
 
+def _futures_feed_symbol(symbol: str) -> str:
+    """Translate the operator-facing USD-M symbol to Cryptofeed perpetual form."""
+    normalized = symbol.strip().upper()
+    if normalized.endswith("-USDT-PERP"):
+        return normalized
+    if normalized.endswith("-USDT"):
+        return f"{normalized}-PERP"
+    raise ValueError("Futures stream symbols must be USDT perpetual contracts")
+
+
+def _storage_symbol(symbol: str) -> str:
+    """Keep persistent Futures symbols in Binance REST form, e.g. BTCUSDT."""
+    return symbol.upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
+
+
 def _build_stream_handler(
     symbols: list[str],
     callback: Callable[[Any, float], Awaitable[None]],
@@ -1519,13 +1577,19 @@ def _build_stream_handler(
     return handler
 
 
-def _stream_report(markets: list[dict[str, Any]]) -> dict[str, Any]:
+def _stream_report(
+    markets: list[dict[str, Any]], *, market: str = "SPOT"
+) -> dict[str, Any]:
     captured_at = _now()
     return {
         "run_id": str(uuid.uuid4()),
         "collection_kind": "stream_trade",
         "captured_at": captured_at,
-        "source_url": "wss://stream.binance.com:9443",
+        "source_url": (
+            "wss://fstream.binance.com"
+            if market.upper() == "FUTURES"
+            else "wss://stream.binance.com:9443"
+        ),
         "markets": markets,
         "product_coverage": [],
     }
@@ -1547,7 +1611,7 @@ def _stream_market(
     side = str(trade.side).lower()
     buyer_maker = side in {"sell", "none"}
     event = {
-        "symbol": standard_symbol.replace("-", ""),
+        "symbol": _storage_symbol(standard_symbol),
         "event_id": str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"bian:trade:{standard_symbol}:{source_timestamp.isoformat()}:{price}:{quantity}",
@@ -1571,7 +1635,7 @@ def _stream_market(
     return (
         standard_symbol,
         {
-            "symbol": standard_symbol.replace("-", ""),
+            "symbol": _storage_symbol(standard_symbol),
             "last_price": price,
             "price_change_percent": None,
             "quote_volume": None,
@@ -1606,7 +1670,7 @@ def _stream_book_ticker(
     received_at = _event_datetime(receipt_timestamp)
     mid = (bid + ask) / Decimal("2")
     event = {
-        "symbol": standard_symbol.replace("-", ""),
+        "symbol": _storage_symbol(standard_symbol),
         "event_id": str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"bian:bookticker:{standard_symbol}:{source_timestamp.isoformat()}:{bid}:{ask}",
@@ -1653,7 +1717,6 @@ def _stream_orderbook(
     if not isinstance(raw, dict):
         return None
     standard_symbol = str(book.symbol)
-    symbol = standard_symbol.replace("-", "")
     received_at = _event_datetime(receipt_timestamp)
     if "lastUpdateId" in raw:
         local_book = LocalOrderBook.from_snapshot(raw)
@@ -1694,7 +1757,7 @@ def _orderbook_event(
     features = local_book.features()
     if not features:
         return None
-    symbol = standard_symbol.replace("-", "")
+    symbol = _storage_symbol(standard_symbol)
     best_bid = max(local_book.bids)
     best_ask = min(local_book.asks)
     event = {
@@ -1750,7 +1813,7 @@ def _stream_liquidation(
     if side not in {"BUY", "SELL"}:
         return None
     event = {
-        "symbol": standard_symbol.replace("-", ""),
+        "symbol": _storage_symbol(standard_symbol),
         "event_id": str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"bian:forceorder:{standard_symbol}:{source_timestamp.isoformat()}:{side}:{price}:{quantity}",
@@ -1790,7 +1853,7 @@ def _stream_funding(
     index_price = _decimal(raw.get("i")) if isinstance(raw, dict) else None
     rate = _decimal(getattr(funding, "rate", None))
     event = {
-        "symbol": standard_symbol.replace("-", ""),
+        "symbol": _storage_symbol(standard_symbol),
         "event_id": str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"bian:mark-index-funding:{standard_symbol}:{source_timestamp.isoformat()}:{mark_price}",
@@ -1849,7 +1912,7 @@ def _build_futures_stream_handler(
     handler = FeedHandler()
     handler.add_feed(
         BinanceFutures(
-            symbols=symbols,
+            symbols=[_futures_feed_symbol(symbol) for symbol in symbols],
             channels=channels,
             callbacks=callbacks,
             retries=-1,
@@ -1922,7 +1985,24 @@ async def stream(
                     market.lower(),
                     type(exc).__name__,
                 )
-                return None
+                received_at = _event_datetime(receipt_timestamp)
+                return standard_symbol, {
+                    "symbol": _storage_symbol(standard_symbol),
+                    "event_id": str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"bian:orderbook-health:{standard_symbol}:{received_at.isoformat()}:{type(exc).__name__}",
+                    )),
+                    "event_type": "ORDERBOOK",
+                    "source": "binance_futures_diff_depth",
+                    "market": "FUTURES",
+                    "source_timestamp": received_at.isoformat(),
+                    "received_timestamp": received_at.isoformat(),
+                    "latency_ms": 0,
+                    "metadata": {
+                        "health_status": "GAP",
+                        "reason": type(exc).__name__,
+                    },
+                }
             depth_buffers.pop(standard_symbol, None)
             received_at = _event_datetime(receipt_timestamp)
             source_timestamp = _event_datetime(raw.get("E", receipt_timestamp))
@@ -1961,12 +2041,30 @@ async def stream(
             await asyncio.sleep(flush_sec)
             if not pending_events and not pending_observations:
                 continue
+            if market.upper() == "FUTURES":
+                received_at = datetime.now(timezone.utc)
+                for standard_symbol in symbols:
+                    symbol = _storage_symbol(standard_symbol)
+                    pending_observations[(symbol, "LIQUIDATION_HEARTBEAT")] = {
+                        "symbol": symbol,
+                        "event_id": str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"bian:liquidation-heartbeat:{symbol}:{received_at.isoformat()}",
+                        )),
+                        "event_type": "LIQUIDATION_HEARTBEAT",
+                        "source": "binance_futures_force_order_subscription",
+                        "market": "FUTURES",
+                        "source_timestamp": received_at.isoformat(),
+                        "received_timestamp": received_at.isoformat(),
+                        "latency_ms": 0,
+                        "metadata": {"observed_liquidation": False},
+                    }
             markets = list(pending.values())
             events = [*pending_events, *pending_observations.values()]
             pending.clear()
             pending_events.clear()
             pending_observations.clear()
-            report = _stream_report(markets)
+            report = _stream_report(markets, market=market)
             report["events"] = events
             try:
                 await asyncio.to_thread(persist, report, dsn)

@@ -8,7 +8,8 @@ from runtime_gate import REQUIRED_FUTURES_SOURCES, evaluate_runtime_gate
 
 
 class FreshStore:
-    def market_data_freshness(self, *, max_age_sec: int):
+    def market_data_freshness(self, *, max_age_sec: int, symbols=()):
+        del symbols
         return [{"status": "FRESH", "age_sec": 1, "max_age_sec": max_age_sec}]
 
 
@@ -17,11 +18,14 @@ class RequiredFreshStore:
         self.missing = missing
         self.stale = stale
 
-    def market_data_freshness(self, *, max_age_sec: int):
+    def market_data_freshness(self, *, max_age_sec: int, symbols=()):
+        del symbols
         now = datetime.now(timezone.utc).isoformat()
         return [
             {
+                "source": source,
                 "event_type": source,
+                "symbol": "BTCUSDT",
                 "status": "STALE" if source == self.stale else "FRESH",
                 "source_timestamp": now,
                 "received_timestamp": now,
@@ -60,6 +64,7 @@ def test_paper_gate_never_constructs_private_account_client(monkeypatch) -> None
         store=FreshStore(),
         data_health_ok=True,
         reconciliation_ok=True,
+        gate_evidence={"paper": "PASSED"},
     )
 
     assert gate.credentials_ok is True
@@ -69,10 +74,21 @@ def test_paper_gate_never_constructs_private_account_client(monkeypatch) -> None
     assert gate.trading_enabled is True
 
 
+def test_paper_gate_requires_24h_acceptance_evidence() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+    )
+
+    assert gate.paper_ready is False
+    assert gate.paper_gate_status == "NOT_STARTED"
+
+
 def test_missing_required_source_blocks_data_health() -> None:
     gate = evaluate_runtime_gate(
         mode="paper",
-        store=RequiredFreshStore(missing="futures_orderbook"),
+        store=RequiredFreshStore(missing="FUTURES_DEPTH"),
         reconciliation_ok=True,
     )
     assert gate.data_health_ok is False
@@ -82,7 +98,7 @@ def test_missing_required_source_blocks_data_health() -> None:
 def test_stale_required_source_blocks_data_health() -> None:
     gate = evaluate_runtime_gate(
         mode="paper",
-        store=RequiredFreshStore(stale="futures_orderbook"),
+        store=RequiredFreshStore(stale="FUTURES_DEPTH"),
         reconciliation_ok=True,
     )
     assert gate.data_health_ok is False

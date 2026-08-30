@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 62 total  |  0 done  |  58 verified  |  0 skipped  |  0 blocked  |  4 remaining
- Drift: 5  |  Last reconcile: T62 |  Tier: structural
+ 69 total  |  1 done  |  60 verified  |  0 skipped  |  1 blocked  |  7 remaining
+ Drift: 5  |  Last reconcile: T63 |  Tier: structural
 
 ## Task Ledger
 
@@ -73,6 +73,13 @@
 | T60 | Delete Spot private leftovers | verified | PrivateClient removed | D15,V34 | migrate callers then drop alias |
 | T61 | Live switches and paper smoke | verified | paper fill; live blocked | D15,V34 | HARD BLOCK until gates pass |
 | T62 | Full pytest/compile/diff | verified | 210 pass; compile; diffcheck | D15,V38 | no commit without evidence |
+| T63 | Restore and validate Futures realtime sources | verified | 76 tests; nine BTCUSDT sources FRESH | D16,V39,V40 | Real REST/stream evidence retained |
+| T64 | Validate data, orderbook, flow, funding contracts | verified | 232 tests; compile; diffcheck | D16,V40,V41,V42 | Accounting, backtest, recon, stream covered |
+| T65 | Run 30-minute Futures realtime smoke | in_progress | pre-fix attempt stopped; symbol bug fixed | D16,V43 | Restart pinned to final commit; retain raw evidence |
+| T66 | Run 24-hour Futures paper validation | pending |  | D16 | Simulated execution on real market data |
+| T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
+| T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
+| T69 | Final static validation, commit, and push | pending |  | D16 | Never upgrade unverified gates |
 
 ## Decision Log
 
@@ -93,6 +100,7 @@
 | D13 | T33,T42 | Do not skip elapsed-time gates | 1h/6h/24h/7d remain required evidence |
 | D14 | T36,T49,T50 | Pivot: adapter/audit before orderbook | New pack requires Spot deletion and FuturesPrivateClient first |
 | D15 | T51-T62 | Unplanned: targeted futures semantic reset | User locked TradeIntent/risk/paper/stream/recon rewrite; do not replan T1-T50 |
+| D16 | T63-T69 | Continue existing readiness ledger | User supplied final validation pack; preserve external gates |
 
 ## Reconciliation History
 
@@ -110,6 +118,8 @@
 | R16 | T1-T50 | 14 | T49/T50 verified; T36 deferred; T33 elapsed gates remain |
 | R17 | T1-T62 | 14 | T51-T62 verified; T33 elapsed + T36-T48 remain; Testnet BLOCKED_BY_EXTERNAL_CREDENTIALS |
 | R18 | T1-T62 | 4 | 210 tests; elapsed/Testnet/Live remain external |
+| R19 | T63 | 0 | Futures source recovery has real DB evidence |
+| R20 | T63-T65 | 0 | Contract suite verified; smoke restart follows symbol fix |
 
 ## Reconciliation History
 
