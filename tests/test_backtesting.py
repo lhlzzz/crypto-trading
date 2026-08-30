@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from backtesting import replay_positioning_frames, run_backtest
+from backtesting import evaluate_alpha_gate, replay_positioning_frames, run_backtest
 from engine import MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
 
 
@@ -85,6 +85,11 @@ def _positioning_frame(timestamp: datetime, before: str, current: str) -> Market
         symbol="BTCUSDT",
         closes=(Decimal(before), Decimal(current)),
         captured_at=timestamp,
+        bid_price=Decimal(current) - Decimal("0.1"),
+        ask_price=Decimal(current) + Decimal("0.1"),
+        last_price=Decimal(current),
+        mark_price=Decimal(current),
+        index_price=Decimal(current),
         spot_buy_volume=Decimal("12"),
         spot_sell_volume=Decimal("4"),
         net_spot_flow=Decimal("8"),
@@ -96,7 +101,10 @@ def _positioning_frame(timestamp: datetime, before: str, current: str) -> Market
         funding_rate=Decimal("0.0001"),
         spread_bps=Decimal("2"),
         depth_25bps=Decimal("100"),
+        funding_timestamp=timestamp,
+        funding_settlement_timestamp=timestamp,
         market_regime="RISK_ON",
+        meme_risk_tier="TRADEABLE",
         freshness=(SourceFreshness("spot", timestamp, timestamp, 900, timestamp),),
         source_timestamps=source,
     )
@@ -145,3 +153,13 @@ def test_backtest_frames_use_futures_paper_execution_contract() -> None:
     assert result.fees > 0
     assert result.slippage >= 0
     assert result.funding != 0
+
+
+def test_alpha_gate_requires_sufficient_chronological_oos_sample() -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    result = evaluate_alpha_gate(
+        [_positioning_frame(start + timedelta(minutes=i), str(100 + i), str(101 + i)) for i in range(8)],
+        min_samples=5,
+    )
+    assert result.status == "INSUFFICIENT_SAMPLE"
+    assert result.out_of_sample_samples >= 0

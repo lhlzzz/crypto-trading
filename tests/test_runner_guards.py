@@ -24,6 +24,7 @@ def _frame() -> MarketFrame:
         symbol="BTCUSDT",
         closes=(Decimal("100"), Decimal("101")),
         captured_at=datetime.now(timezone.utc),
+        meme_risk_tier="TRADEABLE",
     )
 
 

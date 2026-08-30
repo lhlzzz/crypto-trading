@@ -6,7 +6,7 @@ TradeIntent, calls an executor, or mutates Binance account configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 import os
 
 from binance_client import ClientConfig
@@ -37,6 +37,42 @@ def _expected_margin_mode() -> str:
     return os.environ.get("FUTURES_MARGIN_MODE", "ISOLATED").strip().upper()
 
 
+def max_data_age_sec() -> int:
+    """Canonical freshness budget shared by observation, runtime, and API."""
+    try:
+        return max(1, int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")))
+    except ValueError:
+        return 900
+
+
+_GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
+_EXTERNAL_GATES = ("observation", "shadow", "testnet")
+
+
+def _persisted_gate_statuses(
+    store: Any | None,
+    supplied: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Read verified evidence; configuration alone is never sufficient."""
+    values = {name: "NOT_STARTED" for name in _EXTERNAL_GATES}
+    if supplied is not None:
+        values.update({key: str(value).upper() for key, value in supplied.items()})
+    getter = getattr(store, "runtime_gate_statuses", None) if store is not None else None
+    if getter is None:
+        getter = getattr(store, "get_runtime_gate_statuses", None) if store is not None else None
+    if getter is not None:
+        try:
+            persisted = getter()
+            if isinstance(persisted, Mapping):
+                values.update({key: str(value).upper() for key, value in persisted.items()})
+        except Exception:
+            return {name: "FAILED" for name in _EXTERNAL_GATES}
+    for name in _EXTERNAL_GATES:
+        if values[name] not in _GATE_STATUSES:
+            values[name] = "FAILED"
+    return values
+
+
 @dataclass(frozen=True)
 class GateResult:
     """Single canonical answer to runtime readiness questions."""
@@ -63,10 +99,22 @@ class GateResult:
     leverage_ok: bool = False
     observation_gates_ok: bool = False
     testnet_lifecycle_ok: bool = False
+    paper_ready: bool = False
+    testnet_ready: bool = False
+    live_ready: bool = False
+    observation_gate_status: str = "NOT_STARTED"
+    shadow_gate_status: str = "NOT_STARTED"
+    testnet_gate_status: str = "NOT_STARTED"
+    paper_db_ok: bool = False
+    paper_accounting_ok: bool = False
 
     @property
     def trading_enabled(self) -> bool:
-        return self.mode in {"paper", "testnet"} and self._base_ready
+        if self.mode == "paper":
+            return self.paper_ready
+        if self.mode == "testnet":
+            return self.testnet_ready
+        return self.live_allowed
 
     @property
     def _base_ready(self) -> bool:
@@ -141,6 +189,14 @@ class GateResult:
             "kill_switch_ok": self.kill_switch_ok,
             "observation_gates_ok": self.observation_gates_ok,
             "testnet_lifecycle_ok": self.testnet_lifecycle_ok,
+            "paper_ready": self.paper_ready,
+            "testnet_ready": self.testnet_ready,
+            "live_ready": self.live_ready,
+            "observation_gate_status": self.observation_gate_status,
+            "shadow_gate_status": self.shadow_gate_status,
+            "testnet_gate_status": self.testnet_gate_status,
+            "paper_db_ok": self.paper_db_ok,
+            "paper_accounting_ok": self.paper_accounting_ok,
             "live_allowed": self.live_allowed,
             "reasons": list(self.reasons),
         }
@@ -175,6 +231,7 @@ def evaluate_runtime_gate(
     reconciliation_ok: bool | None = None,
     data_health_ok: bool | None = None,
     probe_account: bool = False,
+    gate_evidence: Mapping[str, str] | None = None,
 ) -> GateResult:
     """Evaluate the canonical runtime gate from configuration and evidence."""
     resolved_mode = (mode or _mode()).strip().lower()
@@ -199,15 +256,20 @@ def evaluate_runtime_gate(
     reasons: list[str] = []
     positioning_enabled = _enabled("POSITIONING_DECISION_ENABLED")
     credentials_ok = resolved_mode == "paper" or bool(config.api_key and config.api_secret)
-    account_reachable = resolved_mode == "paper"
+    # These fields are Binance account evidence. Paper must not present local
+    # state as a verified exchange account.
+    account_reachable = False
+    # Paper can validate its local execution configuration, but these are not
+    # exchange-account observations. ``account_reachable`` and the account
+    # balance/position probes remain false in paper mode.
     account_mode_ok = resolved_mode == "paper"
     margin_mode_ok = resolved_mode == "paper"
-    exchange_positions_ok = resolved_mode == "paper"
-    open_orders_ok = resolved_mode == "paper"
-    wallet_balance_ok = resolved_mode == "paper"
-    available_balance_ok = resolved_mode == "paper"
-    server_time_ok = resolved_mode == "paper"
-    leverage_ok = resolved_mode == "paper"
+    exchange_positions_ok = False
+    open_orders_ok = False
+    wallet_balance_ok = False
+    available_balance_ok = False
+    server_time_ok = False
+    leverage_ok = False
     symbol_leverage: dict[str, str] = {}
 
     if resolved_mode != "paper" and not credentials_ok:
@@ -262,20 +324,20 @@ def evaluate_runtime_gate(
     elif resolved_mode != "paper":
         reasons.append("ACCOUNT_PREFLIGHT_NOT_RUN")
 
-    if not account_mode_ok:
+    if resolved_mode != "paper" and not account_mode_ok:
         reasons.append("ACCOUNT_MODE_NOT_VERIFIED")
-    if not margin_mode_ok:
+    if resolved_mode != "paper" and not margin_mode_ok:
         reasons.append("MARGIN_MODE_NOT_VERIFIED")
     if resolved_mode != "paper" and not account_reachable:
         reasons.append("ACCOUNT_UNREACHABLE")
-    if not server_time_ok:
+    if resolved_mode != "paper" and not server_time_ok:
         reasons.append("SERVER_TIME_NOT_VERIFIED")
-    if not leverage_ok:
+    if resolved_mode != "paper" and not leverage_ok:
         reasons.append("LEVERAGE_PARITY_NOT_VERIFIED")
 
     if data_health_ok is None:
-        data_health_ok = resolved_mode == "paper" or _data_health(
-            store, max_age_sec=max(1, int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")))
+        data_health_ok = _data_health(
+            store, max_age_sec=max_data_age_sec()
         )
     if not data_health_ok:
         reasons.append("DATA_HEALTH_NOT_VERIFIED")
@@ -298,13 +360,53 @@ def evaluate_runtime_gate(
     if not confirmation_ok:
         reasons.append("LIVE_CONFIRMATION_MISSING")
 
-    # These acceptance gates are intentionally false until their external
-    # evidence is completed; Live must remain hard-blocked in this release.
-    observation_gates_ok = False
-    testnet_lifecycle_ok = False
-    if resolved_mode == "live":
+    statuses = _persisted_gate_statuses(store, gate_evidence)
+    observation_gate_status = statuses["observation"]
+    shadow_gate_status = statuses["shadow"]
+    testnet_gate_status = statuses["testnet"]
+    observation_gates_ok = (
+        observation_gate_status == "PASSED" and shadow_gate_status == "PASSED"
+    )
+    testnet_lifecycle_ok = testnet_gate_status == "PASSED"
+
+    paper_db_ok = store is not None
+    accounting_checker = getattr(store, "paper_accounting_ready", None) if store is not None else None
+    if accounting_checker is None:
+        paper_accounting_ok = store is not None
+    else:
+        try:
+            paper_accounting_ok = bool(accounting_checker())
+        except Exception:
+            paper_accounting_ok = False
+    paper_ready = all(
+        (paper_db_ok, paper_accounting_ok, bool(data_health_ok), bool(reconciliation_ok),
+         risk_config_ok, kill_switch_ok)
+    )
+    exchange_ready = all(
+        (
+            credentials_ok, account_reachable, account_mode_ok, margin_mode_ok,
+            exchange_positions_ok, open_orders_ok, wallet_balance_ok,
+            available_balance_ok, server_time_ok, leverage_ok, bool(data_health_ok),
+            bool(reconciliation_ok), risk_config_ok, kill_switch_ok,
+        )
+    )
+    testnet_ready = exchange_ready and testnet_lifecycle_ok
+    live_ready = all(
+        (
+            exchange_ready,
+            positioning_enabled,
+            observation_gates_ok,
+            testnet_lifecycle_ok,
+            confirmation_ok,
+        )
+    )
+    if resolved_mode in {"testnet", "live"} and not testnet_lifecycle_ok:
+        reasons.append("TESTNET_LIFECYCLE_NOT_VERIFIED")
+    if resolved_mode == "live" and not observation_gates_ok:
+        reasons.append("OBSERVATION_SHADOW_GATES_NOT_VERIFIED")
+    if resolved_mode == "live" and not live_ready:
         reasons.append("LIVE_RELEASE_GATES_PENDING")
-    live_allowed = False
+    live_allowed = resolved_mode == "live" and live_ready
     return GateResult(
         mode=resolved_mode,
         positioning_enabled=positioning_enabled,
@@ -328,4 +430,12 @@ def evaluate_runtime_gate(
         leverage_ok=leverage_ok,
         observation_gates_ok=observation_gates_ok,
         testnet_lifecycle_ok=testnet_lifecycle_ok,
+        paper_ready=paper_ready,
+        testnet_ready=testnet_ready,
+        live_ready=live_ready,
+        observation_gate_status=observation_gate_status,
+        shadow_gate_status=shadow_gate_status,
+        testnet_gate_status=testnet_gate_status,
+        paper_db_ok=paper_db_ok,
+        paper_accounting_ok=paper_accounting_ok,
     )

@@ -18,6 +18,24 @@ PositionDirection = Literal["LONG", "SHORT", "FLAT"]
 MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
 
 
+@dataclass(frozen=True)
+class FuturesRiskRules:
+    """Single source for the conservative paper liquidation rule inputs."""
+
+    symbol: str
+    maintenance_margin_rate: Decimal = Decimal("0.005")
+
+    def __post_init__(self) -> None:
+        if not self.symbol.strip():
+            raise ValueError("Futures risk rules require a symbol")
+        if not Decimal("0") < self.maintenance_margin_rate < Decimal("1"):
+            raise ValueError("maintenance margin rate must be between 0 and 1")
+
+    @classmethod
+    def conservative(cls, symbol: str) -> "FuturesRiskRules":
+        return cls(symbol=symbol.upper().strip())
+
+
 def _zero(value: Decimal | None) -> Decimal:
     return value if value is not None else Decimal("0")
 
@@ -62,6 +80,8 @@ class RiskLimits:
     min_liquidity_score: Decimal = Decimal("0.4")
     min_positioning_confidence: Decimal = Decimal("0.6")
     max_crowding_score: Decimal = Decimal("0.9")
+    max_meme_notional_usdt: Decimal = Decimal("500")
+    max_directional_meme_exposure_usdt: Decimal = Decimal("500")
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -95,6 +115,12 @@ class RiskLimits:
             max_crowding_score=_decimal_env(
                 "MAX_CROWDING", "0.9",
             ),
+            max_meme_notional_usdt=_decimal_env(
+                "MAX_MEME_NOTIONAL_USDT", "500",
+            ),
+            max_directional_meme_exposure_usdt=_decimal_env(
+                "MAX_DIRECTIONAL_MEME_EXPOSURE_USDT", "500",
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -114,6 +140,8 @@ class RiskLimits:
                 self.min_liquidity_score,
                 self.min_positioning_confidence,
                 self.max_crowding_score,
+                self.max_meme_notional_usdt,
+                self.max_directional_meme_exposure_usdt,
             )
         ):
             raise ValueError("risk limits cannot be negative")
@@ -178,6 +206,15 @@ class RiskContext:
     regime_risk: Decimal | None = None
     evidence_conflict: bool = False
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
+    total_meme_notional: Decimal = Decimal("0")
+    directional_meme_exposure: Decimal = Decimal("0")
+    # Optional sizing evidence. ``stop_distance`` is an absolute quote-asset
+    # distance per base unit; absent values preserve the caller's quantity.
+    risk_budget_usdt: Decimal | None = None
+    stop_distance: Decimal | None = None
+    confidence_modifier: Decimal = Decimal("1")
+    liquidity_modifier: Decimal = Decimal("1")
+    crowding_modifier: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True)
@@ -214,6 +251,12 @@ def classify_meme_risk_tier(
         return "BLOCK"
     if open_interest is not None and open_interest <= 0:
         return "BLOCK"
+    if open_interest is None:
+        return "OBSERVE"
+    if spread_bps is None or liquidity_score is None or data_quality_score is None:
+        return "OBSERVE"
+    if data_quality_score <= 0:
+        return "BLOCK"
     if data_quality_score is not None and data_quality_score < resolved.min_data_quality_score:
         return "OBSERVE"
     if liquidity_score is not None and liquidity_score < resolved.min_liquidity_score:
@@ -237,10 +280,13 @@ class RiskGate:
                 return self._deny(intent, "kill switch blocks new opens")
         if context.evidence_conflict:
             return self._deny(intent, "positioning evidence is conflicted")
+        risk_driven_reduction = False
         if intent.action in {"REDUCE", "CLOSE"} and intent.positioning_state in {
             "UNKNOWN", "CONFLICTED",
         }:
-            return self._deny(intent, "positioning state does not permit position reduction")
+            if intent.action != "REDUCE" or context.position_notional < self.limits.max_position_usdt:
+                return self._deny(intent, "positioning state does not permit position reduction")
+            risk_driven_reduction = True
         if context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK":
             return self._deny(intent, "meme symbol is blocked")
         if context.meme_risk_tier == "OBSERVE" or intent.meme_risk_tier == "OBSERVE":
@@ -333,6 +379,29 @@ class RiskGate:
             if normalized_notional < rules.min_notional:
                 return self._deny(intent, "minimum notional requirement failed")
 
+        if intent.action == "OPEN" and context.risk_budget_usdt is not None and context.stop_distance is not None:
+            if context.risk_budget_usdt <= 0 or context.stop_distance <= 0:
+                return self._deny(intent, "risk budget and stop distance must be positive")
+            modifiers = (
+                context.confidence_modifier,
+                context.liquidity_modifier,
+                context.crowding_modifier,
+            )
+            if any(modifier < 0 for modifier in modifiers):
+                return self._deny(intent, "position sizing modifier cannot be negative")
+            base_quantity = context.risk_budget_usdt / context.stop_distance
+            sized_quantity = base_quantity
+            for modifier in modifiers:
+                sized_quantity *= min(Decimal("1"), modifier)
+            sized_quantity = _floor_step(sized_quantity, rules.step_size if rules else Decimal("0"))
+            if sized_quantity <= 0:
+                return self._deny(intent, "position sizing falls below exchange minimum")
+            if sized_quantity < normalized.quantity:
+                normalized = normalized.model_copy(update={"quantity": sized_quantity})
+                normalized_notional = self._notional(normalized, mark_price)
+                if normalized_notional is None:
+                    return self._deny(intent, "position sizing produced invalid notional")
+
         max_order = self.limits.max_order_usdt
         max_position = self.limits.max_position_usdt
         if context.meme_risk_tier == "REDUCED" or intent.meme_risk_tier == "REDUCED":
@@ -387,6 +456,21 @@ class RiskGate:
             projected_position = normalized_notional
             if projected_position > max_position:
                 return self._deny(intent, "maximum position notional exceeded")
+            if intent.meme_risk_tier in {"TRADEABLE", "REDUCED"} or context.meme_risk_tier in {
+                "TRADEABLE", "REDUCED"
+            }:
+                if (
+                    context.total_meme_notional + projected_position
+                    > self.limits.max_meme_notional_usdt
+                ):
+                    return self._deny(intent, "maximum total meme exposure exceeded")
+                if (
+                    context.directional_meme_exposure + projected_position
+                    > self.limits.max_directional_meme_exposure_usdt
+                ):
+                    return self._deny(intent, "maximum directional meme exposure exceeded")
+            if context.liquidation_price is None:
+                return self._deny(intent, "liquidation price is not verified")
             if context.liquidation_distance_percent is None:
                 return self._deny(intent, "liquidation price is not verified")
             if context.liquidation_distance_percent < self.limits.min_liquidation_buffer_percent:
@@ -397,11 +481,13 @@ class RiskGate:
             if normalized.quantity > context.position_quantity:
                 return self._deny(intent, "close larger than position")
 
-        if normalized != intent:
+        if normalized != intent or risk_driven_reduction:
             return RiskDecision(
                 decision="REDUCE",
                 reason=(
-                    "order reduced for positioning risk"
+                    "risk-driven reduction"
+                    if risk_driven_reduction
+                    else "order reduced for positioning risk"
                     if positioning_reduced
                     else "order normalized to risk and exchange limits"
                 ),

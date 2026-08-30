@@ -127,6 +127,28 @@ class PositioningReplayResult:
         }
 
 
+@dataclass(frozen=True)
+class AlphaGateResult:
+    """Evidence-backed outcome for a chronological train/validation/OOS split."""
+
+    status: str
+    train_samples: int
+    validation_samples: int
+    out_of_sample_samples: int
+    out_of_sample_expectancy: Decimal
+    reason: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "status": self.status,
+            "train_samples": self.train_samples,
+            "validation_samples": self.validation_samples,
+            "out_of_sample_samples": self.out_of_sample_samples,
+            "out_of_sample_expectancy": str(self.out_of_sample_expectancy),
+            "reason": self.reason,
+        }
+
+
 class _BacktestStore:
     """Ephemeral research ledger consumed by the shared PaperExecutor.
 
@@ -531,13 +553,19 @@ def run_backtest(
             )
         market = MarketSnapshot(
             last_price=values[len(equity_curve)],
-            mark_price=frame.mark_price or values[len(equity_curve)],
+            mark_price=frame.mark_price,
             index_price=frame.index_price,
             bid_price=frame.bid_price,
             ask_price=frame.ask_price,
-            available_liquidity=frame.depth_25bps,
+            available_liquidity_notional_usdt=(
+                frame.depth_25bps * frame.mark_price
+                if frame.depth_25bps is not None and frame.mark_price is not None
+                else None
+            ),
             funding_rate=frame.funding_rate,
-            funding_timestamp=frame.captured_at if frame.funding_rate is not None else None,
+            funding_timestamp=frame.funding_timestamp,
+            settlement_timestamp=frame.funding_settlement_timestamp,
+            current_timestamp=frame.captured_at,
         )
         current_before = store.get_position(symbol)
         if current_before and Decimal(str(current_before.get("quantity") or "0")) > 0:
@@ -558,10 +586,14 @@ def run_backtest(
             risk_decision = risk_gate.evaluate(intent, context)
             if risk_decision.executable_intent is not None:
                 executor.submit(intent, risk_decision, market=market)
-        if frame.funding_rate is not None and not store.is_halted():
+        if (
+            frame.funding_rate is not None
+            and frame.funding_settlement_timestamp is not None
+            and not store.is_halted()
+        ):
             executor.apply_funding(symbol, market)
-        if not store.is_halted():
-            executor.mark_to_market(symbol, market.mark_price or market.last_price)
+        if not store.is_halted() and market.mark_price is not None:
+            executor.mark_to_market(symbol, market.mark_price)
         current_after = store.get_position(symbol)
         after_quantity = Decimal(str((current_after or {}).get("quantity") or "0"))
         if after_quantity > 0 and active_start is None:
@@ -662,4 +694,69 @@ def run_backtest(
         net_return=net_return,
         mfe=(sum(mfe_values, Decimal("0")) / Decimal(len(mfe_values)) if mfe_values else Decimal("0")),
         mae=(sum(mae_values, Decimal("0")) / Decimal(len(mae_values)) if mae_values else Decimal("0")),
+    )
+
+
+def evaluate_alpha_gate(
+    frames: Iterable[MarketFrame],
+    *,
+    min_samples: int = 30,
+    train_fraction: Decimal = Decimal("0.5"),
+    validation_fraction: Decimal = Decimal("0.25"),
+    horizon_seconds: int = 300,
+) -> AlphaGateResult:
+    """Evaluate positioning evidence without tuning on the full history."""
+    ordered = list(frames)
+    if not ordered:
+        return AlphaGateResult(
+            "INSUFFICIENT_SAMPLE", 0, 0, 0, Decimal("0"), "no historical frames"
+        )
+    if not Decimal("0") < train_fraction < Decimal("1"):
+        raise ValueError("train_fraction must be between 0 and 1")
+    if not Decimal("0") < validation_fraction < Decimal("1"):
+        raise ValueError("validation_fraction must be between 0 and 1")
+    if train_fraction + validation_fraction >= Decimal("1"):
+        raise ValueError("train and validation fractions must leave OOS data")
+    train_end = max(1, int(Decimal(len(ordered)) * train_fraction))
+    validation_end = max(train_end + 1, int(Decimal(len(ordered)) * (train_fraction + validation_fraction)))
+    validation_end = min(len(ordered) - 1, validation_end)
+    train = ordered[:train_end]
+    validation = ordered[train_end:validation_end]
+    out_of_sample = ordered[validation_end:]
+    if min(len(train), len(validation), len(out_of_sample)) < 2:
+        return AlphaGateResult(
+            "INSUFFICIENT_SAMPLE", len(train), len(validation), len(out_of_sample),
+            Decimal("0"), "each chronological split needs observations"
+        )
+    replay = replay_positioning_frames(out_of_sample, horizons_seconds=(horizon_seconds,))
+    metrics = replay.attribution.get("positioning", {}).get(horizon_seconds)
+    samples = metrics.samples if metrics is not None else 0
+    expectancy = metrics.expectancy if metrics is not None else Decimal("0")
+    if samples < min_samples:
+        return AlphaGateResult(
+            "INSUFFICIENT_SAMPLE", len(train), len(validation), samples,
+            expectancy, f"OOS samples {samples} below minimum {min_samples}"
+        )
+    try:
+        cost_adjusted = run_backtest(
+            [],
+            frames=out_of_sample,
+            engine=StrategyEngine(
+                StrategyConfig(positioning_decision_enabled=True)
+            ),
+        )
+        expectancy = cost_adjusted.expectancy
+    except (ValueError, RuntimeError):
+        return AlphaGateResult(
+            "ALPHA_NOT_SUPPORTED", len(train), len(validation), samples,
+            Decimal("0"), "cost-adjusted OOS execution could not be evaluated"
+        )
+    if expectancy <= 0:
+        return AlphaGateResult(
+            "ALPHA_NOT_SUPPORTED", len(train), len(validation), samples,
+            expectancy, "cost-adjusted OOS expectancy is not positive"
+        )
+    return AlphaGateResult(
+        "ALPHA_SUPPORTED", len(train), len(validation), samples,
+        expectancy, "cost-adjusted OOS expectancy is positive with sufficient samples"
     )

@@ -80,9 +80,10 @@ Backtesting is research-only. With normalized historical `MarketFrame` input,
 PaperExecutor contract in an ephemeral ledger; close-only SMA input remains a
 baseline and fails closed when Futures evidence is absent.
 
-Live is permanently hard-blocked in this release. Testnet requires separate
-credentials and a real account preflight; without them its lifecycle is
-`TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
+Live remains blocked until the persisted observation, shadow, Testnet,
+reconciliation, data-health, risk, Meme, and explicit operator gates pass.
+Testnet requires separate credentials and a real account preflight; without
+them its lifecycle is `TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
 
 The API contract and release identity default to `2026-08-15` and can be
 overridden independently with `BIAN_OPERATOR_CONTRACT_VERSION` and

@@ -103,6 +103,8 @@ class Reconciler:
             for row in self.store.list_balances()
             if row.get("mode") == self.mode
         }
+        if "USDT" not in broker_balances:
+            differences.append("USDT futures balance is unavailable")
         if local_balances:
             for asset in set(broker_balances) | set(local_balances):
                 local = local_balances.get(asset, {})
@@ -113,6 +115,15 @@ class Reconciler:
                 local_wallet = Decimal(str(local.get("wallet_balance") or local.get("free") or "0"))
                 if local_wallet != broker["wallet_balance"]:
                     differences.append(f"balance mismatch: {asset}")
+                    continue
+                for field in ("available_balance", "margin_balance", "unrealized_pnl"):
+                    if field not in local and not isinstance(local.get("payload"), dict):
+                        continue
+                    if field not in local and field not in (local.get("payload") or {}):
+                        continue
+                    local_value = Decimal(str(local.get(field) or (local.get("payload") or {}).get(field) or "0"))
+                    if local_value != broker[field]:
+                        differences.append(f"balance mismatch: {asset}:{field}")
         recovered = 0
         upsert = getattr(self.store, "upsert_balance", None)
         if upsert is not None:
@@ -171,6 +182,23 @@ class Reconciler:
             if entry != local_entry:
                 differences.append(f"position mismatch: {symbol}")
                 continue
+            for field, exchange_key in (
+                ("leverage", "leverage"),
+                ("margin_type", "marginType"),
+                ("mark_price", "markPrice"),
+                ("liquidation_price", "liquidationPrice"),
+                ("unrealized_pnl", "unRealizedProfit"),
+            ):
+                exchange_value = exchange.get(exchange_key)
+                local_value = local.get(field)
+                if exchange_value is None or local_value is None:
+                    continue
+                if field == "margin_type":
+                    matches = str(local_value).upper() == str(exchange_value).upper()
+                else:
+                    matches = Decimal(str(local_value)) == Decimal(str(exchange_value))
+                if not matches:
+                    differences.append(f"position mismatch: {symbol}:{field}")
             recovered += 1
         return recovered
 
@@ -264,6 +292,15 @@ class Reconciler:
 
 def apply_user_stream_event(store: TradingStore, event: Any) -> None:
     """Apply a private futures event as a local observation, never as final truth."""
+    event_id = getattr(event, "event_id", None)
+    if event_id:
+        seen = getattr(store, "_user_stream_event_ids", None)
+        if seen is None:
+            seen = set()
+            setattr(store, "_user_stream_event_ids", seen)
+        if event_id in seen:
+            return
+        seen.add(event_id)
     event_type = getattr(event, "event_type", None)
     if event_type == "ACCOUNT_UPDATE":
         mode = os.environ.get("BIAN_MODE", "testnet")
@@ -343,12 +380,35 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
             source="user_stream",
         )
         return
+    position_side = str(getattr(event, "position_side", "") or "").upper()
+    if position_side == "BOTH":
+        position_side = str(local.get("position_side") or "").upper()
     store.update_order(
         local["order_id"],
         status=status,
         executed_quantity=Decimal(str(getattr(event, "executed_quantity", "0"))),
         exchange_order_id=getattr(event, "exchange_order_id", None),
-        payload=getattr(event, "raw", {}),
+        payload={
+            **(getattr(event, "raw", {}) or {}),
+            "client_order_id": getattr(event, "client_order_id", None),
+            "exchange_order_id": getattr(event, "exchange_order_id", None),
+            "status": status,
+            "execution_type": getattr(event, "execution_type", None),
+            "executed_quantity": str(getattr(event, "executed_quantity", "0")),
+            "last_quantity": str(getattr(event, "last_quantity", "0")),
+            "last_price": (
+                str(getattr(event, "last_price"))
+                if getattr(event, "last_price", None) is not None else None
+            ),
+            "fee": str(getattr(event, "fee", "0")),
+            "fee_asset": getattr(event, "fee_asset", None),
+            "realized_pnl": (
+                str(getattr(event, "realized_pnl"))
+                if getattr(event, "realized_pnl", None) is not None else None
+            ),
+            "position_side": position_side or None,
+            "reduce_only": getattr(event, "reduce_only", None),
+        },
     )
     store.append_order_event(
         local["order_id"],
@@ -356,6 +416,31 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
         status=status,
         payload=getattr(event, "raw", {}),
     )
+    if (
+        getattr(event, "execution_type", None) == "TRADE"
+        and Decimal(str(getattr(event, "last_quantity", "0"))) > 0
+        and getattr(store, "record_trade", None) is not None
+    ):
+        last_price = getattr(event, "last_price", None)
+        if last_price is not None and Decimal(str(last_price)) > 0:
+            store.record_trade(
+                local["order_id"],
+                symbol=str(local.get("symbol") or getattr(event, "symbol", "")).upper(),
+                side=str(local.get("side") or ""),
+                quantity=Decimal(str(getattr(event, "last_quantity", "0"))),
+                price=Decimal(str(last_price)),
+                fee=Decimal(str(getattr(event, "fee", "0"))),
+                fee_asset=str(getattr(event, "fee_asset", None) or "USDT"),
+                realized_pnl=Decimal(str(getattr(event, "realized_pnl", "0") or "0")),
+                market="FUTURES",
+                position_side=position_side or None,
+                payload={
+                    "source": "user_stream",
+                    "event_id": event_id,
+                    "execution_type": getattr(event, "execution_type", None),
+                    "reduce_only": getattr(event, "reduce_only", None),
+                },
+            )
 
 
 def _exchange_position(row: dict[str, Any] | None) -> tuple[str, Decimal]:

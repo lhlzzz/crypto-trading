@@ -11,7 +11,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 from scripts.database import read_overview
-from runtime_gate import GateResult, evaluate_runtime_gate
+from runtime_gate import GateResult, evaluate_runtime_gate, max_data_age_sec
 from trading_store import TradingStore
 
 BIAN_OPERATOR_CONTRACT_VERSION = os.environ.get(
@@ -44,17 +44,6 @@ def _csv_env(name: str, default: str) -> list[str]:
         for value in os.environ.get(name, default).split(",")
         if value.strip()
     ]
-
-
-def _positive_int_env(name: str, default: int) -> int:
-    try:
-        value = int(os.environ.get(name, default))
-    except ValueError:
-        return default
-    return max(1, value)
-
-
-BIAN_MAX_DATA_AGE_SEC = _positive_int_env("BIAN_MAX_DATA_AGE_SEC", 900)
 
 
 def _trading_store() -> TradingStore:
@@ -128,7 +117,7 @@ class BianHealth(BaseModel):
 def _front_data(limit: int) -> dict[str, Any]:
     report = read_overview(
         limit=limit,
-        max_data_age_sec=BIAN_MAX_DATA_AGE_SEC,
+        max_data_age_sec=max_data_age_sec(),
     )
     database = report["database_status"]
     connected = database.get("status") == "ok"
@@ -145,7 +134,7 @@ def _front_data(limit: int) -> dict[str, Any]:
             "shadow_mode": not _env_enabled("POSITIONING_DECISION_ENABLED"),
             "snapshots": store.list_positioning_snapshots(limit),
             "source_freshness": store.market_data_freshness(
-                max_age_sec=BIAN_MAX_DATA_AGE_SEC
+                max_age_sec=max_data_age_sec()
             ),
         }
     except Exception:
@@ -228,7 +217,7 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     report = read_overview(
         limit=1,
-        max_data_age_sec=BIAN_MAX_DATA_AGE_SEC,
+        max_data_age_sec=max_data_age_sec(),
     )
     database = report["database_status"]
     collection = report["collection"]
@@ -429,7 +418,7 @@ def get_positioning_data_quality(
     result = _positioning_items(limit)
     try:
         source_freshness = _trading_store().market_data_freshness(
-            max_age_sec=BIAN_MAX_DATA_AGE_SEC
+            max_age_sec=max_data_age_sec()
         )
     except Exception:
         source_freshness = []
@@ -468,6 +457,44 @@ def get_positioning_status() -> dict[str, Any]:
         "trading_halted": _persistent_trading_halt(_trading_store()),
         "runtime_gate": gate.as_dict(),
     }
+
+
+@app.get("/api/meme/universe")
+def get_meme_universe(
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    """Expose the latest persisted Futures meme classification read-only."""
+    result = _positioning_items(limit)
+    if result.get("status") != "ok":
+        return result
+    return {
+        "status": "ok",
+        "market": "FUTURES",
+        "items": [
+            {
+                "symbol": item.get("symbol"),
+                "state": item.get("state"),
+                "meme_risk_tier": item.get("meme_risk_tier"),
+                "data_quality_score": item.get("data_quality_score"),
+                "observed_at": item.get("observed_at"),
+            }
+            for item in result.get("items", [])
+        ],
+    }
+
+
+@app.get("/api/meme/candidates")
+def get_meme_candidates(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    result = get_meme_universe(200)
+    if result.get("status") != "ok":
+        return result
+    candidates = [
+        item for item in result.get("items", [])
+        if item.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
+    ]
+    return {"status": "ok", "market": "FUTURES", "items": candidates[:limit]}
 
 
 if __name__ == "__main__":

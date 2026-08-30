@@ -10,8 +10,13 @@ import time
 from typing import Any, Literal
 from uuid import UUID
 
-from binance_client import ClientConfig, FuturesPrivateClient, FuturesRiskRules
-from risk import RiskDecision
+from binance_client import (
+    BinanceConnectionError,
+    BinanceRateLimitError,
+    ClientConfig,
+    FuturesPrivateClient,
+)
+from risk import FuturesRiskRules, RiskDecision
 from trade_intent import TradeIntent
 from trading_store import TradingStore
 
@@ -40,9 +45,26 @@ class MarketSnapshot:
     index_price: Decimal | None = None
     bid_price: Decimal | None = None
     ask_price: Decimal | None = None
+    # Canonical liquidity unit is USDT notional. ``available_liquidity`` is
+    # retained only as a constructor compatibility shim for old paper tests.
+    available_liquidity_notional_usdt: Decimal | None = None
     available_liquidity: Decimal | None = None
     funding_rate: Decimal | None = None
     funding_timestamp: datetime | None = None
+    settlement_timestamp: datetime | None = None
+    current_timestamp: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.last_price <= 0:
+            raise ValueError("market last_price must be positive")
+        if self.available_liquidity_notional_usdt is None and self.available_liquidity is not None:
+            # The legacy field represented base quantity. Convert it once at
+            # the snapshot boundary so all execution math uses USDT notional.
+            object.__setattr__(
+                self,
+                "available_liquidity_notional_usdt",
+                self.available_liquidity * self.last_price,
+            )
 
 
 @dataclass(frozen=True)
@@ -261,8 +283,11 @@ class PaperExecutor(_BaseExecutor):
                 },
             )
             raise ExecutionRejected("paper margin is insufficient")
+        expiry_base = market.current_timestamp or datetime.now(timezone.utc)
+        if expiry_base.tzinfo is None:
+            expiry_base = expiry_base.replace(tzinfo=timezone.utc)
         expires_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=self.config.order_expiry_sec)
+            expiry_base + timedelta(seconds=self.config.order_expiry_sec)
             if approved.order_type == "LIMIT" and self.config.order_expiry_sec > 0
             else None
         )
@@ -467,6 +492,16 @@ class PaperExecutor(_BaseExecutor):
     def apply_funding(self, symbol: str, market: MarketSnapshot) -> Decimal:
         if market.funding_rate is None:
             return Decimal("0")
+        settlement = market.settlement_timestamp
+        if settlement is None:
+            return Decimal("0")
+        current_timestamp = market.current_timestamp or settlement
+        if settlement.tzinfo is None:
+            settlement = settlement.replace(tzinfo=timezone.utc)
+        if current_timestamp.tzinfo is None:
+            current_timestamp = current_timestamp.replace(tzinfo=timezone.utc)
+        if current_timestamp < settlement:
+            return Decimal("0")
         position = self.store.get_position(symbol)
         if position is None:
             return Decimal("0")
@@ -476,8 +511,17 @@ class PaperExecutor(_BaseExecutor):
             return Decimal("0")
         payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
         last = payload.get("funding_timestamp")
-        stamp = market.funding_timestamp.isoformat() if market.funding_timestamp is not None else None
-        if stamp is not None and last == stamp:
+        stamp = settlement.isoformat()
+        if last is not None:
+            try:
+                last_timestamp = datetime.fromisoformat(str(last))
+                if last_timestamp.tzinfo is None:
+                    last_timestamp = last_timestamp.replace(tzinfo=timezone.utc)
+                if settlement <= last_timestamp:
+                    return Decimal("0")
+            except ValueError:
+                pass
+        if stamp == last:
             return Decimal("0")
         mark = _mark_price(market)
         notional = quantity * mark
@@ -632,10 +676,23 @@ class PaperExecutor(_BaseExecutor):
             base = market.bid_price or market.last_price
         slippage = self.config.slippage_bps / Decimal("10000")
         price = base * (Decimal("1") + slippage if side == "BUY" else Decimal("1") - slippage)
-        if market.available_liquidity is not None and market.available_liquidity > 0:
-            impact = min(Decimal("1"), intent.quantity / market.available_liquidity) * slippage
+        liquidity_quantity = self._liquidity_quantity(intent, market, base)
+        if liquidity_quantity is not None and liquidity_quantity > 0:
+            impact = min(Decimal("1"), intent.quantity / liquidity_quantity) * slippage
             price = price * (Decimal("1") + impact if side == "BUY" else Decimal("1") - impact)
         return price
+
+    def _liquidity_quantity(
+        self,
+        intent: TradeIntent,
+        market: MarketSnapshot,
+        reference_price: Decimal,
+    ) -> Decimal | None:
+        del intent
+        notional = market.available_liquidity_notional_usdt
+        if notional is None or notional <= 0 or reference_price <= 0:
+            return None
+        return notional / reference_price
 
     def _apply_fill(
         self,
@@ -649,11 +706,13 @@ class PaperExecutor(_BaseExecutor):
         remaining = max(Decimal("0"), requested_quantity - current_executed)
         if remaining <= 0:
             return _result_from_local(self._local_order(order_id) or {})
-        available = (
-            min(remaining, market.available_liquidity)
-            if market.available_liquidity is not None
-            else remaining
+        reference_price = (
+            market.ask_price or market.last_price
+            if intent.exchange_side() == "BUY"
+            else market.bid_price or market.last_price
         )
+        liquidity_quantity = self._liquidity_quantity(intent, market, reference_price)
+        available = min(remaining, liquidity_quantity) if liquidity_quantity is not None else remaining
         fill_ratio = (
             self.config.partial_fill_ratio
             if current_executed == 0
@@ -713,7 +772,6 @@ class PaperExecutor(_BaseExecutor):
                 "slippage": str(slippage),
             },
         )
-        self.apply_funding(intent.symbol, market)
         self.mark_to_market(intent.symbol, _mark_price(market))
         return ExecutionResult(
             order_id=order_id,
@@ -1018,11 +1076,18 @@ class BinanceExecutor(_BaseExecutor):
                 price=approved.price,
                 client_order_id=approved.client_order_id,
                 reduce_only=approved.reduce_only,
+                position_side=(
+                    "BOTH" if approved.position_mode == "ONE_WAY" else approved.direction
+                ),
             )
         except Exception as exc:
-            self.store.update_order(order_id, status="UNKNOWN", payload={"error": str(exc)})
-            self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", error=str(exc))
-            raise
+            if not self._is_uncertain_transport_error(exc):
+                self.store.update_order(
+                    order_id, status="REJECTED", payload={"error": str(exc)}
+                )
+                self._event(order_id, "ORDER_REJECTED", "REJECTED", error=str(exc))
+                raise
+            return self._resolve_uncertain_order(order_id, approved, exc)
         exchange_order_id = str(response.get("orderId")) if response.get("orderId") is not None else None
         self.store.update_order(
             order_id,
@@ -1052,19 +1117,125 @@ class BinanceExecutor(_BaseExecutor):
             exchange_order_id=exchange_order_id,
         )
 
+    @staticmethod
+    def _is_uncertain_transport_error(exc: Exception) -> bool:
+        return isinstance(
+            exc,
+            (
+                BinanceConnectionError,
+                BinanceRateLimitError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+            ),
+        )
+
+    def _resolve_uncertain_order(
+        self,
+        order_id: UUID,
+        intent: TradeIntent,
+        error: Exception,
+    ) -> ExecutionResult:
+        """Resolve a possibly accepted mutation without ever resubmitting it."""
+        local = self.store.get_order(order_id) or {}
+        exchange_order_id = local.get("exchange_order_id")
+        lookups: list[dict[str, Any]] = []
+        if exchange_order_id is not None:
+            lookups.append({"order_id": exchange_order_id})
+        lookups.append({"client_order_id": intent.client_order_id})
+        response: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for lookup in lookups:
+            try:
+                candidate = self.client.get_order(
+                    symbol=intent.symbol,
+                    order_id=lookup.get("order_id"),
+                    client_order_id=lookup.get("client_order_id"),
+                )
+                if isinstance(candidate, dict) and candidate:
+                    response = candidate
+                    break
+            except Exception as exc:
+                last_error = exc
+        if response is None:
+            reason = f"order outcome unresolved after transport failure: {error}"
+            if last_error is not None:
+                reason = f"{reason}; lookup failed: {last_error}"
+            self.store.update_order(
+                order_id,
+                status="UNKNOWN",
+                payload={"error": str(error), "resolution_error": reason},
+            )
+            self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", error=reason)
+            self.store.set_halt(True, reason=reason, source="execution")
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=intent.id,
+                status="UNKNOWN",
+                client_order_id=intent.client_order_id,
+                reason=reason,
+            )
+
+        status = _normal_status(str(response.get("status", "UNKNOWN")))
+        if status == "UNKNOWN":
+            reason = "order lookup returned UNKNOWN status"
+            self.store.update_order(order_id, status="UNKNOWN", payload=response)
+            self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", response=response)
+            self.store.set_halt(True, reason=reason, source="execution")
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=intent.id,
+                status="UNKNOWN",
+                client_order_id=intent.client_order_id,
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None
+                    else None
+                ),
+                reason=reason,
+            )
+        resolved_exchange_id = (
+            str(response["orderId"])
+            if response.get("orderId") is not None
+            else exchange_order_id
+        )
+        executed_quantity = Decimal(str(response.get("executedQty", "0")))
+        self.store.update_order(
+            order_id,
+            status=status,
+            executed_quantity=executed_quantity,
+            exchange_order_id=resolved_exchange_id,
+            payload={"uncertain_create_error": str(error), "resolution": response},
+        )
+        self._event(order_id, "ORDER_RECONCILED_AFTER_UNKNOWN", status, response=response)
+        self._record_fills(order_id, intent, response)
+        return ExecutionResult(
+            order_id=order_id,
+            intent_id=intent.id,
+            status=status,
+            client_order_id=intent.client_order_id,
+            executed_quantity=executed_quantity,
+            exchange_order_id=resolved_exchange_id,
+        )
+
     def cancel(self, order_id: UUID) -> ExecutionResult:
         local = self.store.get_order(order_id)
         if local is None:
             raise KeyError(f"unknown local order: {order_id}")
-        response = self.client.cancel_order(
-            symbol=str(local["symbol"]),
-            order_id=local.get("exchange_order_id"),
-            client_order_id=(
-                None
-                if local.get("exchange_order_id") is not None
-                else str(local["client_order_id"])
-            ),
-        )
+        try:
+            response = self.client.cancel_order(
+                symbol=str(local["symbol"]),
+                order_id=local.get("exchange_order_id"),
+                client_order_id=(
+                    None
+                    if local.get("exchange_order_id") is not None
+                    else str(local["client_order_id"])
+                ),
+            )
+        except Exception as exc:
+            if not self._is_uncertain_transport_error(exc):
+                raise
+            return self._resolve_uncertain_existing_order(order_id, local, exc)
         status = _normal_status(str(response.get("status", "CANCELED")))
         self.store.update_order(
             order_id,
@@ -1087,6 +1258,79 @@ class BinanceExecutor(_BaseExecutor):
                 if response.get("orderId") is not None
                 else local.get("exchange_order_id")
             ),
+        )
+
+    def _resolve_uncertain_existing_order(
+        self,
+        order_id: UUID,
+        local: dict[str, Any],
+        error: Exception,
+    ) -> ExecutionResult:
+        exchange_id = local.get("exchange_order_id")
+        response: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        lookups = [
+            {"order_id": exchange_id, "client_order_id": None},
+            {"order_id": None, "client_order_id": str(local["client_order_id"])},
+        ] if exchange_id is not None else [
+            {"order_id": None, "client_order_id": str(local["client_order_id"])}
+        ]
+        for lookup in lookups:
+            try:
+                candidate = self.client.get_order(
+                    symbol=str(local["symbol"]), **lookup
+                )
+                if isinstance(candidate, dict) and candidate:
+                    response = candidate
+                    break
+            except Exception as exc:
+                last_error = exc
+        if response is None:
+            reason = f"cancel outcome unresolved: {error}"
+            if last_error is not None:
+                reason = f"{reason}; lookup failed: {last_error}"
+            self.store.update_order(
+                order_id, status="UNKNOWN", payload={"error": reason}
+            )
+            self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", error=reason)
+            self.store.set_halt(True, reason=reason, source="execution")
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=UUID(str(local["intent_id"])),
+                status="UNKNOWN",
+                client_order_id=str(local["client_order_id"]),
+                exchange_order_id=str(exchange_id) if exchange_id is not None else None,
+                reason=reason,
+            )
+        status = _normal_status(str(response.get("status", "UNKNOWN")))
+        if status == "UNKNOWN":
+            reason = "cancel lookup returned UNKNOWN status"
+            self.store.update_order(order_id, status="UNKNOWN", payload=response)
+            self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", response=response)
+            self.store.set_halt(True, reason=reason, source="execution")
+        else:
+            self.store.update_order(
+                order_id,
+                status=status,
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None else exchange_id
+                ),
+                payload=response,
+            )
+            self._event(order_id, "CANCEL_RECONCILED", status, response=response)
+        return ExecutionResult(
+            order_id=order_id,
+            intent_id=UUID(str(local["intent_id"])),
+            status=status,
+            client_order_id=str(local["client_order_id"]),
+            executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+            exchange_order_id=(
+                str(response["orderId"])
+                if response.get("orderId") is not None else exchange_id
+            ),
+            reason="cancel outcome reconciled",
         )
 
     def get_order(self, order_id: UUID) -> ExecutionResult:

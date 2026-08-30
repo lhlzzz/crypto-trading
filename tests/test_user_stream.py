@@ -42,6 +42,7 @@ def test_normalizes_order_trade_update() -> None:
     assert event.position_side == "BOTH"
     assert event.realized_pnl == Decimal("1.25")
     assert event.reduce_only is True
+    assert event.event_id == "ORDER_TRADE_UPDATE:42:TRADE:0.010:123"
 
 
 def test_normalizes_account_update() -> None:

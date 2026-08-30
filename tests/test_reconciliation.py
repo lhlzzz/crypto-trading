@@ -157,6 +157,42 @@ def test_user_stream_unknown_order_halts() -> None:
     assert store.halt_calls
 
 
+def test_user_stream_duplicate_trade_event_is_idempotent() -> None:
+    store = StoreStub(
+        orders=[
+            {
+                "order_id": "1",
+                "client_order_id": "BIAN-1",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+            }
+        ]
+    )
+    payload = {
+        "e": "ORDER_TRADE_UPDATE",
+        "E": 10,
+        "o": {
+            "s": "BTCUSDT",
+            "c": "BIAN-1",
+            "i": 9,
+            "t": 77,
+            "X": "FILLED",
+            "x": "TRADE",
+            "z": "0.1",
+            "l": "0.1",
+            "L": "100",
+            "n": "0.01",
+            "N": "USDT",
+        },
+    }
+    event = normalize_user_event(payload)
+    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event)
+
+    assert len(store.updated) == 1
+    assert len(store.events) == 1
+
+
 def test_user_stream_account_update_is_observation_only() -> None:
     store = StoreStub()
     event = normalize_user_event(

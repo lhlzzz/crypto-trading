@@ -23,6 +23,7 @@ class UserStreamEvent:
     """Futures-native event contract consumed by execution/reconciliation."""
 
     event_type: str
+    event_id: str | None = None
     event_time_ms: int | None = None
     symbol: str | None = None
     client_order_id: str | None = None
@@ -81,14 +82,27 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
     if event_type == "listenKeyExpired":
         return UserStreamEvent(
             event_type=event_type,
+            event_id=f"listenKeyExpired:{_int_or_none(raw.get('E'))}",
             event_time_ms=_int_or_none(raw.get("E")),
             raw=raw,
         )
     if event_type == "ORDER_TRADE_UPDATE":
         order = raw.get("o") if isinstance(raw.get("o"), dict) else {}
         realized = order.get("rp")
+        trade_id = order.get("t")
+        try:
+            has_trade_id = trade_id is not None and int(trade_id) >= 0
+        except (TypeError, ValueError):
+            has_trade_id = False
+        event_id = (
+            f"ORDER_TRADE_UPDATE:{trade_id}"
+            if has_trade_id
+            else "ORDER_TRADE_UPDATE:"
+            f"{order.get('i')}:{order.get('x')}:{order.get('z')}:{raw.get('E')}"
+        )
         return UserStreamEvent(
             event_type=event_type,
+            event_id=event_id,
             event_time_ms=_int_or_none(raw.get("E")),
             symbol=_upper_or_none(order.get("s")),
             client_order_id=_str_or_none(order.get("c")),
@@ -133,6 +147,7 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
         )
         return UserStreamEvent(
             event_type=event_type,
+            event_id=f"ACCOUNT_UPDATE:{raw.get('T', raw.get('E'))}",
             event_time_ms=_int_or_none(raw.get("E")),
             balance_updates=balances,
             position_updates=positions,
@@ -171,6 +186,7 @@ class UserStreamClient:
         self._reconnect_delay_sec = reconnect_delay_sec
         self._max_failures = max_failures
         self._keepalive_sec = max(0.01, float(keepalive_sec))
+        self._seen_event_ids: set[str] = set()
 
     def _client(self) -> Any:
         if self._rest is None:
@@ -234,6 +250,10 @@ class UserStreamClient:
         if normalized.event_type == "listenKeyExpired":
             _dispatch(self.on_reconcile)
             raise RuntimeError("listenKey expired")
+        if normalized.event_id is not None:
+            if normalized.event_id in self._seen_event_ids:
+                return
+            self._seen_event_ids.add(normalized.event_id)
         _dispatch(self.on_event, normalized)
 
     async def _keepalive_loop(self) -> None:

@@ -11,6 +11,7 @@ def _frame(closes: list[str]) -> MarketFrame:
         symbol="btcusdt",
         closes=tuple(Decimal(value) for value in closes),
         captured_at=datetime.now(timezone.utc),
+        meme_risk_tier="TRADEABLE",
     )
 
 
@@ -38,6 +39,18 @@ def test_engine_creates_buy_intent_without_execution_dependencies() -> None:
     assert intent.order_type == "MARKET"
     assert intent.quantity > 0
     assert intent.strategy_version == "momentum-sma-1"
+
+
+def test_engine_does_not_create_intent_without_tradeable_meme_evidence() -> None:
+    frame = MarketFrame(
+        symbol="BTCUSDT",
+        closes=(Decimal("1"), Decimal("1"), Decimal("1"), Decimal("2"), Decimal("3")),
+        captured_at=datetime.now(timezone.utc),
+    )
+
+    assert StrategyEngine(
+        StrategyConfig(fast_window=2, slow_window=4, minimum_confidence=Decimal("0.5"))
+    ).evaluate(frame) is None
 
 
 def test_engine_does_not_call_broker_or_risk() -> None:
@@ -82,6 +95,7 @@ def _positioning_frame(**updates: object) -> MarketFrame:
         "spread_bps": Decimal("2"),
         "depth_25bps": Decimal("100"),
         "market_regime": "RISK_ON",
+        "meme_risk_tier": "TRADEABLE",
         "freshness": (SourceFreshness("spot", captured, captured, 900, captured),),
         "source_timestamps": source_timestamps,
     }

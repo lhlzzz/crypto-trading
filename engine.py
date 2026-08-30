@@ -52,7 +52,7 @@ def _map_position_action(
             return "LONG", "REDUCE"
         if state in {
             "LONG_UNWIND", "SHORT_COVERING", "FORCED_DELEVERAGING",
-            "SHORT_BUILDING", "NEUTRAL",
+            "SHORT_BUILDING",
         }:
             return "LONG", "CLOSE"
         return None
@@ -63,7 +63,7 @@ def _map_position_action(
             return "SHORT", "REDUCE"
         if state in {
             "SHORT_COVERING", "LONG_UNWIND", "FORCED_DELEVERAGING",
-            "LONG_BUILDING", "NEUTRAL",
+            "LONG_BUILDING",
         }:
             return "SHORT", "CLOSE"
         return None
@@ -346,6 +346,8 @@ class MarketFrame:
     oi_change_1h: Decimal | None = None
     oi_change_30m: Decimal | None = None
     funding_rate: Decimal | None = None
+    funding_timestamp: datetime | None = None
+    funding_settlement_timestamp: datetime | None = None
     funding_change: Decimal | None = None
     funding_percentile: Decimal | None = None
     funding_zscore: Decimal | None = None
@@ -380,6 +382,8 @@ class MarketFrame:
     breadth_score: Decimal | None = None
     advance_decline_ratio: Decimal | None = None
     market_regime: MarketRegime = "NEUTRAL"
+    # Universe qualification is required before a frame can create an intent.
+    meme_risk_tier: MemeRiskTier = "OBSERVE"
     freshness: tuple[SourceFreshness, ...] = ()
     data_quality_score: Decimal | None = None
     source_timestamps: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -407,7 +411,8 @@ class MarketFrame:
             "oi", "oi_change", "last_price", "mark_price", "index_price",
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
             "oi_change_15m", "oi_change_1h", "oi_change_30m",
-            "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
+            "funding_rate", "funding_timestamp", "funding_settlement_timestamp",
+            "funding_change", "funding_percentile", "funding_zscore",
             "taker_ratio",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
             "observed_short_liquidation_notional",
@@ -428,6 +433,9 @@ class MarketFrame:
         }
         if inputs.get("price_cvd_divergence") is not None:
             values["price_cvd_divergence"] = bool(inputs["price_cvd_divergence"])
+        for name in ("funding_timestamp", "funding_settlement_timestamp"):
+            if inputs.get(name) is not None:
+                values[name] = _aware(datetime.fromisoformat(str(inputs[name])))
         closes = tuple(Decimal(str(value)) for value in inputs.get("closes", ()))
         if not closes:
             raise ValueError("evidence snapshot requires closes")
@@ -458,6 +466,7 @@ class MarketFrame:
             closes=closes,
             captured_at=captured_at,
             market_regime=market_regime,  # type: ignore[arg-type]
+            meme_risk_tier=str(inputs.get("meme_risk_tier", "OBSERVE")),  # type: ignore[arg-type]
             freshness=tuple(freshness),
             source_timestamps=source_timestamps,
             **values,
@@ -565,7 +574,10 @@ class StrategyEngine:
         current_position: CurrentPosition | None = None,
     ) -> TradeIntent | None:
         current = current_position or CurrentPosition()
-        if current.meme_risk_tier in {"BLOCK", "OBSERVE"}:
+        if (
+            current.meme_risk_tier in {"BLOCK", "OBSERVE"}
+            or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
+        ):
             return None
         if not self.config.positioning_decision_enabled:
             return self._legacy_intent(frame, current_position=current)
@@ -763,7 +775,8 @@ class StrategyEngine:
             "oi", "oi_change", "last_price", "mark_price", "index_price",
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
             "oi_change_15m", "oi_change_1h", "oi_change_30m",
-            "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
+            "funding_rate", "funding_timestamp", "funding_settlement_timestamp",
+            "funding_change", "funding_percentile", "funding_zscore",
             "taker_ratio",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
             "observed_short_liquidation_notional",
@@ -778,7 +791,7 @@ class StrategyEngine:
             "relative_strength_1m", "relative_strength_5m",
             "relative_strength_15m", "relative_strength_1h",
             "advance_decline_ratio",
-            "market_regime", "data_quality_score",
+            "market_regime", "meme_risk_tier", "data_quality_score",
         )
         return {name: getattr(frame, name) for name in names}
 
@@ -789,7 +802,10 @@ class StrategyEngine:
         current_position: CurrentPosition | None = None,
     ) -> TradeIntent | None:
         current = current_position or CurrentPosition()
-        if current.meme_risk_tier in {"BLOCK", "OBSERVE"}:
+        if (
+            current.meme_risk_tier in {"BLOCK", "OBSERVE"}
+            or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
+        ):
             return None
         return self._intent_for_action(
             symbol=decision.symbol,
@@ -848,7 +864,7 @@ class StrategyEngine:
             "reason": reason,
             "strategy_version": strategy_version,
             "created_at": created_at,
-            "meme_risk_tier": current.meme_risk_tier,
+            "meme_risk_tier": frame.meme_risk_tier,
         }
         if positioning is not None:
             values.update(

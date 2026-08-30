@@ -33,6 +33,7 @@ def _context(**updates: object) -> RiskContext:
         "leverage": Decimal("2"),
         "margin_type": "ISOLATED",
         "position_mode": "ONE_WAY",
+        "liquidation_price": Decimal("60"),
         "liquidation_distance_percent": Decimal("40"),
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
@@ -282,11 +283,19 @@ def test_blocked_meme_tier_is_denied() -> None:
 def test_classify_meme_risk_tier_uses_canonical_thresholds() -> None:
     assert classify_meme_risk_tier(trading=False) == "BLOCK"
     assert classify_meme_risk_tier(data_quality_score=Decimal("0.1")) == "OBSERVE"
-    assert classify_meme_risk_tier(crowding_score=Decimal("0.95")) == "REDUCED"
+    assert classify_meme_risk_tier(
+        crowding_score=Decimal("0.95"),
+        liquidity_score=Decimal("1"),
+        data_quality_score=Decimal("1"),
+        spread_bps=Decimal("2"),
+        open_interest=Decimal("10"),
+    ) == "REDUCED"
     assert classify_meme_risk_tier(
         crowding_score=Decimal("0.1"),
         liquidity_score=Decimal("1"),
         data_quality_score=Decimal("1"),
+        spread_bps=Decimal("2"),
+        open_interest=Decimal("10"),
     ) == "TRADEABLE"
 
 

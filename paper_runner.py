@@ -23,7 +23,7 @@ from execution import (
 )
 from reconciliation import Reconciler, apply_user_stream_event
 from risk import ExchangeRules, RiskContext, RiskGate, RiskLimits
-from runtime_gate import GateResult, evaluate_runtime_gate
+from runtime_gate import GateResult, evaluate_runtime_gate, max_data_age_sec
 from scripts import bian_market
 from trade_intent import TradeIntent
 from trading_store import TradingStore
@@ -137,7 +137,7 @@ def _market_frame(
         source="binance_futures_klines",
         source_timestamp=source_timestamp,
         received_timestamp=received_timestamp,
-        max_age_sec=int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")),
+        max_age_sec=max_data_age_sec(),
         now=received_timestamp,
     )
     features = bian_market.positioning_feature_values(
@@ -151,7 +151,7 @@ def _market_frame(
         if name in {
             "relative_strength", "relative_strength_1m", "relative_strength_5m",
             "relative_strength_15m", "relative_strength_1h", "breadth_score",
-            "advance_decline_ratio", "market_regime",
+            "advance_decline_ratio", "market_regime", "meme_risk_tier",
         }
     })
     source_timestamps = {
@@ -174,7 +174,7 @@ def _market_frame(
                 source=source,
                 source_timestamp=source_at,
                 received_timestamp=received_at,
-                max_age_sec=int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")),
+                max_age_sec=max_data_age_sec(),
                 now=captured_at,
             )
         )
@@ -191,14 +191,22 @@ def _market_frame(
 
 def _market_snapshot(frame: MarketFrame) -> MarketSnapshot:
     last_price = frame.last_price or frame.closes[-1]
+    mark_price = frame.mark_price
     return MarketSnapshot(
         last_price=last_price,
-        mark_price=frame.mark_price or last_price,
+        mark_price=mark_price,
         index_price=frame.index_price,
         bid_price=frame.bid_price,
         ask_price=frame.ask_price,
-        available_liquidity=frame.depth_25bps,
+        available_liquidity_notional_usdt=(
+            frame.depth_25bps * mark_price
+            if frame.depth_25bps is not None and mark_price is not None
+            else None
+        ),
         funding_rate=frame.funding_rate,
+        funding_timestamp=frame.funding_timestamp,
+        settlement_timestamp=frame.funding_settlement_timestamp,
+        current_timestamp=frame.captured_at,
     )
 
 
@@ -390,7 +398,7 @@ def _risk_context(
     direction = str(position.get("position_side") or "FLAT")
     if quantity == 0:
         direction = "FLAT"
-    mark = market.mark_price or market.last_price
+    mark = market.mark_price
     rules = ExchangeRules(symbol=intent.symbol)
     if public_client is not None:
         raw_rules = public_client.get_symbol_rules(intent.symbol)
@@ -414,6 +422,7 @@ def _risk_context(
         and intent.action == "OPEN"
         and direction == "FLAT"
         and isinstance(executor, PaperExecutor)
+        and mark is not None
     ):
         liquidation_price = executor.liquidation_price_for(
             intent.symbol,
@@ -428,7 +437,7 @@ def _risk_context(
         used_margin=Decimal(str(account.get("used_margin") or "0")),
         position_direction=direction,  # type: ignore[arg-type]
         position_quantity=quantity,
-        position_notional=abs(quantity * mark),
+        position_notional=abs(quantity * mark) if mark is not None else Decimal("0"),
         entry_price=(
             Decimal(str(position["entry_price"]))
             if position.get("entry_price") is not None
@@ -450,7 +459,7 @@ def _risk_context(
         liquidation_price=liquidation_price,
         liquidation_distance_percent=(
             abs(mark - liquidation_price) / mark * Decimal("100")
-            if mark > 0 and liquidation_price is not None
+            if mark is not None and mark > 0 and liquidation_price is not None
             else None
         ),
         exchange_rules=rules,
@@ -459,7 +468,9 @@ def _risk_context(
         liquidity_score=intent.liquidity_score,
         data_quality_score=intent.data_quality_score,
         evidence_conflict=intent.positioning_state == "CONFLICTED",
-        meme_risk_tier=intent.meme_risk_tier or "TRADEABLE",
+        # An intent without an explicit, persisted Futures universe
+        # classification is observe-only; it must not default to tradeable.
+        meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
     )
 
 
@@ -507,9 +518,10 @@ def run_cycle(
         intent = injected_intent or evaluate(frame)
     if intent is None:
         if isinstance(executor, PaperExecutor):
-            if market.funding_rate is not None:
+            if market.settlement_timestamp is not None:
                 executor.apply_funding(symbol, market)
-            executor.mark_to_market(symbol, market.mark_price or market.last_price)
+            if market.mark_price is not None:
+                executor.mark_to_market(symbol, market.mark_price)
         store.record_system_event(
             event_type="NO_SIGNAL",
             severity="INFO",
@@ -562,9 +574,10 @@ def run_cycle(
     )
     result = executor.submit(intent, decision, market=market)
     if isinstance(executor, PaperExecutor):
-        if market.funding_rate is not None:
+        if market.settlement_timestamp is not None:
             executor.apply_funding(symbol, market)
-        executor.mark_to_market(symbol, market.mark_price or market.last_price)
+        if market.mark_price is not None:
+            executor.mark_to_market(symbol, market.mark_price)
     store.update_intent_status(intent.id, result.status)
     return {
         "status": result.status.lower(),

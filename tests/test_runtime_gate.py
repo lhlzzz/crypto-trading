@@ -83,7 +83,8 @@ def test_testnet_gate_accepts_mode_specific_credentials_and_records_state(monkey
     assert gate.margin_mode_ok is True
     assert gate.leverage_ok is True
     assert gate.symbol_leverage == {"BTCUSDT": "2"}
-    assert gate.trading_enabled is True
+    assert gate.trading_enabled is False
+    assert gate.testnet_ready is False
 
 
 def test_live_gate_is_hard_blocked_even_when_preflight_inputs_pass(monkeypatch) -> None:
@@ -107,3 +108,30 @@ def test_live_gate_is_hard_blocked_even_when_preflight_inputs_pass(monkeypatch) 
     assert gate.confirmation_ok is True
     assert gate.live_allowed is False
     assert "LIVE_RELEASE_GATES_PENDING" in gate.reasons
+
+
+def test_runtime_gate_uses_verified_evidence_dynamically(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    pending = evaluate_runtime_gate(
+        mode="testnet",
+        client=_client(),
+        symbols=["BTCUSDT"],
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+    )
+    passed = evaluate_runtime_gate(
+        mode="testnet",
+        client=_client(),
+        symbols=["BTCUSDT"],
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+        gate_evidence={"testnet": "PASSED"},
+    )
+
+    assert pending.testnet_ready is False
+    assert passed.testnet_ready is True

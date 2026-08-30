@@ -649,6 +649,20 @@ def positioning_feature_values(
             decimal_metadata(mark_event, "lastFundingRate"),
             decimal_metadata(funding_event, "fundingRate"),
         ),
+        "funding_timestamp": (
+            _event_datetime(funding_event["event_timestamp"])
+            if funding_event is not None
+            else (
+                _event_datetime(mark_event["event_timestamp"])
+                if mark_event is not None
+                else None
+            )
+        ),
+        "funding_settlement_timestamp": (
+            _event_datetime(funding_event["event_timestamp"])
+            if funding_event is not None
+            else None
+        ),
         "funding_change": _first_not_none(
             latest_change(
                 "MARK_INDEX_FUNDING",
@@ -956,7 +970,16 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             continue
         symbol = str(row.get("symbol", "")).upper()
         if symbol.endswith("USDT"):
-            if symbol in blocklist or (allowlist and symbol not in allowlist):
+            contract_type = str(row.get("contractType", "PERPETUAL")).upper()
+            quote_asset = str(row.get("quoteAsset", "USDT")).upper()
+            trading = str(row.get("status", "TRADING")).upper() == "TRADING"
+            if (
+                symbol in blocklist
+                or (allowlist and symbol not in allowlist)
+                or not trading
+                or contract_type != "PERPETUAL"
+                or quote_asset != "USDT"
+            ):
                 tier = "BLOCK"
             else:
                 from risk import classify_meme_risk_tier
@@ -967,12 +990,13 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
                 tier = classify_meme_risk_tier(
                     liquidity_score=liquidity_score,
                     data_quality_score=Decimal("1"),
+                    spread_bps=_decimal(row.get("spreadBps")),
                     open_interest=_decimal(row.get("openInterest")),
-                    trading=str(row.get("status", "TRADING")).upper() == "TRADING",
+                    trading=trading,
                 )
             row["market"] = "FUTURES"
-            row["contract_type"] = row.get("contractType", "PERPETUAL")
-            row["quote_asset"] = row.get("quoteAsset", "USDT")
+            row["contract_type"] = contract_type
+            row["quote_asset"] = quote_asset
             row["base_asset"] = row.get("baseAsset") or symbol[:-4]
             row["volume"] = _decimal(row.get("volume"))
             row["quote_volume"] = quote_volume

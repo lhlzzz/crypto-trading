@@ -191,6 +191,8 @@ def _create_trading_tables(cursor: Any) -> None:
             intent_id UUID NOT NULL UNIQUE,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+            direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+            action TEXT NOT NULL CHECK (action IN ('OPEN', 'REDUCE', 'CLOSE')),
             order_type TEXT NOT NULL CHECK (order_type IN ('MARKET', 'LIMIT')),
             quantity NUMERIC,
             price NUMERIC,
@@ -200,6 +202,14 @@ def _create_trading_tables(cursor: Any) -> None:
             status TEXT NOT NULL DEFAULT 'CREATED',
             created_at TIMESTAMPTZ NOT NULL,
             client_order_id TEXT,
+            reduce_only BOOLEAN NOT NULL DEFAULT FALSE,
+            leverage NUMERIC NOT NULL DEFAULT 1,
+            margin_type TEXT NOT NULL DEFAULT 'ISOLATED',
+            position_mode TEXT NOT NULL DEFAULT 'ONE_WAY',
+            positioning_state TEXT,
+            previous_state TEXT,
+            transition TEXT,
+            evidence_snapshot_id UUID,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
         """
@@ -228,6 +238,12 @@ def _create_trading_tables(cursor: Any) -> None:
             order_type TEXT NOT NULL CHECK (order_type IN ('MARKET', 'LIMIT')),
             client_order_id TEXT NOT NULL UNIQUE,
             exchange_order_id TEXT,
+            market TEXT NOT NULL DEFAULT 'FUTURES',
+            position_side TEXT,
+            position_action TEXT,
+            reduce_only BOOLEAN NOT NULL DEFAULT FALSE,
+            leverage NUMERIC NOT NULL DEFAULT 1,
+            margin_type TEXT NOT NULL DEFAULT 'ISOLATED',
             quantity NUMERIC,
             price NUMERIC,
             executed_quantity NUMERIC NOT NULL DEFAULT 0,
@@ -272,6 +288,9 @@ def _create_trading_tables(cursor: Any) -> None:
             fee_asset TEXT,
             realized_pnl NUMERIC NOT NULL DEFAULT 0,
             executed_at TIMESTAMPTZ NOT NULL,
+            market TEXT NOT NULL DEFAULT 'FUTURES',
+            position_side TEXT,
+            funding NUMERIC NOT NULL DEFAULT 0,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
         """

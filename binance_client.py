@@ -28,6 +28,7 @@ from binance_sdk_spot import (
 from binance_sdk_spot.rest_api.models import (
     KlinesIntervalEnum,
 )
+from risk import FuturesRiskRules
 
 
 class BinanceError(Exception):
@@ -99,24 +100,6 @@ class ClientConfig:
             or self.exchange_info_ttl_sec < 1
         ):
             raise ValueError("invalid Binance transport configuration")
-
-
-@dataclass(frozen=True)
-class FuturesRiskRules:
-    """Centralized paper liquidation inputs for a USD-M symbol."""
-
-    symbol: str
-    maintenance_margin_rate: Decimal = Decimal("0.005")
-
-    def __post_init__(self) -> None:
-        if not self.symbol.strip():
-            raise ValueError("Futures risk rules require a symbol")
-        if not Decimal("0") < self.maintenance_margin_rate < Decimal("1"):
-            raise ValueError("maintenance margin rate must be between 0 and 1")
-
-    @classmethod
-    def conservative(cls, symbol: str) -> "FuturesRiskRules":
-        return cls(symbol=symbol.upper().strip())
 
 
 def _env_bool(name: str) -> bool:

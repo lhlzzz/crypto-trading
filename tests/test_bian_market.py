@@ -73,14 +73,17 @@ class BianMarketTests(unittest.TestCase):
             {
                 "symbol": "BTCUSDT", "lastPrice": "102", "highPrice": "102",
                 "lowPrice": "98", "priceChangePercent": "2", "quoteVolume": "1000",
+                "openInterest": "100", "spreadBps": "2",
             },
             {
                 "symbol": "ETHUSDT", "lastPrice": "51", "highPrice": "51",
                 "lowPrice": "49", "priceChangePercent": "2", "quoteVolume": "900",
+                "openInterest": "100", "spreadBps": "2",
             },
             {
                 "symbol": "SOLUSDT", "lastPrice": "9", "highPrice": "12",
                 "lowPrice": "9", "priceChangePercent": "-3", "quoteVolume": "100",
+                "openInterest": "100", "spreadBps": "2",
             },
         ]
 
@@ -863,8 +866,8 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         with patch.dict(__import__("os").environ, {"MEME_ALLOWLIST": "DOGEUSDT", "MEME_BLOCKLIST": ""}, clear=False):
             features = bian_market.universe_features(
                 [
-                    {"symbol": "DOGEUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "1000", "status": "TRADING", "openInterest": "10"},
-                    {"symbol": "SHIBUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "10", "status": "TRADING", "openInterest": "10"},
+                    {"symbol": "DOGEUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "1000", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
+                    {"symbol": "SHIBUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "10", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
                 ],
                 candidate_limit=2,
             )

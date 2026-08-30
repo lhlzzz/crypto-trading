@@ -578,6 +578,15 @@ class TradingStore:
                         )
 
         values = list(relative.values())
+        symbol_rows = scanner.get("symbols") if isinstance(scanner.get("symbols"), list) else []
+        symbol_row = next(
+            (
+                row for row in symbol_rows
+                if isinstance(row, dict)
+                and str(row.get("symbol", "")).upper() == normalized_symbol
+            ),
+            {},
+        )
         return {
             "relative_strength": (
                 sum(values, Decimal("0")) / Decimal(len(values)) if values else None
@@ -591,6 +600,7 @@ class TradingStore:
             "advance_decline_ratio": Decimal(str(scanner["advance_decline_ratio"]))
             if scanner.get("advance_decline_ratio") is not None else None,
             "market_regime": str(scanner.get("market_regime", "NEUTRAL")),
+            "meme_risk_tier": str(symbol_row.get("meme_risk_tier", "OBSERVE")),
             "source_timestamps": {
                 "market_universe": {
                     "source_timestamp": _as_utc(source_at).isoformat(),
@@ -1325,6 +1335,43 @@ class TradingStore:
                 rows = cursor.fetchall()
         columns = ("event_id", "event_type", "severity", "message", "event_at")
         return [_row_dict(columns, row) for row in rows]
+
+    def record_runtime_gate_status(self, gate: str, status: str, *, detail: dict[str, Any] | None = None) -> UUID:
+        """Persist externally verified readiness evidence for one gate."""
+        normalized_gate = gate.strip().lower()
+        normalized_status = status.strip().upper()
+        if normalized_gate not in {"observation", "shadow", "testnet"}:
+            raise ValueError("unsupported runtime gate")
+        if normalized_status not in {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}:
+            raise ValueError("unsupported runtime gate status")
+        payload = {"gate": normalized_gate, "status": normalized_status, **(detail or {})}
+        return self.record_system_event(
+            event_type="RUNTIME_GATE_EVIDENCE",
+            severity="INFO" if normalized_status != "FAILED" else "CRITICAL",
+            message=f"runtime gate {normalized_gate} is {normalized_status}",
+            payload=payload,
+        )
+
+    def runtime_gate_statuses(self) -> dict[str, str]:
+        """Return the latest persisted status for each external acceptance gate."""
+        import psycopg2
+
+        values = {"observation": "NOT_STARTED", "shadow": "NOT_STARTED", "testnet": "NOT_STARTED"}
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON ((payload->>'gate')) payload->>'gate', payload->>'status'
+                    FROM system_events
+                    WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
+                      AND payload->>'gate' IN ('observation', 'shadow', 'testnet')
+                    ORDER BY (payload->>'gate'), event_at DESC
+                    """
+                )
+                for gate, status in cursor.fetchall():
+                    if gate in values and status:
+                        values[gate] = str(status).upper()
+        return values
 
     def trading_summary(self) -> dict[str, Any]:
         from datetime import datetime, timezone

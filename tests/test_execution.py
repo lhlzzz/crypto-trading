@@ -7,12 +7,13 @@ from uuid import UUID
 import pytest
 
 from execution import (
+    BinanceExecutor,
     ExecutionConfig,
     ExecutionRejected,
     MarketSnapshot,
     PaperExecutor,
 )
-from binance_client import FuturesRiskRules
+from binance_client import BinanceConnectionError, ClientConfig, FuturesRiskRules
 from risk import RiskContext, RiskGate
 from trade_intent import TradeIntent
 
@@ -174,6 +175,7 @@ def _risk(intent: TradeIntent, **updates: object):
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
         "positioning_confidence": Decimal("1"),
+        "liquidation_price": Decimal("50"),
         "liquidation_distance_percent": Decimal("50"),
     }
     if intent.action != "OPEN":
@@ -314,10 +316,10 @@ def test_paper_low_liquidity_cannot_fully_fill() -> None:
     result = PaperExecutor(store=store).submit(
         intent,
         _risk(intent),
-        market=_market(available_liquidity=Decimal("0.04")),
+        market=_market(available_liquidity_notional_usdt=Decimal("4")),
     )
     assert result.status == "PARTIALLY_FILLED"
-    assert result.executed_quantity == Decimal("0.04")
+    assert result.executed_quantity == Decimal("0.03996003996003996003996003996")
 
 
 def test_paper_executor_rejects_denied_risk_decision() -> None:
@@ -434,7 +436,11 @@ def test_paper_funding_is_recorded_separately() -> None:
     executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
     payment = executor.apply_funding(
         "BTCUSDT",
-        _market(funding_rate=Decimal("0.01"), funding_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc)),
+        _market(
+            funding_rate=Decimal("0.01"),
+            funding_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc),
+            settlement_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        ),
     )
     position = store.get_position("BTCUSDT")
     assert payment < 0
@@ -454,6 +460,7 @@ def test_paper_funding_is_not_double_recorded_after_mark() -> None:
         last_price=Decimal("100"),
         funding_rate=Decimal("0.01"),
         funding_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        settlement_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
 
     first = executor.apply_funding("BTCUSDT", funding_market)
@@ -587,6 +594,7 @@ def test_futures_observation_to_paper_position_path() -> None:
         spread_bps=Decimal("2"),
         depth_25bps=Decimal("100"),
         market_regime="RISK_ON",
+        meme_risk_tier="TRADEABLE",
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,
     )
@@ -605,3 +613,72 @@ def test_futures_observation_to_paper_position_path() -> None:
     position = store.get_position("BTCUSDT")
     assert position["position_side"] == "LONG"
     assert position["quantity"] > 0
+
+
+def test_order_timeout_never_resubmits(monkeypatch) -> None:
+    class Client:
+        def __init__(self):
+            self.create_calls = 0
+            self.lookup_calls = 0
+
+        def create_order(self, **kwargs):
+            del kwargs
+            self.create_calls += 1
+            raise TimeoutError("timed out")
+
+        def get_order(self, **kwargs):
+            del kwargs
+            self.lookup_calls += 1
+            return {"orderId": "42", "status": "FILLED", "executedQty": "0.1"}
+
+    client = Client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+
+    result = executor.submit(intent, _risk(intent), market=_market())
+
+    assert result.status == "FILLED"
+    assert client.create_calls == 1
+    assert client.lookup_calls == 1
+    assert store.orders[result.order_id]["exchange_order_id"] == "42"
+
+
+def test_order_5xx_never_resubmits_and_halts_when_unresolved(monkeypatch) -> None:
+    class Client:
+        def __init__(self):
+            self.create_calls = 0
+            self.lookup_calls = 0
+
+        def create_order(self, **kwargs):
+            del kwargs
+            self.create_calls += 1
+            raise BinanceConnectionError("server failure")
+
+        def get_order(self, **kwargs):
+            del kwargs
+            self.lookup_calls += 1
+            raise BinanceConnectionError("lookup unavailable")
+
+    client = Client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+
+    result = executor.submit(intent, _risk(intent), market=_market())
+
+    assert result.status == "UNKNOWN"
+    assert client.create_calls == 1
+    assert client.lookup_calls == 1
+    assert store.halted is True
+    assert store.orders[result.order_id]["status"] == "UNKNOWN"
