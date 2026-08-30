@@ -1267,6 +1267,25 @@ def collect_futures_observations(
 
     for raw_symbol in symbols:
         symbol = raw_symbol.replace("-", "").upper()
+        get_klines = getattr(client, "get_klines", None)
+        klines = get_klines(symbol, interval="1m", limit=2) if get_klines else []
+        if klines:
+            latest_kline = klines[-1]
+            if isinstance(latest_kline, (list, tuple)) and len(latest_kline) >= 7:
+                append(
+                    symbol,
+                    "FUTURES_KLINES",
+                    {
+                        "openTime": latest_kline[0],
+                        "open": latest_kline[1],
+                        "high": latest_kline[2],
+                        "low": latest_kline[3],
+                        "close": latest_kline[4],
+                        "volume": latest_kline[5],
+                        "closeTime": latest_kline[6],
+                    },
+                    datetime.fromtimestamp(int(latest_kline[0]) / 1000, tz=timezone.utc),
+                )
         mark = client.get_mark_price(symbol)
         mark_price = _decimal(mark.get("markPrice"))
         index_price = _decimal(mark.get("indexPrice"))

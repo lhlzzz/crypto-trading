@@ -310,7 +310,11 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 continue
             current = getattr(store, "get_balance", lambda _asset: None)(asset) or {}
             payload = dict(current.get("payload") or {})
-            payload.update({"source": "user_stream", "balance_change": balance.get("balance_change", "0")})
+            payload.update({
+                "source": getattr(event, "source", "USER_STREAM"),
+                "completeness": getattr(event, "completeness", "PARTIAL"),
+                "balance_change": balance.get("balance_change", "0"),
+            })
             wallet = Decimal(str(balance.get("wallet_balance") or current.get("wallet_balance") or "0"))
             available = Decimal(str(balance.get("available_balance") or current.get("available_balance") or wallet))
             store.upsert_balance(
@@ -356,7 +360,11 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 maintenance_margin=current.get("maintenance_margin"),
                 liquidation_price=current.get("liquidation_price"),
                 funding_pnl=Decimal(str(current.get("funding_pnl") or "0")),
-                payload={**(current.get("payload") or {}), "source": "user_stream"},
+                payload={
+                    **(current.get("payload") or {}),
+                    "source": getattr(event, "source", "USER_STREAM"),
+                    "completeness": getattr(event, "completeness", "PARTIAL"),
+                },
             )
         return
     if event_type in {"malformed", "unknown"}:

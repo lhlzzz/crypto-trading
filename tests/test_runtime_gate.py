@@ -2,12 +2,35 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from runtime_gate import evaluate_runtime_gate
+from datetime import datetime, timezone
+
+from runtime_gate import REQUIRED_FUTURES_SOURCES, evaluate_runtime_gate
 
 
 class FreshStore:
     def market_data_freshness(self, *, max_age_sec: int):
         return [{"status": "FRESH", "age_sec": 1, "max_age_sec": max_age_sec}]
+
+
+class RequiredFreshStore:
+    def __init__(self, *, missing: str | None = None, stale: str | None = None) -> None:
+        self.missing = missing
+        self.stale = stale
+
+    def market_data_freshness(self, *, max_age_sec: int):
+        now = datetime.now(timezone.utc).isoformat()
+        return [
+            {
+                "event_type": source,
+                "status": "STALE" if source == self.stale else "FRESH",
+                "source_timestamp": now,
+                "received_timestamp": now,
+                "latency_ms": 0,
+                "age_sec": max_age_sec + 1 if source == self.stale else 0,
+            }
+            for source in REQUIRED_FUTURES_SOURCES
+            if source != self.missing
+        ]
 
 
 def _client() -> MagicMock:
@@ -44,6 +67,36 @@ def test_paper_gate_never_constructs_private_account_client(monkeypatch) -> None
     assert gate.margin_mode_ok is True
     assert gate.live_allowed is False
     assert gate.trading_enabled is True
+
+
+def test_missing_required_source_blocks_data_health() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(missing="futures_orderbook"),
+        reconciliation_ok=True,
+    )
+    assert gate.data_health_ok is False
+    assert gate.paper_ready is False
+
+
+def test_stale_required_source_blocks_data_health() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(stale="futures_orderbook"),
+        reconciliation_ok=True,
+    )
+    assert gate.data_health_ok is False
+
+
+def test_gate_verification_timestamp() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+    )
+    assert gate.verified_at is not None
+    assert gate.verification_age_sec == 0
+    assert gate.verification_source == "runtime_gate"
 
 
 def test_testnet_gate_checks_real_account_state_and_leverage(monkeypatch) -> None:

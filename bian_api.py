@@ -126,7 +126,6 @@ def _front_data(limit: int) -> dict[str, Any]:
         store = gate_store
         gate = _runtime_gate(
             store=store,
-            data_health_ok=report["collection"].get("status") == "fresh",
             reconciliation_ok=not _persistent_trading_halt(store),
         )
         positioning = {
@@ -265,12 +264,23 @@ def get_trading_status() -> dict[str, Any]:
         database_status = "unavailable"
     gate = _runtime_gate(
         store=store,
-        data_health_ok=database_status == "ok",
         reconciliation_ok=not halted,
     )
     return {
         "api_mode": "READ_ONLY",
         "trading_mode": gate.mode,
+        "paper_ready": gate.paper_ready,
+        "testnet_ready": gate.testnet_ready,
+        "live_ready": gate.live_ready,
+        "live_allowed": gate.live_allowed,
+        "observation_gate_status": gate.observation_gate_status,
+        "shadow_gate_status": gate.shadow_gate_status,
+        "testnet_gate_status": gate.testnet_gate_status,
+        "alpha_gate_status": gate.alpha_gate_status,
+        "data_health": gate.data_health,
+        "reconciliation": gate.reconciliation,
+        "verified_at": gate.verified_at,
+        "verification_age_sec": gate.verification_age_sec,
         "database_status": database_status,
         "trading_halted": halted,
         "runtime_gate": gate.as_dict(),

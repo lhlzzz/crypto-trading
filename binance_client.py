@@ -452,6 +452,17 @@ class FuturesPublicClient:
     def get_mark_price(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/premiumIndex", symbol=symbol.upper())
 
+    def get_klines(
+        self, symbol: str, *, interval: str = "1m", limit: int = 500
+    ) -> list[Any]:
+        payload = self._get(
+            f"{self.base_url}/klines",
+            symbol=symbol.upper(),
+            interval=interval,
+            limit=max(1, min(limit, 1500)),
+        )
+        return payload if isinstance(payload, list) else []
+
     def get_ticker_price(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/ticker/price", symbol=symbol.upper())
 

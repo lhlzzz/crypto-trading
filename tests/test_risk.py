@@ -280,6 +280,28 @@ def test_blocked_meme_tier_is_denied() -> None:
     assert "blocked" in decision.reason
 
 
+def test_meme_notional_cap() -> None:
+    decision = RiskGate(
+        RiskLimits(max_meme_notional_usdt=Decimal("15"))
+    ).evaluate(
+        _intent(quantity=Decimal("0.1")),
+        _context(symbol_meme_notional=Decimal("6")),
+    )
+    assert decision.decision == "DENY"
+    assert "meme symbol" in decision.reason
+
+
+def test_directional_meme_cap() -> None:
+    decision = RiskGate(
+        RiskLimits(max_directional_meme_exposure_usdt=Decimal("15"))
+    ).evaluate(
+        _intent(quantity=Decimal("0.1")),
+        _context(directional_meme_exposure=Decimal("6")),
+    )
+    assert decision.decision == "DENY"
+    assert "directional meme" in decision.reason
+
+
 def test_classify_meme_risk_tier_uses_canonical_thresholds() -> None:
     assert classify_meme_risk_tier(trading=False) == "BLOCK"
     assert classify_meme_risk_tier(data_quality_score=Decimal("0.1")) == "OBSERVE"

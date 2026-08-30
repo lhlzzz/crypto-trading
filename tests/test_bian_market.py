@@ -564,6 +564,12 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
     def test_futures_observation_preserves_each_native_aggregate_period(self):
         class FakeFuturesClient:
+            def get_klines(self, symbol: str, *, interval: str, limit: int):
+                self.assert_symbol(symbol)
+                assert interval == "1m"
+                assert limit == 2
+                return [[1_000, "100", "102", "99", "101", "10", 2_000]]
+
             def get_mark_price(self, symbol: str):
                 self.assert_symbol(symbol)
                 return {"markPrice": "101", "indexPrice": "100", "time": 2_000}
@@ -610,7 +616,10 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "TAKER_RATIO", "GLOBAL_LONG_SHORT", "TOP_TRADER_LONG_SHORT",
             }
         ]
-        self.assertEqual(len(report["events"]), 16)
+        self.assertEqual(len(report["events"]), 17)
+        self.assertIn(
+            "FUTURES_KLINES", {event["event_type"] for event in report["events"]}
+        )
         self.assertEqual(
             {event["metadata"]["observationPeriod"] for event in period_events},
             {"5m", "15m", "30m", "1h"},

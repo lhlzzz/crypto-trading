@@ -45,6 +45,11 @@ class TradingStore:
     def __init__(self, dsn: str | None = None) -> None:
         self.dsn = dsn or configured_dsn()
 
+    @staticmethod
+    def _mode(mode: str | None = None) -> str:
+        import os
+        return (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+
     def initialize(self) -> None:
         ensure_schema(self.dsn)
 
@@ -439,30 +444,70 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT market, event_type, MAX(event_timestamp),
-                           MAX(received_timestamp), MAX(latency_ms)
+                    SELECT DISTINCT ON (market, event_type)
+                           market, event_type, event_timestamp,
+                           received_timestamp, latency_ms
                     FROM market_flow_events
-                    GROUP BY market, event_type
-                    ORDER BY market, event_type
+                    WHERE market = 'FUTURES'
+                    ORDER BY market, event_type, event_timestamp DESC,
+                             received_timestamp DESC
                     """
                 )
                 rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT captured_at, payload
+                    FROM bian_market_snapshots
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+                kline_row = cursor.fetchone()
         now = _now()
-        result = []
+        canonical: dict[str, tuple[str, Any, Any, int]] = {}
         for market, event_type, source_at, received_at, latency_ms in rows:
-            age_sec = max(0, int((now - _as_utc(source_at)).total_seconds()))
-            result.append(
-                {
-                    "market": market,
-                    "event_type": event_type,
-                    "source_timestamp": source_at.isoformat(),
-                    "received_timestamp": received_at.isoformat(),
-                    "latency_ms": int(latency_ms),
-                    "age_sec": age_sec,
-                    "status": "FRESH" if age_sec <= max(1, max_age_sec) else "STALE",
-                }
-            )
+            aliases = {
+                "FUTURES_KLINES": ("futures_klines",),
+                "FUTURES_TRADE": ("futures_trade_flow",),
+                "TAKER_RATIO": ("futures_taker_ratio",),
+                "OPEN_INTEREST": ("futures_open_interest",),
+                "FUNDING": ("futures_funding",),
+                "MARK_INDEX_FUNDING": ("futures_mark_price", "futures_index_price"),
+                "BOOK_TICKER": ("futures_book_ticker",),
+                "ORDERBOOK": ("futures_orderbook",),
+                "FORCE_ORDER": ("futures_liquidation",),
+            }.get(str(event_type), ())
+            for alias in aliases:
+                canonical[alias] = (str(market), source_at, received_at, int(latency_ms))
+        if kline_row is not None:
+            source_at, payload = kline_row
+            stored = payload if isinstance(payload, dict) else {}
+            received_at = stored.get("received_timestamp", source_at)
+            canonical["futures_klines"] = ("FUTURES", source_at, received_at, int(
+                (self._datetime(received_at) - _as_utc(source_at)).total_seconds() * 1000
+            ))
+
+        result = []
+        for event_type, (market, source_at, received_at, latency_ms) in sorted(canonical.items()):
+            source_dt = _as_utc(source_at)
+            received_dt = _as_utc(received_at)
+            age_sec = max(0, int((now - source_dt).total_seconds()))
+            valid_timestamps = received_dt >= source_dt and source_dt <= now and received_dt <= now
+            valid_latency = latency_ms >= 0 and latency_ms == int((received_dt - source_dt).total_seconds() * 1000)
+            result.append({
+                "market": market,
+                "event_type": event_type,
+                "source_timestamp": source_dt.isoformat(),
+                "received_timestamp": received_dt.isoformat(),
+                "latency_ms": latency_ms,
+                "age_sec": age_sec,
+                "status": "FRESH" if age_sec <= max(1, max_age_sec) and valid_timestamps and valid_latency else "STALE",
+            })
         return result
+
+    @staticmethod
+    def _datetime(value: Any) -> datetime:
+        return _as_utc(value)
 
     def market_universe_context(
         self,
@@ -855,7 +900,7 @@ class TradingStore:
                     values,
                 )
 
-    def get_order_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+    def get_order_by_client_order_id(self, client_order_id: str, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -868,9 +913,9 @@ class TradingStore:
                            mode, created_at, updated_at, expires_at,
                            position_side, position_action, reduce_only, leverage
                     FROM orders
-                    WHERE client_order_id = %s
+                    WHERE client_order_id = %s AND mode = %s
                     """,
-                    (client_order_id,),
+                    (client_order_id, self._mode(mode)),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -884,7 +929,7 @@ class TradingStore:
         )
         return _row_dict(columns, row)
 
-    def get_order(self, order_id: UUID) -> dict[str, Any] | None:
+    def get_order(self, order_id: UUID, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -897,9 +942,9 @@ class TradingStore:
                            mode, created_at, updated_at, expires_at,
                            position_side, position_action, reduce_only, leverage
                     FROM orders
-                    WHERE order_id = %s
+                    WHERE order_id = %s AND mode = %s
                     """,
-                    (str(order_id),),
+                    (str(order_id), self._mode(mode)),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -959,10 +1004,10 @@ class TradingStore:
                     """
                     INSERT INTO trades(
                         trade_id, order_id, symbol, side, quantity, price,
-                        fee, fee_asset, realized_pnl, executed_at, market,
+                        fee, fee_asset, realized_pnl, executed_at, market, mode,
                         position_side, funding, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, CAST(%s AS JSONB))
+                              %s, %s, %s, %s, CAST(%s AS JSONB))
                     RETURNING trade_id
                     """,
                     (
@@ -977,6 +1022,7 @@ class TradingStore:
                         realized_pnl,
                         _now(),
                         market,
+                        self._mode((payload or {}).get("mode")),
                         position_side,
                         funding,
                         _json(payload),
@@ -1138,7 +1184,7 @@ class TradingStore:
                         used_margin, unrealized_pnl
                     ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB),
                               %s, %s, %s, %s, %s)
-                    ON CONFLICT (asset) DO UPDATE SET
+                    ON CONFLICT (mode, asset) DO UPDATE SET
                         free = EXCLUDED.free,
                         locked = EXCLUDED.locked,
                         mode = EXCLUDED.mode,
@@ -1157,7 +1203,7 @@ class TradingStore:
                     ),
                 )
 
-    def get_balance(self, asset: str) -> dict[str, Any] | None:
+    def get_balance(self, asset: str, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -1168,9 +1214,9 @@ class TradingStore:
                            wallet_balance, available_balance, margin_balance,
                            used_margin, unrealized_pnl, payload
                     FROM balances
-                    WHERE asset = %s
+                    WHERE asset = %s AND mode = %s
                     """,
-                    (asset,),
+                    (asset, self._mode(mode)),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -1189,7 +1235,7 @@ class TradingStore:
             "payload": row[10] if isinstance(row[10], dict) else {},
         }
 
-    def list_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_orders(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 
         bounded_limit = max(1, min(int(limit), 200))
@@ -1203,10 +1249,11 @@ class TradingStore:
                            mode, created_at, updated_at, expires_at,
                            position_side, position_action, reduce_only, leverage
                     FROM orders
+                    WHERE mode = %s AND market = %s
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
-                    (bounded_limit,),
+                    (self._mode(mode), market.upper(), bounded_limit),
                 )
                 rows = cursor.fetchall()
         columns = (
@@ -1218,14 +1265,14 @@ class TradingStore:
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def list_open_local_orders(self) -> list[dict[str, Any]]:
+    def list_open_local_orders(self, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         return [
             row
-            for row in self.list_orders(limit=200)
+            for row in self.list_orders(limit=200, mode=mode, market=market)
             if row["status"] in {"CREATED", "RISK_APPROVED", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED", "UNKNOWN"}
         ]
 
-    def list_trades(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_trades(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 
         bounded_limit = max(1, min(int(limit), 200))
@@ -1234,23 +1281,24 @@ class TradingStore:
                 cursor.execute(
                     """
                     SELECT trade_id, order_id, symbol, side, quantity, price,
-                           fee, fee_asset, realized_pnl, executed_at, market,
+                           fee, fee_asset, realized_pnl, executed_at, market, mode,
                            position_side, funding, payload
                     FROM trades
+                    WHERE market = %s AND mode = %s
                     ORDER BY executed_at DESC
                     LIMIT %s
                     """,
-                    (bounded_limit,),
+                    (market.upper(), self._mode(mode), bounded_limit),
                 )
                 rows = cursor.fetchall()
         columns = (
             "trade_id", "order_id", "symbol", "side", "quantity", "price",
             "fee", "fee_asset", "realized_pnl", "executed_at", "market",
-            "position_side", "funding", "payload",
+            "mode", "position_side", "funding", "payload",
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def list_positions(self) -> list[dict[str, Any]]:
+    def list_positions(self, *, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -1263,8 +1311,9 @@ class TradingStore:
                            margin_type, initial_margin, maintenance_margin,
                            liquidation_price, funding_pnl
                     FROM positions
+                    WHERE market = %s
                     ORDER BY market, symbol
-                    """
+                    """, (market.upper(),)
                 )
                 rows = cursor.fetchall()
         columns = (
@@ -1276,7 +1325,7 @@ class TradingStore:
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def list_balances(self) -> list[dict[str, Any]]:
+    def list_balances(self, *, mode: str | None = None) -> list[dict[str, Any]]:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -1287,8 +1336,9 @@ class TradingStore:
                            wallet_balance, available_balance, margin_balance,
                            used_margin, unrealized_pnl, payload
                     FROM balances
+                    WHERE mode = %s
                     ORDER BY asset
-                    """
+                    """, (self._mode(mode),)
                 )
                 rows = cursor.fetchall()
         columns = (
@@ -1298,7 +1348,7 @@ class TradingStore:
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def list_risk_events(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_risk_events(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 
         bounded_limit = max(1, min(int(limit), 200))
@@ -1306,18 +1356,19 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT event_id, intent_id, decision, reason, event_at
+                    SELECT event_id, intent_id, decision, reason, event_at, mode, market
                     FROM risk_events
+                    WHERE mode = %s AND market = %s
                     ORDER BY event_at DESC
                     LIMIT %s
                     """,
-                    (bounded_limit,),
+                    (self._mode(mode), market.upper(), bounded_limit),
                 )
                 rows = cursor.fetchall()
-        columns = ("event_id", "intent_id", "decision", "reason", "event_at")
+        columns = ("event_id", "intent_id", "decision", "reason", "event_at", "mode", "market")
         return [_row_dict(columns, row) for row in rows]
 
-    def list_system_events(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_system_events(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 
         bounded_limit = max(1, min(int(limit), 200))
@@ -1325,15 +1376,16 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT event_id, event_type, severity, message, event_at
+                    SELECT event_id, event_type, severity, message, event_at, mode, market
                     FROM system_events
+                    WHERE mode = %s AND market = %s
                     ORDER BY event_at DESC
                     LIMIT %s
                     """,
-                    (bounded_limit,),
+                    (self._mode(mode), market.upper(), bounded_limit),
                 )
                 rows = cursor.fetchall()
-        columns = ("event_id", "event_type", "severity", "message", "event_at")
+        columns = ("event_id", "event_type", "severity", "message", "event_at", "mode", "market")
         return [_row_dict(columns, row) for row in rows]
 
     def record_runtime_gate_status(self, gate: str, status: str, *, detail: dict[str, Any] | None = None) -> UUID:
@@ -1453,13 +1505,15 @@ class TradingStore:
         import psycopg2
 
         event_id = uuid4()
+        mode = self._mode((payload or {}).get("mode"))
+        market = str((payload or {}).get("market", "FUTURES")).upper()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO risk_events(
-                        event_id, intent_id, decision, reason, event_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        event_id, intent_id, decision, reason, mode, market, event_at, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
                     RETURNING event_id
                     """,
                     (
@@ -1467,6 +1521,8 @@ class TradingStore:
                         str(intent_id) if intent_id is not None else None,
                         decision,
                         reason,
+                        mode,
+                        market,
                         _now(),
                         _json(payload),
                     ),
@@ -1485,13 +1541,15 @@ class TradingStore:
         import psycopg2
 
         event_id = uuid4()
+        mode = self._mode((payload or {}).get("mode"))
+        market = str((payload or {}).get("market", "FUTURES")).upper()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO system_events(
-                        event_id, event_type, severity, message, event_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        event_id, event_type, severity, message, mode, market, event_at, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
                     RETURNING event_id
                     """,
                     (
@@ -1499,6 +1557,8 @@ class TradingStore:
                         event_type,
                         severity,
                         message,
+                        mode,
+                        market,
                         _now(),
                         _json(payload),
                     ),

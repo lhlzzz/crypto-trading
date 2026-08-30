@@ -362,11 +362,11 @@ def test_paper_partial_order_can_fill_on_a_later_market_cycle() -> None:
     first = executor.submit(
         intent,
         _risk(intent),
-        market=_market(available_liquidity=Decimal("0.1")),
+        market=_market(available_liquidity_notional_usdt=Decimal("10")),
     )
     second = executor.process_market(
         first.order_id,
-        _market(available_liquidity=Decimal("0.1")),
+        _market(available_liquidity_notional_usdt=Decimal("10")),
     )
     assert first.status == "PARTIALLY_FILLED"
     assert second.status == "FILLED"
@@ -394,7 +394,7 @@ def test_paper_restart_recovers_partial_order_without_duplicate_trade() -> None:
     first = first_executor.submit(
         intent,
         _risk(intent),
-        market=_market(available_liquidity=Decimal("0.1")),
+        market=_market(available_liquidity_notional_usdt=Decimal("10")),
     )
     restarted_executor = PaperExecutor(
         store=store,
@@ -403,7 +403,7 @@ def test_paper_restart_recovers_partial_order_without_duplicate_trade() -> None:
     recovered = restarted_executor.recover()
     final = restarted_executor.process_market(
         first.order_id,
-        _market(available_liquidity=Decimal("0.1")),
+        _market(available_liquidity_notional_usdt=Decimal("10")),
     )
     assert len(recovered) == 1
     assert recovered[0].status == "PARTIALLY_FILLED"
@@ -470,6 +470,12 @@ def test_paper_funding_is_not_double_recorded_after_mark() -> None:
     assert first == Decimal("-1")
     assert second == Decimal("0")
     assert executor.account_state()["funding_pnl"] == Decimal("-1")
+    settlements = [
+        event for event in store.system_events
+        if event.get("event_type") == "FUNDING_SETTLED"
+    ]
+    assert len(settlements) == 1
+    assert settlements[0]["payload"]["funding_timestamp"] == "2026-08-29T00:00:00+00:00"
 
 
 def test_paper_liquidation_halts() -> None:

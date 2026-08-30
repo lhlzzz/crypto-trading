@@ -85,6 +85,10 @@ reconciliation, data-health, risk, Meme, and explicit operator gates pass.
 Testnet requires separate credentials and a real account preflight; without
 them its lifecycle is `TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
 
+AlphaGate is research-only and fail-closed: train, validation, frozen OOS,
+independent episode analysis, and baseline/stressed-cost metrics are required;
+`ALPHA_GATE_STATUS=ALPHA_SUPPORTED` is necessary but not sufficient for Live.
+
 The API contract and release identity default to `2026-08-15` and can be
 overridden independently with `BIAN_OPERATOR_CONTRACT_VERSION` and
 `BIAN_RELEASE_VERSION`.

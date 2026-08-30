@@ -60,6 +60,8 @@ def test_normalizes_account_update() -> None:
     assert event.balance_updates[0]["wallet_balance"] == "100"
     assert event.position_updates[0]["symbol"] == "BTCUSDT"
     assert event.position_updates[0]["quantity"] == "0.1"
+    assert event.completeness == "PARTIAL"
+    assert event.source == "USER_STREAM"
 
 
 def test_spot_events_are_malformed_not_accepted() -> None:
@@ -191,6 +193,65 @@ def test_unknown_and_disconnect_trigger_reconciliation() -> None:
 
     asyncio.run(scenario())
     assert reconciled
+    assert halted
+
+
+def test_listen_key_expiry_reconnect() -> None:
+    rest = FakeRest()
+    first, second = FakeWebsocket(), FakeWebsocket()
+    sockets = [first, second]
+
+    async def connect(url: str):
+        return sockets.pop(0)
+
+    client = UserStreamClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+        rest_client=rest,
+        websocket_connect=connect,
+        reconnect_delay_sec=0,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(client.run_forever())
+        await asyncio.sleep(0)
+        await first.messages.put({"e": "listenKeyExpired", "E": 1})
+        await asyncio.sleep(0.05)
+        client._stopped = True
+        await second.close()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert rest.created >= 2
+
+
+def test_listen_key_expiry_halts_after_failures() -> None:
+    rest = FakeRest()
+    first, second = FakeWebsocket(), FakeWebsocket()
+    sockets = [first, second]
+    halted = []
+
+    async def connect(url: str):
+        return sockets.pop(0)
+
+    client = UserStreamClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+        rest_client=rest,
+        websocket_connect=connect,
+        on_halt=halted.append,
+        reconnect_delay_sec=0,
+        max_failures=2,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(client.run_forever())
+        await asyncio.sleep(0)
+        await first.messages.put({"e": "listenKeyExpired", "E": 1})
+        await asyncio.sleep(0.05)
+        await second.messages.put({"e": "listenKeyExpired", "E": 2})
+        with pytest.raises(RuntimeError, match="LISTEN_KEY_EXPIRED"):
+            await task
+
+    asyncio.run(scenario())
     assert halted
 
 

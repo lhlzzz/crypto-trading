@@ -6,6 +6,7 @@ TradeIntent, calls an executor, or mutates Binance account configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 import os
 
@@ -47,6 +48,20 @@ def max_data_age_sec() -> int:
 
 _GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
 _EXTERNAL_GATES = ("observation", "shadow", "testnet")
+REQUIRED_FUTURES_SOURCES = frozenset(
+    {
+        "futures_klines",
+        "futures_trade_flow",
+        "futures_taker_ratio",
+        "futures_open_interest",
+        "futures_funding",
+        "futures_mark_price",
+        "futures_index_price",
+        "futures_orderbook",
+        "futures_book_ticker",
+        "futures_liquidation",
+    }
+)
 
 
 def _persisted_gate_statuses(
@@ -107,6 +122,11 @@ class GateResult:
     testnet_gate_status: str = "NOT_STARTED"
     paper_db_ok: bool = False
     paper_accounting_ok: bool = False
+    alpha_gate_status: str = "INSUFFICIENT_SAMPLE"
+    meme_universe_ready: bool = False
+    verified_at: str | None = None
+    verification_age_sec: int | None = None
+    verification_source: str = "runtime_gate"
 
     @property
     def trading_enabled(self) -> bool:
@@ -197,6 +217,11 @@ class GateResult:
             "testnet_gate_status": self.testnet_gate_status,
             "paper_db_ok": self.paper_db_ok,
             "paper_accounting_ok": self.paper_accounting_ok,
+            "alpha_gate_status": self.alpha_gate_status,
+            "meme_universe_ready": self.meme_universe_ready,
+            "verified_at": self.verified_at,
+            "verification_age_sec": self.verification_age_sec,
+            "verification_source": self.verification_source,
             "live_allowed": self.live_allowed,
             "reasons": list(self.reasons),
         }
@@ -206,7 +231,32 @@ def _data_health(store: Any | None, *, max_age_sec: int) -> bool:
     if store is None or not hasattr(store, "market_data_freshness"):
         return False
     rows = store.market_data_freshness(max_age_sec=max_age_sec)
-    return bool(rows) and all(str(row.get("status", "")).upper() == "FRESH" for row in rows)
+    by_source = {str(row.get("event_type", "")).lower(): row for row in rows}
+    if not REQUIRED_FUTURES_SOURCES.issubset(by_source):
+        return False
+    now = datetime.now(timezone.utc)
+    for source in REQUIRED_FUTURES_SOURCES:
+        row = by_source[source]
+        if str(row.get("status", "")).upper() != "FRESH":
+            return False
+        if row.get("latency_ms") is None or int(row["latency_ms"]) > int(
+            os.environ.get("MAX_DATA_LATENCY_MS", "2000")
+        ):
+            return False
+        try:
+            source_at = datetime.fromisoformat(str(row["source_timestamp"]))
+            received_at = datetime.fromisoformat(str(row["received_timestamp"]))
+            if source_at.tzinfo is None:
+                source_at = source_at.replace(tzinfo=timezone.utc)
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+            if received_at < source_at or source_at > now or received_at > now:
+                return False
+            if int(row["latency_ms"]) != int((received_at - source_at).total_seconds() * 1000):
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
 
 
 def _risk_config_ok() -> bool:
@@ -232,6 +282,8 @@ def evaluate_runtime_gate(
     data_health_ok: bool | None = None,
     probe_account: bool = False,
     gate_evidence: Mapping[str, str] | None = None,
+    alpha_gate_status: str | None = None,
+    meme_universe_ready: bool | None = None,
 ) -> GateResult:
     """Evaluate the canonical runtime gate from configuration and evidence."""
     resolved_mode = (mode or _mode()).strip().lower()
@@ -255,6 +307,18 @@ def evaluate_runtime_gate(
     selected_symbols = _symbols(symbols)
     reasons: list[str] = []
     positioning_enabled = _enabled("POSITIONING_DECISION_ENABLED")
+    alpha_status = str(
+        alpha_gate_status or os.environ.get("ALPHA_GATE_STATUS", "INSUFFICIENT_SAMPLE")
+    ).upper()
+    if alpha_status not in {"INSUFFICIENT_SAMPLE", "ALPHA_NOT_SUPPORTED", "ALPHA_SUPPORTED"}:
+        alpha_status = "ALPHA_NOT_SUPPORTED"
+    meme_ready = (
+        _enabled("MEME_UNIVERSE_READY")
+        if meme_universe_ready is None
+        else bool(meme_universe_ready)
+    )
+    if resolved_mode == "live" and not meme_ready:
+        reasons.append("MEME_UNIVERSE_NOT_READY")
     credentials_ok = resolved_mode == "paper" or bool(config.api_key and config.api_secret)
     # These fields are Binance account evidence. Paper must not present local
     # state as a verified exchange account.
@@ -391,12 +455,18 @@ def evaluate_runtime_gate(
         )
     )
     testnet_ready = exchange_ready and testnet_lifecycle_ok
+    live_trading_enabled = _enabled("LIVE_TRADING_ENABLED")
+    if resolved_mode == "live" and not live_trading_enabled:
+        reasons.append("LIVE_TRADING_DISABLED")
     live_ready = all(
         (
             exchange_ready,
             positioning_enabled,
             observation_gates_ok,
             testnet_lifecycle_ok,
+            alpha_status == "ALPHA_SUPPORTED",
+            meme_ready,
+            live_trading_enabled,
             confirmation_ok,
         )
     )
@@ -407,6 +477,7 @@ def evaluate_runtime_gate(
     if resolved_mode == "live" and not live_ready:
         reasons.append("LIVE_RELEASE_GATES_PENDING")
     live_allowed = resolved_mode == "live" and live_ready
+    verified_at = datetime.now(timezone.utc).isoformat()
     return GateResult(
         mode=resolved_mode,
         positioning_enabled=positioning_enabled,
@@ -438,4 +509,9 @@ def evaluate_runtime_gate(
         testnet_gate_status=testnet_gate_status,
         paper_db_ok=paper_db_ok,
         paper_accounting_ok=paper_accounting_ok,
+        alpha_gate_status=alpha_status,
+        meme_universe_ready=meme_ready,
+        verified_at=verified_at,
+        verification_age_sec=0,
+        verification_source="runtime_gate",
     )

@@ -289,6 +289,7 @@ def _create_trading_tables(cursor: Any) -> None:
             realized_pnl NUMERIC NOT NULL DEFAULT 0,
             executed_at TIMESTAMPTZ NOT NULL,
             market TEXT NOT NULL DEFAULT 'FUTURES',
+            mode TEXT NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'testnet', 'live')),
             position_side TEXT,
             funding NUMERIC NOT NULL DEFAULT 0,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
@@ -324,12 +325,13 @@ def _create_trading_tables(cursor: Any) -> None:
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS balances (
-            asset TEXT PRIMARY KEY,
+            asset TEXT NOT NULL,
             free NUMERIC NOT NULL DEFAULT 0,
             locked NUMERIC NOT NULL DEFAULT 0,
             mode TEXT NOT NULL CHECK (mode IN ('paper', 'testnet', 'live')),
             updated_at TIMESTAMPTZ NOT NULL,
-            payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
+            payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB),
+            PRIMARY KEY (mode, asset)
         )
         """
     )
@@ -341,6 +343,8 @@ def _create_trading_tables(cursor: Any) -> None:
             intent_id UUID,
             decision TEXT NOT NULL CHECK (decision IN ('ALLOW', 'DENY', 'REDUCE', 'HALT')),
             reason TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'testnet', 'live')),
+            market TEXT NOT NULL DEFAULT 'FUTURES',
             event_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
@@ -354,6 +358,8 @@ def _create_trading_tables(cursor: Any) -> None:
             event_type TEXT NOT NULL,
             severity TEXT NOT NULL,
             message TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'testnet', 'live')),
+            market TEXT NOT NULL DEFAULT 'FUTURES',
             event_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
@@ -486,6 +492,7 @@ def _migrate_futures_columns(cursor: Any) -> None:
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS leverage NUMERIC",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS margin_type TEXT",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS market TEXT",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'paper'",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS position_side TEXT",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS funding NUMERIC NOT NULL DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS market TEXT",
@@ -505,10 +512,37 @@ def _migrate_futures_columns(cursor: Any) -> None:
         "ALTER TABLE balances ADD COLUMN IF NOT EXISTS margin_balance NUMERIC",
         "ALTER TABLE balances ADD COLUMN IF NOT EXISTS used_margin NUMERIC",
         "ALTER TABLE balances ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC",
+        "ALTER TABLE risk_events ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'paper'",
+        "ALTER TABLE risk_events ADD COLUMN IF NOT EXISTS market TEXT DEFAULT 'FUTURES'",
+        "ALTER TABLE system_events ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'paper'",
+        "ALTER TABLE system_events ADD COLUMN IF NOT EXISTS market TEXT DEFAULT 'FUTURES'",
     )
     for statement in statements:
         cursor.execute(statement)
     cursor.execute("UPDATE positions SET market = 'FUTURES' WHERE market IS NULL")
+    cursor.execute("UPDATE orders SET market = 'FUTURES' WHERE market IS NULL")
+    cursor.execute("UPDATE trades SET market = 'FUTURES', mode = COALESCE(mode, 'paper') WHERE market IS NULL OR mode IS NULL")
+    cursor.execute("UPDATE risk_events SET market = 'FUTURES', mode = COALESCE(mode, 'paper') WHERE market IS NULL OR mode IS NULL")
+    cursor.execute("UPDATE system_events SET market = 'FUTURES', mode = COALESCE(mode, 'paper') WHERE market IS NULL OR mode IS NULL")
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM balances
+                GROUP BY mode, asset
+                HAVING COUNT(*) > 1
+            ) THEN
+                RAISE EXCEPTION 'balances contain duplicate canonical (mode, asset) keys';
+            END IF;
+        END $$
+        """
+    )
+    cursor.execute("ALTER TABLE balances DROP CONSTRAINT IF EXISTS balances_pkey")
+    cursor.execute(
+        "ALTER TABLE balances ADD CONSTRAINT balances_pkey PRIMARY KEY (mode, asset)"
+    )
     cursor.execute(
         """
         DO $$

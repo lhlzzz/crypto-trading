@@ -45,10 +45,8 @@ class MarketSnapshot:
     index_price: Decimal | None = None
     bid_price: Decimal | None = None
     ask_price: Decimal | None = None
-    # Canonical liquidity unit is USDT notional. ``available_liquidity`` is
-    # retained only as a constructor compatibility shim for old paper tests.
+    # Canonical liquidity unit is USDT notional.
     available_liquidity_notional_usdt: Decimal | None = None
-    available_liquidity: Decimal | None = None
     funding_rate: Decimal | None = None
     funding_timestamp: datetime | None = None
     settlement_timestamp: datetime | None = None
@@ -57,14 +55,6 @@ class MarketSnapshot:
     def __post_init__(self) -> None:
         if self.last_price <= 0:
             raise ValueError("market last_price must be positive")
-        if self.available_liquidity_notional_usdt is None and self.available_liquidity is not None:
-            # The legacy field represented base quantity. Convert it once at
-            # the snapshot boundary so all execution math uses USDT notional.
-            object.__setattr__(
-                self,
-                "available_liquidity_notional_usdt",
-                self.available_liquidity * self.last_price,
-            )
 
 
 @dataclass(frozen=True)
@@ -167,6 +157,7 @@ class _BaseExecutor(Executor):
                 intent_id=intent.id,
                 decision=risk_decision.decision,
                 reason=risk_decision.reason,
+                payload={"mode": self.config.mode, "market": "FUTURES"},
             )
             raise ExecutionRejected(risk_decision.reason)
         approved = risk_decision.executable_intent
@@ -176,6 +167,7 @@ class _BaseExecutor(Executor):
             intent_id=intent.id,
             decision=risk_decision.decision,
             reason=risk_decision.reason,
+            payload={"mode": self.config.mode, "market": "FUTURES"},
         )
         self.store.record_intent(approved, status="RISK_APPROVED")
         return approved
@@ -510,7 +502,7 @@ class PaperExecutor(_BaseExecutor):
         if quantity <= 0 or direction == "FLAT":
             return Decimal("0")
         payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
-        last = payload.get("funding_timestamp")
+        last = payload.get("last_funding_settlement_timestamp")
         stamp = settlement.isoformat()
         if last is not None:
             try:
@@ -521,8 +513,6 @@ class PaperExecutor(_BaseExecutor):
                     return Decimal("0")
             except ValueError:
                 pass
-        if stamp == last:
-            return Decimal("0")
         mark = _mark_price(market)
         notional = quantity * mark
         payment = notional * market.funding_rate
@@ -538,6 +528,7 @@ class PaperExecutor(_BaseExecutor):
             funding_pnl=account["funding_pnl"] - signed,
         )
         extra = dict(payload)
+        extra["last_funding_settlement_timestamp"] = stamp
         extra["funding_timestamp"] = stamp
         extra["funding_pnl"] = str(funding_pnl)
         self.store.upsert_position(
@@ -553,6 +544,19 @@ class PaperExecutor(_BaseExecutor):
             funding_pnl=funding_pnl,
             leverage=_decimal_field(position, "leverage", default="1"),
             payload=extra,
+        )
+        self.store.record_system_event(
+            event_type="FUNDING_SETTLED",
+            severity="INFO",
+            message=f"funding settled for {symbol}",
+            payload={
+                "mode": self.config.mode,
+                "symbol": symbol,
+                "funding_timestamp": stamp,
+                "funding_rate": str(market.funding_rate),
+                "position_notional": str(notional),
+                "funding_pnl": str(-signed),
+            },
         )
         return -signed
 
@@ -600,7 +604,7 @@ class PaperExecutor(_BaseExecutor):
             event_type="LIQUIDATED",
             severity="CRITICAL",
             message=f"{symbol} paper position liquidated at mark {mark_price}",
-            payload={"symbol": symbol, "mark_price": str(mark_price)},
+            payload={"mode": self.config.mode, "symbol": symbol, "mark_price": str(mark_price)},
         )
         setter = getattr(self.store, "set_halt", None)
         if setter is not None:
@@ -831,6 +835,13 @@ class PaperExecutor(_BaseExecutor):
         initial: bool = False,
     ) -> None:
         available = wallet_balance - used_margin
+        equity = wallet_balance + unrealized_pnl
+        if wallet_balance < 0 or used_margin < 0 or available < 0:
+            raise RuntimeError("paper accounting produced negative balance or margin")
+        if equity != wallet_balance + unrealized_pnl:
+            raise RuntimeError("paper equity invariant failed")
+        if available != wallet_balance - used_margin:
+            raise RuntimeError("paper available balance invariant failed")
         self.store.upsert_balance(
             "USDT",
             free=available,

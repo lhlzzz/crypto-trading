@@ -206,6 +206,7 @@ class RiskContext:
     regime_risk: Decimal | None = None
     evidence_conflict: bool = False
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
+    symbol_meme_notional: Decimal = Decimal("0")
     total_meme_notional: Decimal = Decimal("0")
     directional_meme_exposure: Decimal = Decimal("0")
     # Optional sizing evidence. ``stop_distance`` is an absolute quote-asset
@@ -459,6 +460,11 @@ class RiskGate:
             if intent.meme_risk_tier in {"TRADEABLE", "REDUCED"} or context.meme_risk_tier in {
                 "TRADEABLE", "REDUCED"
             }:
+                if (
+                    context.symbol_meme_notional + projected_position
+                    > self.limits.max_meme_notional_usdt
+                ):
+                    return self._deny(intent, "maximum meme symbol exposure exceeded")
                 if (
                     context.total_meme_notional + projected_position
                     > self.limits.max_meme_notional_usdt

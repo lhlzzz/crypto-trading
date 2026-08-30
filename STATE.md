@@ -140,7 +140,7 @@ research baseline until positioning gates pass.
 
 ## Current verification (2026-08-30)
 
-- `210` tests pass; `compileall` and `git diff --check` pass.
+- `226` tests pass; `compileall` and `git diff --check` pass.
 - Futures order writes are single-attempt; transport uncertainty records
   `UNKNOWN` and reconciliation queries the exact client order ID.
 - listenKey create/keepalive/close use API-key-only transport.
@@ -154,3 +154,12 @@ research baseline until positioning gates pass.
   are accounted by `PaperExecutor`; liquidation flattens and halts.
 - Testnet is not runtime-verified because credentials are unavailable;
   status is `TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
+- AlphaGate now reports frozen strategy version/config hash, train,
+  validation, OOS, independent episode, baseline, and stressed-cost metrics.
+- Paper funding settles once per persisted settlement timestamp and records a
+  `FUNDING_SETTLED` accounting event.
+- Runtime data health requires every configured Futures source, timestamp
+  integrity, freshness, and latency limits; readiness responses include the
+  verification timestamp and age.
+- Balances are isolated by composite `(mode, asset)` identity and UserStream
+  `ACCOUNT_UPDATE` observations are explicitly marked `PARTIAL`.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from backtesting import evaluate_alpha_gate, replay_positioning_frames, run_backtest
+from backtesting import BacktestResult, evaluate_alpha_gate, replay_positioning_frames, run_backtest
 from engine import MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
 
 
@@ -163,3 +163,81 @@ def test_alpha_gate_requires_sufficient_chronological_oos_sample() -> None:
     )
     assert result.status == "INSUFFICIENT_SAMPLE"
     assert result.out_of_sample_samples >= 0
+
+
+def test_episode_deduplication() -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    replay = replay_positioning_frames(
+        [
+            _positioning_frame(start + timedelta(minutes=index), str(100 + index), str(101 + index))
+            for index in range(6)
+        ],
+        horizons_seconds=(60,),
+    )
+
+    assert replay.attribution["positioning"][60].samples > replay.independent_episodes
+    assert replay.independent_episodes == 1
+    assert replay.episode_trade_metrics[60].samples == 1
+
+
+def test_alpha_gate_true_oos_and_does_not_tune_oos(monkeypatch) -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    frames = [
+        _positioning_frame(start + timedelta(minutes=index), str(100 + index), str(101 + index))
+        for index in range(16)
+    ]
+    seen = []
+
+    def fake_backtest(*args, **kwargs):
+        seen.append((kwargs["frames"], kwargs["fee_rate"], kwargs["slippage_bps"], kwargs["engine"].config))
+        return BacktestResult(
+            symbol="BTCUSDT", initial_cash=Decimal("1000"), final_value=Decimal("1010"),
+            total_return=Decimal("0.01"), max_drawdown=Decimal("0.01"), total_trades=1,
+            win_rate=Decimal("1"), loss_rate=Decimal("0"), profit_factor=Decimal("2"),
+            expectancy=Decimal("0.01"), average_win=Decimal("1"), average_loss=Decimal("0"),
+            sharpe=Decimal("1"), sortino=Decimal("1"), exposure=Decimal("0"),
+            average_holding_time_minutes=Decimal("1"), fees=Decimal("0"), slippage=Decimal("0"),
+        )
+
+    monkeypatch.setattr("backtesting.run_backtest", fake_backtest)
+    result = evaluate_alpha_gate(frames, min_samples=1)
+
+    assert result.status == "ALPHA_SUPPORTED"
+    assert result.train_samples == 8
+    assert result.validation_samples == 4
+    assert result.oos_samples == result.oos_metrics["independent_episodes"]
+    assert result.strategy_version == "positioning-v1"
+    assert result.parameter_version == result.config_hash
+    assert len(result.config_hash) == 64
+    assert len(seen) == 2
+    assert seen[0][0] == frames[12:]
+    assert [frame.captured_at for frame in seen[1][0]] == [
+        frame.captured_at for frame in frames[12:]
+    ]
+    assert seen[0][3] == seen[1][3]
+
+
+def test_alpha_cost_stress_rejects_strategy(monkeypatch) -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    frames = [
+        _positioning_frame(start + timedelta(minutes=index), str(100 + index), str(101 + index))
+        for index in range(16)
+    ]
+
+    def fake_backtest(*args, **kwargs):
+        stressed = kwargs["fee_rate"] > Decimal("0.001")
+        expectancy = Decimal("-0.01") if stressed else Decimal("0.01")
+        return BacktestResult(
+            symbol="BTCUSDT", initial_cash=Decimal("1000"), final_value=Decimal("1000"),
+            total_return=Decimal("0"), max_drawdown=Decimal("0.01"), total_trades=1,
+            win_rate=Decimal("1"), loss_rate=Decimal("0"), profit_factor=Decimal("2"),
+            expectancy=expectancy, average_win=Decimal("1"), average_loss=Decimal("0"),
+            sharpe=Decimal("1"), sortino=Decimal("1"), exposure=Decimal("0"),
+            average_holding_time_minutes=Decimal("1"), fees=Decimal("0"), slippage=Decimal("0"),
+        )
+
+    monkeypatch.setattr("backtesting.run_backtest", fake_backtest)
+    result = evaluate_alpha_gate(frames, min_samples=1)
+
+    assert result.status == "ALPHA_NOT_SUPPORTED"
+    assert result.oos_metrics["cost_stress"]["net_expectancy"] == "-0.01"

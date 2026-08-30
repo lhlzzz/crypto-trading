@@ -41,6 +41,8 @@ class UserStreamEvent:
     reduce_only: bool | None = None
     balance_updates: tuple[dict[str, str], ...] = ()
     position_updates: tuple[dict[str, str], ...] = ()
+    completeness: str = "FULL"
+    source: str = "USER_STREAM"
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -151,6 +153,8 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
             event_time_ms=_int_or_none(raw.get("E")),
             balance_updates=balances,
             position_updates=positions,
+            completeness="PARTIAL",
+            source="USER_STREAM",
             raw=raw,
         )
     return UserStreamEvent(event_type="malformed", raw=raw)
@@ -187,6 +191,7 @@ class UserStreamClient:
         self._max_failures = max_failures
         self._keepalive_sec = max(0.01, float(keepalive_sec))
         self._seen_event_ids: set[str] = set()
+        self.stream_failure_reason: str | None = None
 
     def _client(self) -> Any:
         if self._rest is None:
@@ -212,8 +217,11 @@ class UserStreamClient:
                 websocket = None
                 try:
                     websocket = await self.connect_once()
-                    failures = 0
+                    self.stream_failure_reason = None
                     await self._consume(websocket)
+                    if self.stream_failure_reason is not None:
+                        raise RuntimeError(self.stream_failure_reason)
+                    failures = 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -241,6 +249,8 @@ class UserStreamClient:
             return
         async for message in websocket:
             self._message_received(message)
+            if self.stream_failure_reason is not None:
+                return
 
     def _message_received(self, event: Any) -> None:
         try:
@@ -248,8 +258,9 @@ class UserStreamClient:
         except Exception:
             normalized = UserStreamEvent(event_type="malformed", raw={"raw": str(event)})
         if normalized.event_type == "listenKeyExpired":
+            self.stream_failure_reason = "LISTEN_KEY_EXPIRED"
             _dispatch(self.on_reconcile)
-            raise RuntimeError("listenKey expired")
+            return
         if normalized.event_id is not None:
             if normalized.event_id in self._seen_event_ids:
                 return

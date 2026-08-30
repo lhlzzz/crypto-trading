@@ -1,9 +1,11 @@
 """Research-only backtesting entry point using the single strategy engine."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+import hashlib
+import json
 from typing import Any, Iterable, Mapping
 from uuid import UUID, uuid4
 
@@ -112,6 +114,8 @@ class PositioningReplayResult:
     attribution: Mapping[str, Mapping[int, ForwardReturnMetrics]]
     by_state: Mapping[str, Mapping[int, ForwardReturnMetrics]]
     by_transition: Mapping[str, Mapping[int, ForwardReturnMetrics]]
+    episode_trade_metrics: Mapping[int, ForwardReturnMetrics]
+    independent_episodes: int
 
     def as_dict(self) -> dict[str, object]:
         def render(groups: Mapping[str, Mapping[int, ForwardReturnMetrics]]) -> dict[str, object]:
@@ -124,6 +128,15 @@ class PositioningReplayResult:
             "attribution": render(self.attribution),
             "by_state": render(self.by_state),
             "by_transition": render(self.by_transition),
+            "observation_samples": sum(
+                metrics.samples
+                for metrics in self.attribution.get("positioning", {}).values()
+            ),
+            "independent_episodes": self.independent_episodes,
+            "episode_trade_metrics": {
+                str(horizon): metrics.as_dict()
+                for horizon, metrics in self.episode_trade_metrics.items()
+            },
         }
 
 
@@ -134,17 +147,41 @@ class AlphaGateResult:
     status: str
     train_samples: int
     validation_samples: int
-    out_of_sample_samples: int
-    out_of_sample_expectancy: Decimal
+    oos_samples: int
+    train_metrics: Mapping[str, Any]
+    validation_metrics: Mapping[str, Any]
+    oos_metrics: Mapping[str, Any]
+    strategy_version: str
+    parameter_version: str
+    config_hash: str
     reason: str
+
+    @property
+    def out_of_sample_samples(self) -> int:
+        return self.oos_samples
+
+    @property
+    def out_of_sample_expectancy(self) -> Decimal:
+        return Decimal(str(self.oos_metrics.get("expectancy", "0")))
+
+    @property
+    def strategy_config_hash(self) -> str:
+        return self.config_hash
 
     def as_dict(self) -> dict[str, str | int]:
         return {
             "status": self.status,
             "train_samples": self.train_samples,
             "validation_samples": self.validation_samples,
-            "out_of_sample_samples": self.out_of_sample_samples,
-            "out_of_sample_expectancy": str(self.out_of_sample_expectancy),
+            "oos_samples": self.oos_samples,
+            "out_of_sample_samples": self.oos_samples,
+            "train_metrics": dict(self.train_metrics),
+            "validation_metrics": dict(self.validation_metrics),
+            "oos_metrics": dict(self.oos_metrics),
+            "strategy_version": self.strategy_version,
+            "parameter_version": self.parameter_version,
+            "config_hash": self.config_hash,
+            "strategy_config_hash": self.config_hash,
             "reason": self.reason,
         }
 
@@ -436,11 +473,66 @@ def replay_positioning_frames(
             for name, horizons in groups.items()
         }
 
+    # Collapse consecutive observations in the same directional episode. The
+    # raw forward observations remain available for diagnostics, but episode
+    # metrics count one trade opportunity per continuous positioning regime.
+    episode_groups: dict[int, list[tuple[Decimal, Decimal, Decimal, Decimal]]] = {}
+    episode_starts: list[int] = []
+    previous_direction: Direction = "FLAT"
+    for index, record in enumerate(records):
+        direction = record.positioning.direction
+        if direction != "FLAT" and direction != previous_direction:
+            episode_starts.append(index)
+        previous_direction = direction
+
+    for episode_number, index in enumerate(episode_starts):
+        record = records[index]
+        entry = ordered[index].closes[-1]
+        if entry <= 0:
+            continue
+        episode_end = (
+            episode_starts[episode_number + 1]
+            if episode_number + 1 < len(episode_starts)
+            else len(records)
+        )
+        for horizon in horizons_seconds:
+            target = record.timestamp.timestamp() + max(1, horizon)
+            horizon_exit = next(
+                (
+                    candidate for candidate in range(index + 1, len(records))
+                    if records[candidate].timestamp.timestamp() >= target
+                ),
+                None,
+            )
+            exit_index = min(
+                horizon_exit if horizon_exit is not None else episode_end - 1,
+                episode_end - 1,
+            )
+            if exit_index <= index:
+                continue
+            prices = [frame.closes[-1] for frame in ordered[index + 1:exit_index + 1]]
+            if not prices:
+                continue
+            multiplier = Decimal("1") if record.positioning.direction == "LONG" else Decimal("-1")
+            path = [multiplier * (price / entry - Decimal("1")) for price in prices]
+            holding = Decimal(str(
+                (records[exit_index].timestamp - record.timestamp).total_seconds() / 60
+            ))
+            episode_groups.setdefault(horizon, []).append(
+                (path[-1], max(path), min(path), holding)
+            )
+
+    episode_metrics = {
+        horizon: _forward_metrics(values)
+        for horizon, values in episode_groups.items()
+    }
     return PositioningReplayResult(
         records=tuple(records),
         attribution=summarize(by_strategy),
         by_state=summarize(by_state),
         by_transition=summarize(by_transition),
+        episode_trade_metrics=episode_metrics,
+        independent_episodes=len(episode_starts),
     )
 
 
@@ -704,13 +796,58 @@ def evaluate_alpha_gate(
     train_fraction: Decimal = Decimal("0.5"),
     validation_fraction: Decimal = Decimal("0.25"),
     horizon_seconds: int = 300,
+    minimum_expectancy: Decimal = Decimal("0"),
+    maximum_drawdown: Decimal = Decimal("1"),
+    minimum_profit_factor: Decimal = Decimal("0"),
+    minimum_cost_stress: Decimal = Decimal("0"),
+    strategy: StrategyEngine | None = None,
 ) -> AlphaGateResult:
-    """Evaluate positioning evidence without tuning on the full history."""
+    """Evaluate a frozen strategy through chronological train/validation/OOS.
+
+    The strategy configuration is hashed before OOS evaluation. OOS only
+    replays that frozen configuration; it never selects thresholds or a more
+    profitable candidate.
+    """
+    frozen_strategy = strategy or StrategyEngine()
+    config = frozen_strategy.config
+    strategy_version = config.positioning_strategy_version
+    config_payload = json.dumps(asdict(config), sort_keys=True, default=str)
+    config_hash = hashlib.sha256(config_payload.encode("utf-8")).hexdigest()
+    parameter_version = config_hash
+
+    def result(
+        status: str,
+        train: list[MarketFrame],
+        validation: list[MarketFrame],
+        oos: list[MarketFrame],
+        reason: str,
+        *,
+        oos_metrics: Mapping[str, Any] | None = None,
+        train_metrics: Mapping[str, Any] | None = None,
+        validation_metrics: Mapping[str, Any] | None = None,
+    ) -> AlphaGateResult:
+        resolved_oos_samples = (
+            int(oos_metrics["independent_episodes"])
+            if oos_metrics is not None and "independent_episodes" in oos_metrics
+            else len(oos)
+        )
+        return AlphaGateResult(
+            status=status,
+            train_samples=len(train),
+            validation_samples=len(validation),
+            oos_samples=resolved_oos_samples,
+            train_metrics=train_metrics or {},
+            validation_metrics=validation_metrics or {},
+            oos_metrics=oos_metrics or {},
+            strategy_version=strategy_version,
+            parameter_version=parameter_version,
+            config_hash=config_hash,
+            reason=reason,
+        )
+
     ordered = list(frames)
     if not ordered:
-        return AlphaGateResult(
-            "INSUFFICIENT_SAMPLE", 0, 0, 0, Decimal("0"), "no historical frames"
-        )
+        return result("INSUFFICIENT_SAMPLE", [], [], [], "no historical frames")
     if not Decimal("0") < train_fraction < Decimal("1"):
         raise ValueError("train_fraction must be between 0 and 1")
     if not Decimal("0") < validation_fraction < Decimal("1"):
@@ -724,39 +861,85 @@ def evaluate_alpha_gate(
     validation = ordered[train_end:validation_end]
     out_of_sample = ordered[validation_end:]
     if min(len(train), len(validation), len(out_of_sample)) < 2:
-        return AlphaGateResult(
-            "INSUFFICIENT_SAMPLE", len(train), len(validation), len(out_of_sample),
-            Decimal("0"), "each chronological split needs observations"
-        )
-    replay = replay_positioning_frames(out_of_sample, horizons_seconds=(horizon_seconds,))
-    metrics = replay.attribution.get("positioning", {}).get(horizon_seconds)
-    samples = metrics.samples if metrics is not None else 0
-    expectancy = metrics.expectancy if metrics is not None else Decimal("0")
-    if samples < min_samples:
-        return AlphaGateResult(
-            "INSUFFICIENT_SAMPLE", len(train), len(validation), samples,
-            expectancy, f"OOS samples {samples} below minimum {min_samples}"
+        return result("INSUFFICIENT_SAMPLE", train, validation, out_of_sample,
+                      "each chronological split needs observations")
+
+    train_replay = replay_positioning_frames(train, engine=frozen_strategy, horizons_seconds=(horizon_seconds,))
+    validation_replay = replay_positioning_frames(validation, engine=frozen_strategy, horizons_seconds=(horizon_seconds,))
+    oos_replay = replay_positioning_frames(out_of_sample, engine=frozen_strategy, horizons_seconds=(horizon_seconds,))
+    train_forward = train_replay.attribution.get("positioning", {}).get(horizon_seconds)
+    validation_forward = validation_replay.attribution.get("positioning", {}).get(horizon_seconds)
+    oos_forward = oos_replay.attribution.get("positioning", {}).get(horizon_seconds)
+    train_metrics = train_forward.as_dict() if train_forward else {}
+    validation_metrics = validation_forward.as_dict() if validation_forward else {}
+    observation_samples = oos_forward.samples if oos_forward else 0
+    episode_samples = oos_replay.independent_episodes
+    if episode_samples < min_samples:
+        return result(
+            "INSUFFICIENT_SAMPLE", train, validation, out_of_sample,
+            f"independent OOS episodes {episode_samples} below minimum {min_samples}",
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            oos_metrics={
+                **(oos_forward.as_dict() if oos_forward else {}),
+                "observation_samples": observation_samples,
+                "independent_episodes": episode_samples,
+            },
         )
     try:
-        cost_adjusted = run_backtest(
+        baseline = run_backtest(
             [],
             frames=out_of_sample,
-            engine=StrategyEngine(
-                StrategyConfig(positioning_decision_enabled=True)
-            ),
+            fee_rate=Decimal("0.001"),
+            slippage_bps=Decimal("5"),
+            engine=frozen_strategy,
         )
-        expectancy = cost_adjusted.expectancy
+        stressed_frames = [
+            replace(frame, funding_rate=(frame.funding_rate * Decimal("1.5"))
+                    if frame.funding_rate is not None else None)
+            for frame in out_of_sample
+        ]
+        stressed = run_backtest(
+            [],
+            frames=stressed_frames,
+            fee_rate=Decimal("0.001") * Decimal("1.25"),
+            slippage_bps=Decimal("5") * Decimal("1.50"),
+            engine=frozen_strategy,
+        )
     except (ValueError, RuntimeError):
-        return AlphaGateResult(
-            "ALPHA_NOT_SUPPORTED", len(train), len(validation), samples,
-            Decimal("0"), "cost-adjusted OOS execution could not be evaluated"
+        return result(
+            "ALPHA_NOT_SUPPORTED", train, validation, out_of_sample,
+            "cost-adjusted OOS execution could not be evaluated",
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+            oos_metrics={"observation_samples": observation_samples, "independent_episodes": episode_samples},
         )
-    if expectancy <= 0:
-        return AlphaGateResult(
-            "ALPHA_NOT_SUPPORTED", len(train), len(validation), samples,
-            expectancy, "cost-adjusted OOS expectancy is not positive"
+    oos_metrics = {
+        **baseline.as_dict(),
+        "observation_samples": observation_samples,
+        "independent_episodes": episode_samples,
+        "cost_stress": {
+            "fee_multiplier": "1.25",
+            "slippage_multiplier": "1.50",
+            "funding_multiplier": "1.50",
+            "net_expectancy": str(stressed.expectancy),
+            "net_return": str(stressed.net_return),
+        },
+    }
+    supported = all(
+        (
+            baseline.expectancy >= minimum_expectancy,
+            baseline.max_drawdown <= maximum_drawdown,
+            baseline.profit_factor >= minimum_profit_factor,
+            stressed.expectancy >= minimum_cost_stress,
         )
-    return AlphaGateResult(
-        "ALPHA_SUPPORTED", len(train), len(validation), samples,
-        expectancy, "cost-adjusted OOS expectancy is positive with sufficient samples"
+    )
+    return result(
+        "ALPHA_SUPPORTED" if supported else "ALPHA_NOT_SUPPORTED",
+        train, validation, out_of_sample,
+        "frozen OOS metrics and cost stress passed"
+        if supported else "frozen OOS metrics or cost stress failed",
+        train_metrics=train_metrics,
+        validation_metrics=validation_metrics,
+        oos_metrics=oos_metrics,
     )
