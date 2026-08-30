@@ -60,7 +60,8 @@ def _positioning_frame(**updates: object) -> MarketFrame:
             "spot_trade",
             "futures_open_interest",
             "futures_funding",
-            "futures_taker_flow",
+            "futures_trade_flow",
+            "futures_taker_ratio",
             "spot_book_ticker",
             "spot_orderbook",
         )
@@ -72,6 +73,7 @@ def _positioning_frame(**updates: object) -> MarketFrame:
         "spot_buy_volume": Decimal("12"),
         "spot_sell_volume": Decimal("4"),
         "net_spot_flow": Decimal("8"),
+        "futures_trade_flow": Decimal("8"),
         "cvd_change": Decimal("8"),
         "taker_buy_volume": Decimal("10"),
         "taker_sell_volume": Decimal("3"),
@@ -103,7 +105,7 @@ def test_positioning_building_is_explainable_but_shadow_only_by_default() -> Non
     decision = StrategyEngine().positioning_decision(frame)
     assert decision.state == "LONG_BUILDING"
     assert decision.direction == "LONG"
-    assert "SPOT_BUYING" in decision.reason_codes
+    assert "FUTURES_BUYING" in decision.reason_codes
     assert StrategyEngine().evaluate(frame) is None
 
 
@@ -157,7 +159,11 @@ def test_missing_timestamp_provenance_fails_closed() -> None:
 
 def test_conflicting_flow_fails_closed() -> None:
     decision = StrategyEngine().positioning_decision(
-        _positioning_frame(net_spot_flow=Decimal("-8"), cvd_change=Decimal("-8"))
+        _positioning_frame(
+            net_spot_flow=Decimal("-8"),
+            futures_trade_flow=Decimal("-8"),
+            cvd_change=Decimal("-8"),
+        )
     )
     assert decision.state == "CONFLICTED"
     assert decision.direction == "FLAT"
@@ -181,6 +187,7 @@ def test_absorption_requires_exceptional_flow_and_low_price_impact() -> None:
         _positioning_frame(
             closes=(Decimal("100"), Decimal("100")),
             net_spot_flow=Decimal("-8"),
+            futures_trade_flow=Decimal("-8"),
             cvd_change=Decimal("-8"),
             taker_buy_volume=Decimal("3"),
             taker_sell_volume=Decimal("10"),
@@ -223,6 +230,7 @@ def test_short_building_is_directionally_symmetric_with_long_building() -> None:
         _positioning_frame(
             closes=(Decimal("101"), Decimal("100")),
             net_spot_flow=Decimal("-8"),
+            futures_trade_flow=Decimal("-8"),
             cvd_change=Decimal("-8"),
             taker_buy_volume=Decimal("3"),
             taker_sell_volume=Decimal("10"),
@@ -246,6 +254,25 @@ def test_directional_and_transition_strength_are_split() -> None:
     assert decision.directional_strength != decision.transition_strength
 
 
+def test_transition_strength_reflects_state_delta() -> None:
+    from engine import StrategyEngine
+
+    building_to_unwind = StrategyEngine._transition_strength(
+        "LONG_BUILDING",
+        "LONG_UNWIND",
+        long_score=Decimal("0.4"),
+        short_score=Decimal("0.2"),
+    )
+    neutral_to_building = StrategyEngine._transition_strength(
+        "NEUTRAL",
+        "LONG_BUILDING",
+        long_score=Decimal("0.4"),
+        short_score=Decimal("0.2"),
+    )
+
+    assert building_to_unwind > neutral_to_building
+
+
 def test_engine_maps_flat_long_building_to_open_long() -> None:
     assert _map_position_action("FLAT", "LONG", "LONG_BUILDING") == ("LONG", "OPEN")
     assert _map_position_action("LONG", "LONG", "LONG_BUILDING") is None
@@ -253,6 +280,39 @@ def test_engine_maps_flat_long_building_to_open_long() -> None:
     assert _map_position_action("LONG", "SHORT", "SHORT_BUILDING") == ("LONG", "CLOSE")
     assert _map_position_action("FLAT", "SHORT", "SHORT_BUILDING") == ("SHORT", "OPEN")
     assert _map_position_action("SHORT", "LONG", "LONG_BUILDING") == ("SHORT", "CLOSE")
+
+
+def test_unknown_and_conflicted_never_close_existing_positions() -> None:
+    for state in ("UNKNOWN", "CONFLICTED"):
+        assert _map_position_action("LONG", "FLAT", state) is None
+        assert _map_position_action("SHORT", "FLAT", state) is None
+
+
+def test_stale_and_future_data_never_create_close_intents() -> None:
+    engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))
+    frame = _positioning_frame()
+    stale = _positioning_frame(
+        freshness=(
+            SourceFreshness(
+                "futures_trade_flow",
+                frame.captured_at,
+                frame.captured_at,
+                1,
+                frame.captured_at.replace(hour=13),
+            ),
+        ),
+    )
+    assert engine.evaluate(stale, current_position=CurrentPosition(direction="LONG", quantity=Decimal("1"))) is None
+    future_decision = engine.positioning_decision(
+        frame,
+        now=frame.captured_at.replace(hour=11),
+    )
+    assert future_decision.state == "UNKNOWN"
+    assert engine._intent_from_positioning(
+        future_decision,
+        frame,
+        current_position=CurrentPosition(direction="SHORT", quantity=Decimal("1")),
+    ) is None
 
 
 def test_engine_does_not_repeat_open_when_already_long() -> None:
@@ -304,7 +364,7 @@ def test_received_after_decision_fails_closed() -> None:
     frame = _positioning_frame(
         freshness=(
             SourceFreshness(
-                "futures_taker_flow",
+                "futures_trade_flow",
                 datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
                 datetime(2026, 8, 26, 12, 0, 1, tzinfo=timezone.utc),
                 900,

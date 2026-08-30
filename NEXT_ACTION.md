@@ -1,12 +1,11 @@
 # Next Action
 
-Keep `POSITIONING_DECISION_ENABLED=false` until elapsed observation, 7-day
-shadow, and Testnet USD-M lifecycle gates pass.
+Actual blockers are external runtime evidence, not implementation debt:
 
-The trading contract is now futures-native: TradeIntent uses LONG/SHORT plus
-OPEN/REDUCE/CLOSE, Risk/Paper/User Stream/Reconciliation no longer use Spot
-private semantics, and `quote_quantity` is not an active trading field.
+- continuous public observation: 1h, 6h, and 24h gates
+- seven-day shadow with directional samples
+- Testnet USD-M lifecycle, blocked until credentials are supplied
+- Live release gates: observation, shadow, Testnet lifecycle, reconciliation,
+  data health, Meme `TRADEABLE`, and human confirmation
 
-Do not enable Live. Live remains HARD BLOCKED until data health,
-reconciliation, ONE_WAY/ISOLATED, meme TRADEABLE, and human confirmation
-all pass. T33 elapsed 1h/6h/24h/7-day gates remain open.
+`POSITIONING_DECISION_ENABLED=false` and Live remains hard-blocked.

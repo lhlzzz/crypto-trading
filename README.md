@@ -6,9 +6,11 @@ Repository name: `crypto trading`
 
 Public market endpoints remain owned by `scripts/bian_market.py`. PostgreSQL
 is the only bian data authority, `bian_api.py` is read-only, and Financial OS
-owns the browser UI. The validated trading path is:
-market data -> `engine.py` -> TradeIntent -> risk -> `execution.py` ->
-Paper/Binance adapter, with reconciliation and audit events around it.
+owns the browser UI. The canonical trading path is:
+public Futures evidence -> `engine.py` -> TradeIntent -> `risk.py` ->
+`execution.py` -> Paper/BinanceExecutor -> FuturesPrivateClient, with REST
+reconciliation and audit events around it. `runtime_gate.py` is the single
+readiness result and never creates intents or submits orders.
 
 ```bash
 docker-compose -f docker-compose.db.yml up -d
@@ -41,9 +43,10 @@ The read-only API exposes `/health` and
 `BIAN_API_BASE_URL` and displays it at
 `http://localhost:3000/dashboard/bian`.
 
-`python3.12 scripts/bian_market.py stream` collects only the configured public
-Binance USDT trade channels. It has no authenticated feed configuration and
-does not support orders, wallets, or private APIs.
+`python3.12 scripts/bian_market.py stream` collects public Futures trades,
+bookTicker, depth, mark/index/funding, and observed force-order events. It has
+no authenticated feed configuration and does not support orders, wallets, or
+private APIs. Spot remains auxiliary confirmation only.
 
 Capital Positioning remains shadow-only. The collector derives 24-hour
 cross-sectional breadth, a bounded Tier 1 candidate universe, and a
@@ -72,8 +75,14 @@ Run the validated paper path with `bash start_paper_trading.sh`. Testnet uses
 `bash start_live.sh`. The live guard exits before creating a private client
 unless all required conditions pass.
 
-Backtesting is research-only and uses `backtesting.py` plus VectorBT. It calls
-the same `StrategyEngine` and never submits orders or writes trading state.
+Backtesting is research-only. With normalized historical `MarketFrame` input,
+`backtesting.py` runs the same positioning, TradeIntent, RiskGate, and
+PaperExecutor contract in an ephemeral ledger; close-only SMA input remains a
+baseline and fails closed when Futures evidence is absent.
+
+Live is permanently hard-blocked in this release. Testnet requires separate
+credentials and a real account preflight; without them its lifecycle is
+`TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
 
 The API contract and release identity default to `2026-08-15` and can be
 overridden independently with `BIAN_OPERATOR_CONTRACT_VERSION` and

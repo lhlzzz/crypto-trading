@@ -279,13 +279,26 @@ def _create_trading_tables(cursor: Any) -> None:
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS positions (
-            symbol TEXT PRIMARY KEY,
+            market TEXT NOT NULL DEFAULT 'FUTURES',
+            symbol TEXT NOT NULL,
+            position_side TEXT,
             quantity NUMERIC NOT NULL DEFAULT 0,
+            entry_price NUMERIC NOT NULL DEFAULT 0,
             average_price NUMERIC NOT NULL DEFAULT 0,
+            mark_price NUMERIC,
+            index_price NUMERIC,
+            notional NUMERIC,
+            leverage NUMERIC,
+            margin_type TEXT NOT NULL DEFAULT 'ISOLATED',
+            initial_margin NUMERIC,
+            maintenance_margin NUMERIC,
+            liquidation_price NUMERIC,
             realized_pnl NUMERIC NOT NULL DEFAULT 0,
             unrealized_pnl NUMERIC NOT NULL DEFAULT 0,
+            funding_pnl NUMERIC NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL,
-            payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
+            payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB),
+            PRIMARY KEY (market, symbol)
         )
         """
     )
@@ -476,6 +489,26 @@ def _migrate_futures_columns(cursor: Any) -> None:
     )
     for statement in statements:
         cursor.execute(statement)
+    cursor.execute("UPDATE positions SET market = 'FUTURES' WHERE market IS NULL")
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM positions
+                GROUP BY market, symbol
+                HAVING COUNT(*) > 1
+            ) THEN
+                RAISE EXCEPTION 'positions contain duplicate canonical (market, symbol) keys';
+            END IF;
+        END $$
+        """
+    )
+    cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey")
+    cursor.execute(
+        "ALTER TABLE positions ADD CONSTRAINT positions_pkey PRIMARY KEY (market, symbol)"
+    )
     cursor.execute(
         """
         UPDATE trade_intents
@@ -518,16 +551,7 @@ def _migrate_futures_columns(cursor: Any) -> None:
             """
         )
         cursor.execute("ALTER TABLE orders DROP COLUMN IF EXISTS quote_quantity")
-    cursor.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS positions_market_symbol_side_uidx
-        ON positions (
-            COALESCE(market, 'FUTURES'),
-            symbol,
-            COALESCE(position_side, 'BOTH')
-        )
-        """
-    )
+    cursor.execute("DROP INDEX IF EXISTS positions_market_symbol_side_uidx")
 
 
 def schema_status(dsn: str | None = None) -> dict[str, object]:

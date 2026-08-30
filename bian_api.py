@@ -11,6 +11,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 from scripts.database import read_overview
+from runtime_gate import GateResult, evaluate_runtime_gate
 from trading_store import TradingStore
 
 BIAN_OPERATOR_CONTRACT_VERSION = os.environ.get(
@@ -75,6 +76,22 @@ def _persistent_trading_halt(store: TradingStore) -> bool:
         return _trading_halted()
 
 
+def _runtime_gate(
+    *,
+    store: TradingStore | None = None,
+    data_health_ok: bool | None = None,
+    reconciliation_ok: bool | None = None,
+) -> GateResult:
+    resolved_store = store or _trading_store()
+    return evaluate_runtime_gate(
+        mode=_trading_mode(),
+        store=resolved_store,
+        data_health_ok=data_health_ok,
+        reconciliation_ok=reconciliation_ok,
+        probe_account=False,
+    )
+
+
 class BianFrontData(BaseModel):
     """Versioned response consumed by the Financial OS bian workspace."""
 
@@ -115,8 +132,14 @@ def _front_data(limit: int) -> dict[str, Any]:
     )
     database = report["database_status"]
     connected = database.get("status") == "ok"
+    gate_store = _trading_store()
     try:
-        store = _trading_store()
+        store = gate_store
+        gate = _runtime_gate(
+            store=store,
+            data_health_ok=report["collection"].get("status") == "fresh",
+            reconciliation_ok=not _persistent_trading_halt(store),
+        )
         positioning = {
             "enabled": _env_enabled("POSITIONING_DECISION_ENABLED"),
             "shadow_mode": not _env_enabled("POSITIONING_DECISION_ENABLED"),
@@ -126,6 +149,11 @@ def _front_data(limit: int) -> dict[str, Any]:
             ),
         }
     except Exception:
+        gate = _runtime_gate(
+            store=None,
+            data_health_ok=False,
+            reconciliation_ok=False,
+        )
         positioning = {
             "enabled": _env_enabled("POSITIONING_DECISION_ENABLED"),
             "shadow_mode": not _env_enabled("POSITIONING_DECISION_ENABLED"),
@@ -137,7 +165,8 @@ def _front_data(limit: int) -> dict[str, Any]:
         "release_version": BIAN_RELEASE_VERSION,
         "environment": BIAN_ENVIRONMENT,
         "workspace": "bian",
-        "mode": "PUBLIC_READ_ONLY / NO_TRADE",
+        "api_mode": "READ_ONLY",
+        "mode": _trading_mode(),
         "trading_mode": _trading_mode(),
         "trading_halted": _persistent_trading_halt(_trading_store()),
         "source": "binance_public_api_and_stream",
@@ -164,6 +193,7 @@ def _front_data(limit: int) -> dict[str, Any]:
             "entries": report["coverage"],
         },
         "positioning": positioning,
+        "runtime_gate": gate.as_dict(),
         "updated_at": report["updated_at"],
     }
 
@@ -244,16 +274,19 @@ def get_trading_status() -> dict[str, Any]:
         summary = {}
         halted = _trading_halted()
         database_status = "unavailable"
-    mode = _trading_mode()
-    live_enabled = _env_enabled("LIVE_TRADING_ENABLED")
-    live_allowed = mode == "live" and live_enabled and not halted
+    gate = _runtime_gate(
+        store=store,
+        data_health_ok=database_status == "ok",
+        reconciliation_ok=not halted,
+    )
     return {
-        "mode": mode,
+        "api_mode": "READ_ONLY",
+        "trading_mode": gate.mode,
         "database_status": database_status,
         "trading_halted": halted,
-        "risk_status": "HALT" if halted else "SAFE",
-        "live_trading_enabled": live_enabled,
-        "live_orders_allowed": live_allowed,
+        "runtime_gate": gate.as_dict(),
+        "risk_status": gate.risk_status,
+        "live_orders_allowed": gate.live_allowed,
         "counts": counts,
         "summary": summary,
     }
@@ -424,13 +457,16 @@ def get_positioning_status() -> dict[str, Any]:
     snapshots = _positioning_items(1)
     items = snapshots.get("items") or []
     latest = items[0] if items else None
+    gate = _runtime_gate()
     return {
         "status": "ok" if snapshots.get("status") == "ok" else "unavailable",
         "enabled": enabled,
         "shadow_mode": not enabled,
-        "futures_execution": False,
+        "api_mode": "READ_ONLY",
+        "trading_mode": gate.mode,
         "latest": latest,
         "trading_halted": _persistent_trading_halt(_trading_store()),
+        "runtime_gate": gate.as_dict(),
     }
 
 

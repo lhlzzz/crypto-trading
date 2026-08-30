@@ -987,6 +987,7 @@ class TradingStore:
         position_side: str | None = None,
         entry_price: Decimal | None = None,
         mark_price: Decimal | None = None,
+        index_price: Decimal | None = None,
         notional: Decimal | None = None,
         leverage: Decimal | None = None,
         margin_type: str = "ISOLATED",
@@ -1004,14 +1005,14 @@ class TradingStore:
                 cursor.execute(
                     """
                     INSERT INTO positions(
-                        symbol, quantity, average_price, realized_pnl,
-                        unrealized_pnl, updated_at, payload, market,
-                        position_side, entry_price, mark_price, notional,
+                        market, symbol, quantity, average_price, realized_pnl,
+                        unrealized_pnl, updated_at, payload, position_side,
+                        entry_price, mark_price, index_price, notional,
                         leverage, margin_type, initial_margin,
                         maintenance_margin, liquidation_price, funding_pnl
-                    ) VALUES (%s, %s, %s, %s, %s, %s, CAST(%s AS JSONB),
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB),
                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (symbol) DO UPDATE SET
+                    ON CONFLICT (market, symbol) DO UPDATE SET
                         quantity = EXCLUDED.quantity,
                         average_price = EXCLUDED.average_price,
                         realized_pnl = EXCLUDED.realized_pnl,
@@ -1022,6 +1023,7 @@ class TradingStore:
                         position_side = EXCLUDED.position_side,
                         entry_price = EXCLUDED.entry_price,
                         mark_price = EXCLUDED.mark_price,
+                        index_price = EXCLUDED.index_price,
                         notional = EXCLUDED.notional,
                         leverage = EXCLUDED.leverage,
                         margin_type = EXCLUDED.margin_type,
@@ -1031,6 +1033,7 @@ class TradingStore:
                         funding_pnl = EXCLUDED.funding_pnl
                     """,
                     (
+                        market,
                         symbol,
                         quantity,
                         average_price,
@@ -1038,10 +1041,10 @@ class TradingStore:
                         unrealized_pnl,
                         _now(),
                         _json(payload),
-                        market,
                         position_side,
                         resolved_entry,
                         mark_price,
+                        index_price,
                         notional,
                         leverage,
                         margin_type,
@@ -1052,45 +1055,46 @@ class TradingStore:
                     ),
                 )
 
-    def get_position(self, symbol: str) -> dict[str, Any] | None:
+    def get_position(self, symbol: str, *, market: str = "FUTURES") -> dict[str, Any] | None:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT symbol, quantity, average_price, realized_pnl,
-                           unrealized_pnl, updated_at, market, position_side,
-                           entry_price, mark_price, notional, leverage,
+                    SELECT market, symbol, quantity, average_price, realized_pnl,
+                           unrealized_pnl, updated_at, position_side,
+                           entry_price, mark_price, index_price, notional, leverage,
                            margin_type, initial_margin, maintenance_margin,
                            liquidation_price, funding_pnl, payload
                     FROM positions
-                    WHERE symbol = %s
+                    WHERE market = %s AND symbol = %s
                     """,
-                    (symbol,),
+                    (market, symbol),
                 )
                 row = cursor.fetchone()
         if row is None:
             return None
         return {
-            "symbol": row[0],
-            "quantity": Decimal(str(row[1])),
-            "average_price": Decimal(str(row[2])),
-            "realized_pnl": Decimal(str(row[3])),
-            "unrealized_pnl": Decimal(str(row[4])),
-            "updated_at": row[5],
-            "market": row[6],
+            "market": row[0],
+            "symbol": row[1],
+            "quantity": Decimal(str(row[2])),
+            "average_price": Decimal(str(row[3])),
+            "realized_pnl": Decimal(str(row[4])),
+            "unrealized_pnl": Decimal(str(row[5])),
+            "updated_at": row[6],
             "position_side": row[7],
-            "entry_price": Decimal(str(row[8] if row[8] is not None else row[2])),
+            "entry_price": Decimal(str(row[8] if row[8] is not None else row[3])),
             "mark_price": Decimal(str(row[9])) if row[9] is not None else None,
-            "notional": Decimal(str(row[10])) if row[10] is not None else None,
-            "leverage": Decimal(str(row[11])) if row[11] is not None else None,
-            "margin_type": row[12],
-            "initial_margin": Decimal(str(row[13])) if row[13] is not None else None,
-            "maintenance_margin": Decimal(str(row[14])) if row[14] is not None else None,
-            "liquidation_price": Decimal(str(row[15])) if row[15] is not None else None,
-            "funding_pnl": Decimal(str(row[16] if row[16] is not None else "0")),
-            "payload": row[17] if isinstance(row[17], dict) else {},
+            "index_price": Decimal(str(row[10])) if row[10] is not None else None,
+            "notional": Decimal(str(row[11])) if row[11] is not None else None,
+            "leverage": Decimal(str(row[12])) if row[12] is not None else None,
+            "margin_type": row[13],
+            "initial_margin": Decimal(str(row[14])) if row[14] is not None else None,
+            "maintenance_margin": Decimal(str(row[15])) if row[15] is not None else None,
+            "liquidation_price": Decimal(str(row[16])) if row[16] is not None else None,
+            "funding_pnl": Decimal(str(row[17] if row[17] is not None else "0")),
+            "payload": row[18] if isinstance(row[18], dict) else {},
         }
 
     def upsert_balance(
@@ -1152,7 +1156,7 @@ class TradingStore:
                     """
                     SELECT asset, free, locked, mode, updated_at,
                            wallet_balance, available_balance, margin_balance,
-                           used_margin, unrealized_pnl
+                           used_margin, unrealized_pnl, payload
                     FROM balances
                     WHERE asset = %s
                     """,
@@ -1172,6 +1176,7 @@ class TradingStore:
             "margin_balance": Decimal(str(row[7] if row[7] is not None else row[1])),
             "used_margin": Decimal(str(row[8] if row[8] is not None else row[2])),
             "unrealized_pnl": Decimal(str(row[9] if row[9] is not None else "0")),
+            "payload": row[10] if isinstance(row[10], dict) else {},
         }
 
     def list_orders(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -1219,7 +1224,8 @@ class TradingStore:
                 cursor.execute(
                     """
                     SELECT trade_id, order_id, symbol, side, quantity, price,
-                           fee, fee_asset, realized_pnl, executed_at
+                           fee, fee_asset, realized_pnl, executed_at, market,
+                           position_side, funding, payload
                     FROM trades
                     ORDER BY executed_at DESC
                     LIMIT %s
@@ -1229,7 +1235,8 @@ class TradingStore:
                 rows = cursor.fetchall()
         columns = (
             "trade_id", "order_id", "symbol", "side", "quantity", "price",
-            "fee", "fee_asset", "realized_pnl", "executed_at",
+            "fee", "fee_asset", "realized_pnl", "executed_at", "market",
+            "position_side", "funding", "payload",
         )
         return [_row_dict(columns, row) for row in rows]
 
@@ -1240,20 +1247,20 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT symbol, quantity, average_price, realized_pnl,
-                           unrealized_pnl, updated_at, market, position_side,
-                           entry_price, mark_price, notional, leverage,
+                    SELECT market, symbol, quantity, average_price, realized_pnl,
+                           unrealized_pnl, updated_at, position_side,
+                           entry_price, mark_price, index_price, notional, leverage,
                            margin_type, initial_margin, maintenance_margin,
                            liquidation_price, funding_pnl
                     FROM positions
-                    ORDER BY symbol
+                    ORDER BY market, symbol
                     """
                 )
                 rows = cursor.fetchall()
         columns = (
-            "symbol", "quantity", "average_price", "realized_pnl",
-            "unrealized_pnl", "updated_at", "market", "position_side",
-            "entry_price", "mark_price", "notional", "leverage",
+            "market", "symbol", "quantity", "average_price", "realized_pnl",
+            "unrealized_pnl", "updated_at", "position_side",
+            "entry_price", "mark_price", "index_price", "notional", "leverage",
             "margin_type", "initial_margin", "maintenance_margin",
             "liquidation_price", "funding_pnl",
         )
@@ -1268,7 +1275,7 @@ class TradingStore:
                     """
                     SELECT asset, free, locked, mode, updated_at,
                            wallet_balance, available_balance, margin_balance,
-                           used_margin, unrealized_pnl
+                           used_margin, unrealized_pnl, payload
                     FROM balances
                     ORDER BY asset
                     """
@@ -1277,7 +1284,7 @@ class TradingStore:
         columns = (
             "asset", "free", "locked", "mode", "updated_at",
             "wallet_balance", "available_balance", "margin_balance",
-            "used_margin", "unrealized_pnl",
+            "used_margin", "unrealized_pnl", "payload",
         )
         return [_row_dict(columns, row) for row in rows]
 

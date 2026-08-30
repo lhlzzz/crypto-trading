@@ -5,8 +5,8 @@ the `bian` PostgreSQL database on port `5446`. Its read-only FastAPI contract
 runs on port `8001` and is consumed by Financial OS; `bian` remains the sole
 database owner.
 
-Product target after the 2026-08-28 V4 addendum: Binance USD-M Meme Futures
-capital positioning. Legacy SMA remains the only executable strategy until
+Current target: Binance USD-M Meme Futures capital positioning. Legacy SMA is
+research baseline only; Capital Positioning remains disabled by default until
 shadow, paper, testnet, and recovery gates pass.
 `POSITIONING_DECISION_ENABLED` defaults to `false`.
 
@@ -29,7 +29,7 @@ shadow, paper, testnet, and recovery gates pass.
 No `engine_v2.py`, `futures_engine.py`, `positioning_engine.py`, or second
 executor family exists.
 
-## Phase A audit (2026-08-28)
+## Historical Phase A audit (2026-08-28)
 
 Validated from `d75a795` with a clean tree. 118 tests passed, `compileall`
 succeeded, and PostgreSQL reported `missing_tables=[]`. Collection is stale:
@@ -52,7 +52,8 @@ Already present and kept:
   resync.
 - Shadow comparison and read-only `/api/positioning/*` endpoints.
 
-Gaps versus the Meme Futures production pack:
+The following was the historical gap list at that audit point. It is retained
+for audit history, not as the current implementation state:
 
 1. Adapter namespaces are `SpotPublicClient`, `FuturesPublicClient`, and
    `FuturesPrivateClient`. TradeIntent is futures-native: direction, action,
@@ -71,7 +72,7 @@ Gaps versus the Meme Futures production pack:
    absent because Binance does not publish them.
 7. `directional_strength` is current-view magnitude. `transition_strength` is
    previous-to-current state change and is 0 when state does not change.
-8. `PositioningState` still includes `TRANSITION` as a state literal. The
+8. The historical implementation had a dedicated transition state. The
    production contract treats transition as a field, not a state.
 9. `.env.example` has `BIAN_MARKET=FUTURES`, one-way/isolated mode,
    `MAX_LEVERAGE`, `MAX_MARGIN_USDT`, and `MIN_LIQUIDATION_BUFFER_PERCENT`.
@@ -112,12 +113,12 @@ Codebase-memory graph after Phase B: 1319 nodes, 3317 edges.
 | `FuturesPublicClient` public REST + 30m periods | KEEP |
 | Spot `PrivateClient` + `binance-sdk-spot` `new_order` | DELETE |
 | `https://testnet.binance.vision` private REST | REPLACE with USD-M Futures testnet |
-| `available_base_quantity`, SELL-as-close, base-balance short | DELETED |
-| Paper cash inventory / quote_quantity market buys | REPLACED with futures margin paper |
+| Legacy base-inventory close/short semantics | DELETED |
+| Paper cash inventory market buys | REPLACED with futures margin paper |
 | User stream `executionReport` Spot WS | REPLACED with ACCOUNT_UPDATE / ORDER_TRADE_UPDATE |
 | SMA as production path | REPLACE with positioning; SMA = research baseline |
 | `transition_strength = abs(edge)*quality` | REPLACED; directional vs transition split |
-| `PositioningState` includes `TRANSITION` | DELETE as a state later |
+| Dedicated transition state | DELETE as a state later |
 | Meme allowlist / TRADEABLE tiers | CREATE later |
 | Futures book `pu` | CREATE later (old T36) |
 
@@ -125,7 +126,8 @@ Codebase-memory graph after Phase B: 1319 nodes, 3317 edges.
 
 T49/T50 landed before old T36 orderbook. Signed USD-M REST uses stdlib HMAC.
 Paper cannot construct `FuturesPrivateClient`. Testnet/Live `BinanceExecutor`
-no longer sends Spot `quoteOrderQty`. TradeIntent is OPEN/REDUCE/CLOSE.
+no longer sends Spot quote-order quantity fields. TradeIntent is
+OPEN/REDUCE/CLOSE.
 Live remains HARD BLOCKED until elapsed observation, 7-day shadow, Testnet
 lifecycle, data health, and human confirmation all pass.
 
@@ -133,5 +135,22 @@ lifecycle, data health, and human confirmation all pass.
 
 TradeIntent, Risk, Paper, User Stream, Reconciliation, and TradingStore now
 use futures position semantics. Spot remains public confirmation only.
-`quote_quantity` is migrated out of the active schema. SMA stays a research
-baseline until positioning gates pass.
+Legacy quote-order quantity is migrated out of the active schema. SMA stays a
+research baseline until positioning gates pass.
+
+## Current verification (2026-08-30)
+
+- `210` tests pass; `compileall` and `git diff --check` pass.
+- Futures order writes are single-attempt; transport uncertainty records
+  `UNKNOWN` and reconciliation queries the exact client order ID.
+- listenKey create/keepalive/close use API-key-only transport.
+- Futures public streams provide trade, bookTicker, depth, mark/index/funding,
+  and observed force-order events with provenance; Spot is auxiliary only.
+- `runtime_gate.py` is the canonical readiness result and `live_allowed` is
+  hard false in this release.
+- Backtest normalized frames now use PositioningDecision, TradeIntent,
+  RiskGate, and PaperExecutor semantics in an ephemeral research ledger.
+- Paper wallet, margin, realized PnL, funding, fees, slippage, and liquidation
+  are accounted by `PaperExecutor`; liquidation flattens and halts.
+- Testnet is not runtime-verified because credentials are unavailable;
+  status is `TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.

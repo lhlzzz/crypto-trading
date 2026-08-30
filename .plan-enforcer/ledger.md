@@ -4,7 +4,7 @@
 
 ## Scoreboard
 
- 62 total  |  0 done  |  48 verified  |  0 skipped  |  0 blocked  |  14 remaining
+ 62 total  |  0 done  |  58 verified  |  0 skipped  |  0 blocked  |  4 remaining
  Drift: 5  |  Last reconcile: T62 |  Tier: structural
 
 ## Task Ledger
@@ -46,18 +46,18 @@
 | T33 | Complete research and elapsed-time gates | pending | 104 tests; observer/Shadow restart and zero-order audit | D11,V28,V29,V30 | Duration, 7-day Shadow, Testnet remain |
 | T34 | Phase A meme-futures architecture audit | verified | 118 tests; schema ok; compile ok | D12,A:I3,A:I4,A:I5,V31 | Owners intact; execution still Spot |
 | T35 | Phase B Futures data completeness | verified | 120 tests; live 30m taker | D12,A:I3,V32 | No private Futures orders |
-| T36 | Phase C Futures orderbook | pending |  | D12,D14 | Deferred until adapter/TradeIntent/risk |
-| T37 | Phase D Futures positioning features | pending |  | D12 | No synthesized windows |
-| T38 | Phase E MarketFrame alignment | pending |  | D12 | Extend existing frame only |
-| T39 | Phase F positioning state machine | pending |  | D12,A:I5 | Remove TRANSITION state |
-| T40 | Phase G transition semantics | pending |  | D12,A:I5 | Strength is state change |
-| T41 | Phase H evidence and replay | pending |  | D12 | MISSING != NEUTRAL |
+| T36 | Phase C Futures orderbook | verified | orderbook tests pass | D12,D14,V35 | Snapshot/buffer/gap/resync |
+| T37 | Phase D Futures positioning features | verified | Futures feature tests pass | D12,V35 | Native windows, no synthesis |
+| T38 | Phase E MarketFrame alignment | verified | frame replay tests pass | D12,V35 | Normalized evidence only |
+| T39 | Phase F positioning state machine | verified | state safety tests pass | D12,A:I5,V35 | No dedicated transition state |
+| T40 | Phase G transition semantics | verified | continuous strength tests pass | D12,A:I5,V35 | State delta magnitude |
+| T41 | Phase H evidence and replay | verified | replay/backtest tests pass | D12,V35 | MISSING remains UNKNOWN |
 | T42 | Phase I shadow duration gates | pending |  | D12,D13 | Includes T33 elapsed gates |
-| T43 | Phase J Futures paper | pending |  | D12,A:I3 | Upgrade existing executor |
-| T44 | Phase K backtest/walk-forward | pending |  | D12 | Net expectancy, OOS only |
+| T43 | Phase J Futures paper | verified | paper lifecycle tests pass | D12,A:I3,V36 | Margin/PnL/funding/liquidation |
+| T44 | Phase K backtest/walk-forward | verified | 210 tests pass | D12,V38 | Futures PaperExecutor chain |
 | T45 | Phase L Testnet Futures lifecycle | pending |  | D12,A:I3 | Separate testnet secrets |
-| T46 | Phase M failure injection | pending |  | D12 | HALT on unresolved state |
-| T47 | Phase N production guards | pending |  | D12,A:I3 | BIAN_MARKET=FUTURES |
+| T46 | Phase M failure injection | verified | uncertainty tests pass | D12,V36 | UNKNOWN/HALT fail closed |
+| T47 | Phase N production guards | verified | gate/API/owner checks | D12,A:I3,V36 | Futures-only guards |
 | T48 | Phase O limited live | pending |  | D12 | Hard block until gates pass |
 | T49 | Legacy Spot assumption audit | verified | STATE KEEP/REPLACE/DELETE table | D14,A:I6 | Adapter first |
 | T50 | USD-M private adapter | verified | 124 tests; HMAC/400/tombstone | D14,A:I3,A:I6,V33 | HMAC stdlib; no quoteOrderQty |
@@ -72,7 +72,7 @@
 | T59 | Replace obsolete spot tests | verified | 185 pytest passed | D15,V34 | intent/risk/paper/stream/recon |
 | T60 | Delete Spot private leftovers | verified | PrivateClient removed | D15,V34 | migrate callers then drop alias |
 | T61 | Live switches and paper smoke | verified | paper fill; live blocked | D15,V34 | HARD BLOCK until gates pass |
-| T62 | Full pytest/compile/diff | verified | 185 pass; compile; diffcheck | D15,V34 | no commit without evidence |
+| T62 | Full pytest/compile/diff | verified | 210 pass; compile; diffcheck | D15,V38 | no commit without evidence |
 
 ## Decision Log
 
@@ -109,6 +109,7 @@
 | R15 | T1-T48 | 14 | T35 verified; native 30m + distinct last/mark/index; T33 remains |
 | R16 | T1-T50 | 14 | T49/T50 verified; T36 deferred; T33 elapsed gates remain |
 | R17 | T1-T62 | 14 | T51-T62 verified; T33 elapsed + T36-T48 remain; Testnet BLOCKED_BY_EXTERNAL_CREDENTIALS |
+| R18 | T1-T62 | 4 | 210 tests; elapsed/Testnet/Live remain external |
 
 ## Reconciliation History
 

@@ -53,7 +53,7 @@ def _map_position_action(
         if state in {
             "LONG_UNWIND", "SHORT_COVERING", "FORCED_DELEVERAGING",
             "SHORT_BUILDING", "NEUTRAL",
-        } or desired in {"FLAT", "SHORT"}:
+        }:
             return "LONG", "CLOSE"
         return None
     if current == "SHORT":
@@ -64,7 +64,7 @@ def _map_position_action(
         if state in {
             "SHORT_COVERING", "LONG_UNWIND", "FORCED_DELEVERAGING",
             "LONG_BUILDING", "NEUTRAL",
-        } or desired in {"FLAT", "LONG"}:
+        }:
             return "SHORT", "CLOSE"
         return None
     return None
@@ -74,7 +74,8 @@ CORE_FUTURES_SOURCES = frozenset(
     {
         "futures_open_interest",
         "futures_funding",
-        "futures_taker_flow",
+        "futures_trade_flow",
+        "futures_taker_ratio",
         "futures_mark_price",
         "futures_index_price",
         "futures_liquidation",
@@ -216,7 +217,7 @@ class SourceFreshness:
 @dataclass(frozen=True)
 class EvidenceVector:
     price: int | None = None
-    spot_flow: int | None = None
+    futures_trade_flow: int | None = None
     cvd: int | None = None
     oi: int | None = None
     funding: int | None = None
@@ -233,14 +234,12 @@ class EvidenceVector:
 @dataclass(frozen=True)
 class PositioningWeights:
     price: Decimal = Decimal("1")
-    spot_flow: Decimal = Decimal("2")
+    futures_trade_flow: Decimal = Decimal("2")
     cvd: Decimal = Decimal("2")
     oi: Decimal = Decimal("1")
-    funding: Decimal = Decimal("0.5")
     taker: Decimal = Decimal("2")
     orderbook: Decimal = Decimal("1")
     liquidation: Decimal = Decimal("1")
-    basis: Decimal = Decimal("0.5")
     relative_strength: Decimal = Decimal("1")
     market_regime: Decimal = Decimal("1")
 
@@ -317,6 +316,9 @@ class MarketFrame:
     spot_buy_volume: Decimal | None = None
     spot_sell_volume: Decimal | None = None
     net_spot_flow: Decimal | None = None
+    futures_buy_volume: Decimal | None = None
+    futures_sell_volume: Decimal | None = None
+    futures_trade_flow: Decimal | None = None
     cvd: Decimal | None = None
     cvd_change: Decimal | None = None
     cvd_1m: Decimal | None = None
@@ -350,9 +352,12 @@ class MarketFrame:
     basis_bps: Decimal | None = None
     global_long_short_ratio: Decimal | None = None
     top_trader_long_short_ratio: Decimal | None = None
-    short_liquidation_notional: Decimal | None = None
-    long_liquidation_notional: Decimal | None = None
+    taker_ratio: Decimal | None = None
+    observed_short_liquidation_notional: Decimal | None = None
+    observed_long_liquidation_notional: Decimal | None = None
+    observed_liquidation_notional: Decimal | None = None
     liquidation_acceleration: Decimal | None = None
+    liquidation_observed: bool | None = None
     bid_depth_5: Decimal | None = None
     ask_depth_5: Decimal | None = None
     bid_depth_10: Decimal | None = None
@@ -392,7 +397,8 @@ class MarketFrame:
         source_timestamps = dict(payload.get("source_timestamps") or {})
         decimal_fields = {
             "bid_price", "ask_price", "quote_volume", "volume",
-            "spot_buy_volume", "spot_sell_volume", "net_spot_flow", "cvd",
+            "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
+            "futures_buy_volume", "futures_sell_volume", "futures_trade_flow", "cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
             "cvd_1h", "cvd_30m", "cvd_acceleration", "volume_ratio_1m",
             "volume_ratio_5m", "volume_ratio_15m", "volume_zscore",
@@ -402,8 +408,11 @@ class MarketFrame:
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
             "oi_change_15m", "oi_change_1h", "oi_change_30m",
             "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
+            "taker_ratio",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
-            "short_liquidation_notional", "long_liquidation_notional",
+            "observed_short_liquidation_notional",
+            "observed_long_liquidation_notional",
+            "observed_liquidation_notional",
             "liquidation_acceleration", "bid_depth_5", "ask_depth_5",
             "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
             "spread_bps", "depth_10bps", "depth_25bps", "depth_50bps",
@@ -486,30 +495,24 @@ class StrategyConfig:
 
         return cls(
             strategy_version=os.environ.get("LEGACY_STRATEGY_VERSION", "momentum-sma-1"),
-            positioning_strategy_version=os.environ.get(
-                "POSITIONING_STRATEGY_VERSION", "positioning-v1"
-            ),
+            positioning_strategy_version=os.environ.get("POSITIONING_STRATEGY_VERSION", "positioning-v1"),
             default_leverage=decimal("DEFAULT_LEVERAGE", Decimal("1")),
             positioning_decision_enabled=os.environ.get(
                 "POSITIONING_DECISION_ENABLED", "false"
             ).strip().lower() in {"1", "true", "yes", "on"},
             minimum_positioning_confidence=decimal(
-                "POSITIONING_MIN_CONFIDENCE", Decimal("0.6")
+                "MIN_POSITIONING_CONFIDENCE", Decimal("0.6")
             ),
-            minimum_positioning_edge=decimal(
-                "POSITIONING_MIN_EDGE", Decimal("0.15")
-            ),
-            minimum_transition_strength=decimal(
-                "POSITIONING_MIN_TRANSITION_STRENGTH", Decimal("0.15")
-            ),
+            minimum_positioning_edge=Decimal("0.15"),
+            minimum_transition_strength=Decimal("0.15"),
             minimum_data_quality=decimal(
-                "POSITIONING_MIN_DATA_QUALITY", Decimal("0.8")
+                "MIN_DATA_QUALITY", Decimal("0.8")
             ),
             maximum_crowding=decimal(
-                "POSITIONING_MAX_CROWDING", Decimal("0.9")
+                "MAX_CROWDING", Decimal("0.9")
             ),
             minimum_liquidity_score=decimal(
-                "POSITIONING_MIN_LIQUIDITY", Decimal("0.4")
+                "MIN_LIQUIDITY_SCORE", Decimal("0.4")
             ),
         )
 
@@ -636,10 +639,11 @@ class StrategyEngine:
         transition = f"{prior}->{state}" if prior and prior != state else "NONE"
         edge = long_score - short_score
         directional_strength = min(Decimal("1"), abs(edge) * quality)
-        transition_strength = (
-            Decimal("0")
-            if prior is None or prior == state
-            else Decimal("1")
+        transition_strength = self._transition_strength(
+            prior,
+            state,
+            long_score=long_score,
+            short_score=short_score,
         )
         confidence = min(
             Decimal("1"),
@@ -682,7 +686,7 @@ class StrategyEngine:
             and prior != state
             and transition_strength < self.config.minimum_transition_strength
         ):
-            reasons.append("TRANSITION_STRENGTH_LOW")
+            reasons.append("STATE_CHANGE_STRENGTH_LOW")
         self._previous_states[frame.symbol.upper()] = state
         snapshot_id = self._snapshot_id(frame, timestamp, evidence)
         return PositioningDecision(
@@ -749,7 +753,8 @@ class StrategyEngine:
         """Persist normalized inputs, never raw exchange payloads, for replay."""
         names = (
             "closes", "bid_price", "ask_price", "quote_volume", "volume",
-            "spot_buy_volume", "spot_sell_volume", "net_spot_flow", "cvd",
+            "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
+            "futures_buy_volume", "futures_sell_volume", "futures_trade_flow", "cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
             "cvd_1h", "cvd_30m", "cvd_acceleration", "price_cvd_divergence",
             "volume_ratio_1m", "volume_ratio_5m", "volume_ratio_15m",
@@ -759,9 +764,13 @@ class StrategyEngine:
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
             "oi_change_15m", "oi_change_1h", "oi_change_30m",
             "funding_rate", "funding_change", "funding_percentile", "funding_zscore",
+            "taker_ratio",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
-            "short_liquidation_notional", "long_liquidation_notional",
+            "observed_short_liquidation_notional",
+            "observed_long_liquidation_notional",
+            "observed_liquidation_notional",
             "liquidation_acceleration", "bid_depth_5", "ask_depth_5",
+            "liquidation_observed",
             "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
             "spread_bps", "depth_10bps", "depth_25bps", "depth_50bps",
             "price_impact_buy", "price_impact_sell", "liquidity_added",
@@ -896,6 +905,7 @@ class StrategyEngine:
         elif not aux_ok:
             reasons.append("AUXILIARY_SPOT_TIMESTAMP_INCONSISTENT")
         core_features = (
+            frame.futures_trade_flow,
             frame.oi_change, frame.funding_rate,
             frame.taker_buy_volume, frame.taker_sell_volume,
             frame.spread_bps, frame.depth_25bps,
@@ -908,14 +918,17 @@ class StrategyEngine:
         )
         if any(value is None for value in auxiliary_features):
             reasons.append("AUXILIARY_SPOT_MISSING")
-        required_timestamp_sources = (
-            "futures_open_interest",
-            "futures_funding",
-            "futures_taker_flow",
-        )
         timestamp_provenance_complete = all(
             source in frame.source_timestamps
-            for source in required_timestamp_sources
+            for source in (
+                "futures_open_interest",
+                "futures_funding",
+                "futures_taker_ratio",
+            )
+        ) and bool(
+            {"futures_trade", "futures_trade_flow"}.intersection(
+                frame.source_timestamps
+            )
         )
         if not timestamp_provenance_complete:
             reasons.append("MISSING_TIMESTAMP_PROVENANCE")
@@ -941,16 +954,21 @@ class StrategyEngine:
         if not timestamp_provenance_complete:
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
         price_signal = _sign(self._price_change(frame))
-        flow_signal = _sign(frame.net_spot_flow)
+        flow_source = "FUTURES"
+        flow_signal = _sign(frame.futures_trade_flow)
         cvd_signal = _sign(frame.cvd_change)
         oi_signal = _sign(frame.oi_change)
-        taker_signal = _sign(self._taker_flow(frame))
+        taker_signal = _sign(
+            frame.taker_ratio - Decimal("1")
+            if frame.taker_ratio is not None
+            else self._taker_flow(frame)
+        )
         funding_signal = _sign(frame.funding_rate)
         basis_signal = _sign(frame.basis_bps)
         orderbook_signal = _sign(self._orderbook_imbalance(frame))
         liquidation_signal = _sign(
-            (frame.short_liquidation_notional or Decimal("0"))
-            - (frame.long_liquidation_notional or Decimal("0"))
+            (frame.observed_short_liquidation_notional or Decimal("0"))
+            - (frame.observed_long_liquidation_notional or Decimal("0"))
         )
         relative_signal = _sign(frame.relative_strength)
         regime_signal = (
@@ -959,9 +977,9 @@ class StrategyEngine:
             else 0
         )
         if _positive(flow_signal):
-            reasons.append("SPOT_BUYING")
+            reasons.append(f"{flow_source}_BUYING")
         elif _negative(flow_signal):
-            reasons.append("SPOT_SELLING")
+            reasons.append(f"{flow_source}_SELLING")
         if _positive(cvd_signal):
             reasons.append("POSITIVE_CVD")
         elif _negative(cvd_signal):
@@ -977,7 +995,7 @@ class StrategyEngine:
         elif _negative(taker_signal):
             reasons.append("TAKER_SELL")
         return EvidenceVector(
-            price=price_signal, spot_flow=flow_signal, cvd=cvd_signal, oi=oi_signal,
+            price=price_signal, futures_trade_flow=flow_signal, cvd=cvd_signal, oi=oi_signal,
             funding=funding_signal, taker=taker_signal, orderbook=orderbook_signal,
             liquidation=liquidation_signal, relative_strength=relative_signal,
             basis=basis_signal, market_regime=regime_signal,
@@ -987,7 +1005,8 @@ class StrategyEngine:
     def _scores(self, evidence: EvidenceVector) -> tuple[Decimal, Decimal]:
         weights = self.config.positioning_weights
         values = (
-            (evidence.price, weights.price), (evidence.spot_flow, weights.spot_flow),
+            (evidence.price, weights.price),
+            (evidence.futures_trade_flow, weights.futures_trade_flow),
             (evidence.cvd, weights.cvd), (evidence.oi, weights.oi),
             (evidence.taker, weights.taker), (evidence.orderbook, weights.orderbook),
             (evidence.liquidation, weights.liquidation),
@@ -1001,6 +1020,40 @@ class StrategyEngine:
             sum(weight for value, weight in present if value < 0) / total,
         )
 
+    @staticmethod
+    def _transition_strength(
+        previous: PositioningState | None,
+        current: PositioningState,
+        *,
+        long_score: Decimal,
+        short_score: Decimal,
+    ) -> Decimal:
+        """Measure state-change magnitude continuously in the [0, 1] range."""
+        if previous is None or previous == current:
+            return Decimal("0")
+        edge = abs(long_score - short_score)
+        long_states = {
+            "LONG_BUILDING", "SHORT_COVERING", "ABSORPTION_LONG", "EXHAUSTION_LONG",
+        }
+        short_states = {
+            "SHORT_BUILDING", "LONG_UNWIND", "ABSORPTION_SHORT", "EXHAUSTION_SHORT",
+        }
+        previous_bias = 1 if previous in long_states else -1 if previous in short_states else 0
+        current_bias = 1 if current in long_states else -1 if current in short_states else 0
+        if previous_bias and current_bias and previous_bias != current_bias:
+            state_delta = Decimal("0.50")
+        elif previous_bias != current_bias:
+            state_delta = Decimal("0.15")
+        elif previous in {"LONG_BUILDING", "SHORT_BUILDING"} and current in {
+            "LONG_UNWIND", "SHORT_COVERING", "EXHAUSTION_LONG", "EXHAUSTION_SHORT",
+        }:
+            state_delta = Decimal("0.35")
+        elif current in {"LONG_UNWIND", "SHORT_COVERING", "EXHAUSTION_LONG", "EXHAUSTION_SHORT"}:
+            state_delta = Decimal("0.25")
+        else:
+            state_delta = Decimal("0.15")
+        return min(Decimal("1"), edge * Decimal("0.50") + state_delta)
+
     def _state(
         self, frame: MarketFrame, evidence: EvidenceVector,
         crowding: Decimal, quality: Decimal,
@@ -1013,7 +1066,7 @@ class StrategyEngine:
         ):
             return "FORCED_DELEVERAGING"
         price, oi = evidence.price, evidence.oi
-        flow, taker, cvd = evidence.spot_flow, evidence.taker, evidence.cvd
+        flow, taker, cvd = evidence.futures_trade_flow, evidence.taker, evidence.cvd
         if frame.price_cvd_divergence and price is not None and cvd is not None and price != cvd:
             return "CONFLICTED"
         positive = sum(_positive(value) for value in (price, flow, cvd, taker))

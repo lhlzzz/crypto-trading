@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
+from uuid import UUID, uuid4
 
 from engine import Direction, MarketFrame, PositioningDecision, StrategyConfig, StrategyEngine
+from execution import ExecutionConfig, MarketSnapshot, PaperExecutor
+from risk import RiskGate, RiskLimits
+from trade_intent import TradeIntent
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,11 @@ class BacktestResult:
     average_holding_time_minutes: Decimal
     fees: Decimal
     slippage: Decimal
+    funding: Decimal = Decimal("0")
+    gross_return: Decimal = Decimal("0")
+    net_return: Decimal = Decimal("0")
+    mfe: Decimal = Decimal("0")
+    mae: Decimal = Decimal("0")
 
     def as_dict(self) -> dict[str, str | int]:
         return {
@@ -50,6 +59,11 @@ class BacktestResult:
             "average_holding_time_minutes": str(self.average_holding_time_minutes),
             "fees": str(self.fees),
             "slippage": str(self.slippage),
+            "funding": str(self.funding),
+            "gross_return": str(self.gross_return),
+            "net_return": str(self.net_return),
+            "mfe": str(self.mfe),
+            "mae": str(self.mae),
         }
 
 
@@ -111,6 +125,138 @@ class PositioningReplayResult:
             "by_state": render(self.by_state),
             "by_transition": render(self.by_transition),
         }
+
+
+class _BacktestStore:
+    """Ephemeral research ledger consumed by the shared PaperExecutor.
+
+    This store never persists or talks to an exchange. Trading facts remain
+    owned by TradingStore in runtime paths; the ledger only lets a backtest
+    exercise the exact paper execution contract without a database.
+    """
+
+    def __init__(self, initial_cash: Decimal) -> None:
+        self.orders: dict[UUID, dict[str, Any]] = {}
+        self.positions: dict[str, dict[str, Any]] = {}
+        self.balances: dict[str, dict[str, Any]] = {}
+        self.trades: list[dict[str, Any]] = []
+        self.funding_entries: list[Decimal] = []
+        self.events: list[dict[str, Any]] = []
+        self.halted = False
+        self.upsert_balance(
+            "USDT",
+            free=initial_cash,
+            locked=Decimal("0"),
+            wallet_balance=initial_cash,
+            available_balance=initial_cash,
+            margin_balance=initial_cash,
+            used_margin=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            mode="paper",
+            payload={"source": "backtest"},
+        )
+
+    def initialize(self) -> None:
+        return None
+
+    def is_halted(self) -> bool:
+        return self.halted
+
+    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+        self.halted = halted
+        self.events.append({"event_type": "HALT", "reason": reason, "source": source})
+
+    def record_system_event(self, **fields: Any) -> UUID:
+        self.events.append(fields)
+        return uuid4()
+
+    def record_risk_event(self, **fields: Any) -> UUID:
+        self.events.append(fields)
+        return uuid4()
+
+    def record_intent(self, intent: TradeIntent, *, status: str = "CREATED") -> None:
+        del intent, status
+
+    def create_order(self, intent: TradeIntent, *, mode: str, status: str, **fields: Any) -> UUID:
+        order_id = uuid4()
+        self.orders[order_id] = {
+            "order_id": order_id,
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "client_order_id": intent.client_order_id,
+            "quantity": intent.quantity,
+            "price": intent.price,
+            "executed_quantity": Decimal("0"),
+            "status": status,
+            "mode": mode,
+            "order_type": intent.order_type,
+            "position_side": intent.direction,
+            "position_action": intent.action,
+            "reduce_only": intent.reduce_only,
+            "leverage": intent.leverage,
+            "intent": intent,
+            **fields,
+        }
+        return order_id
+
+    def update_order(self, order_id: UUID, *, status: str, **fields: Any) -> None:
+        self.orders[order_id].update({"status": status, **fields})
+
+    def append_order_event(self, order_id: UUID, **fields: Any) -> None:
+        self.events.append({"order_id": order_id, **fields})
+
+    def get_order(self, order_id: UUID) -> dict[str, Any] | None:
+        return self.orders.get(order_id)
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+        return next(
+            (row for row in self.orders.values() if row["client_order_id"] == client_order_id),
+            None,
+        )
+
+    def list_open_local_orders(self) -> list[dict[str, Any]]:
+        return [
+            row for row in self.orders.values()
+            if row["status"] in {
+                "CREATED", "RISK_APPROVED", "SUBMITTED", "ACKNOWLEDGED",
+                "PARTIALLY_FILLED", "UNKNOWN",
+            }
+        ]
+
+    def record_trade(self, order_id: UUID, **fields: Any) -> UUID:
+        trade_id = uuid4()
+        self.trades.append({"trade_id": trade_id, "order_id": order_id, **fields})
+        return trade_id
+
+    def upsert_position(self, symbol: str, **fields: Any) -> None:
+        self.positions[symbol.upper()] = {"symbol": symbol.upper(), **fields}
+
+    def get_position(self, symbol: str, **_: Any) -> dict[str, Any] | None:
+        return self.positions.get(symbol.upper())
+
+    def upsert_balance(self, asset: str, **fields: Any) -> None:
+        self.balances[asset.upper()] = {"asset": asset.upper(), **fields}
+
+    def get_balance(self, asset: str) -> dict[str, Any] | None:
+        return self.balances.get(asset.upper())
+
+
+def _metric_from_returns(values: list[Decimal]) -> tuple[Decimal, Decimal, Decimal]:
+    if not values:
+        return Decimal("0"), Decimal("0"), Decimal("0")
+    mean = sum(values, Decimal("0")) / Decimal(len(values))
+    variance = sum((value - mean) ** 2 for value in values) / Decimal(len(values))
+    stddev = variance.sqrt() if variance > 0 else Decimal("0")
+    downside = [value for value in values if value < 0]
+    downside_stddev = (
+        (sum(value * value for value in downside) / Decimal(len(downside))).sqrt()
+        if downside else Decimal("0")
+    )
+    return (
+        mean / stddev if stddev else Decimal("0"),
+        mean / downside_stddev if downside_stddev else Decimal("0"),
+        mean,
+    )
 
 
 def _direction_from_signal(signal: object | None) -> Direction:
@@ -279,110 +425,241 @@ def replay_positioning_frames(
 def run_backtest(
     closes: Iterable[Decimal | str | float],
     *,
+    timestamps: Iterable[datetime] | None = None,
+    frames: Iterable[MarketFrame] | None = None,
     symbol: str = "BTCUSDT",
     initial_cash: Decimal = Decimal("1000"),
     fee_rate: Decimal = Decimal("0.001"),
     slippage_bps: Decimal = Decimal("5"),
     engine: StrategyEngine | None = None,
 ) -> BacktestResult:
-    """Run research only; no database, broker, or order side effects."""
+    """Replay historical Futures evidence through the shared paper contract.
 
-    try:
-        import pandas as pd
-        import vectorbt as vbt
-    except ImportError as exc:
-        raise RuntimeError("vectorbt is required for backtesting") from exc
-
-    values = [Decimal(str(value)) for value in closes]
-    if len(values) < 2 or any(value <= 0 for value in values):
-        raise ValueError("backtesting requires at least two positive closes")
-    strategy = engine or StrategyEngine()
-    index = pd.date_range(
-        end=datetime.now(timezone.utc), periods=len(values), freq="min"
-    )
-    entries: list[bool] = []
-    exits: list[bool] = []
-    for position in range(len(values)):
-        frame = MarketFrame(
-            symbol=symbol,
-            closes=tuple(values[: position + 1]),
-            captured_at=index[position].to_pydatetime(),
-        )
-        signal = strategy.signal(frame)
-        entries.append(signal is not None and signal.side == "BUY")
-        exits.append(signal is not None and signal.side == "SELL")
-
-    close_series = pd.Series([float(value) for value in values], index=index)
-    portfolio = vbt.Portfolio.from_signals(
-        close_series,
-        entries=pd.Series(entries, index=index),
-        exits=pd.Series(exits, index=index),
-        init_cash=float(initial_cash),
-        fees=float(fee_rate),
-        slippage=float(slippage_bps / Decimal("10000")),
-        freq="1min",
-    )
-    no_slippage = vbt.Portfolio.from_signals(
-        close_series,
-        entries=pd.Series(entries, index=index),
-        exits=pd.Series(exits, index=index),
-        init_cash=float(initial_cash),
-        fees=float(fee_rate),
-        slippage=0.0,
-        freq="1min",
-    )
-    stats = portfolio.stats()
-    final_value = Decimal(str(portfolio.value().iloc[-1]))
-    total_return = final_value / initial_cash - Decimal("1")
-    max_drawdown = abs(Decimal(str(stats.get("Max Drawdown [%]", 0))) / Decimal("100"))
-    trades = int(stats.get("Total Trades", 0))
-    raw_win_rate = Decimal(str(stats.get("Win Rate [%]", 0)))
-    win_rate = (
-        Decimal("0")
-        if not raw_win_rate.is_finite()
-        else raw_win_rate / Decimal("100")
-    )
-    raw_loss_rate = Decimal(str(stats.get("Loss Rate [%]", 0)))
-    loss_rate = (
-        Decimal("0")
-        if not raw_loss_rate.is_finite()
-        else raw_loss_rate / Decimal("100")
-    )
-
-    def metric(name: str, *, percent: bool = False) -> Decimal:
-        value = Decimal(str(stats.get(name, 0)))
-        if not value.is_finite():
-            return Decimal("0")
-        return value / Decimal("100") if percent else value
-
-    records = portfolio.trades.records
-    if len(records) == 0:
-        average_holding_minutes = Decimal("0")
+    ``frames`` is the preferred input. The close-only form remains available
+    for the SMA research baseline, but it intentionally produces no
+    positioning order because missing Futures evidence fails closed.
+    """
+    if initial_cash <= 0:
+        raise ValueError("initial_cash must be positive")
+    if frames is not None:
+        historical_frames = list(frames)
+        if not historical_frames:
+            raise ValueError("frames must contain at least one historical frame")
+        values = [Decimal(str(frame.last_price or frame.closes[-1])) for frame in historical_frames]
+        historical_times = [frame.captured_at for frame in historical_frames]
+        if any(frame.symbol.upper() != symbol.upper() for frame in historical_frames):
+            raise ValueError("all frames must use the requested symbol")
     else:
-        durations = [
-            Decimal(str(int(row.exit_idx) - int(row.entry_idx)))
-            for row in records.itertuples(index=False)
+        values = [Decimal(str(value)) for value in closes]
+        if len(values) < 2 or any(value <= 0 for value in values):
+            raise ValueError("backtesting requires at least two positive closes")
+        if timestamps is None:
+            raise ValueError("backtesting requires historical observation timestamps")
+        historical_times = list(timestamps)
+        if len(historical_times) != len(values):
+            raise ValueError("timestamps must align one-to-one with closes")
+        historical_frames = [
+            MarketFrame(
+                symbol=symbol,
+                closes=tuple(values[: position + 1]),
+                captured_at=historical_times[position],
+            )
+            for position in range(len(values))
         ]
-        average_holding_minutes = sum(durations, Decimal("0")) / Decimal(str(len(durations)))
+    if any(timestamp.tzinfo is None for timestamp in historical_times):
+        raise ValueError("historical timestamps must be timezone-aware")
+    if any(current < previous for previous, current in zip(historical_times, historical_times[1:])):
+        raise ValueError("historical timestamps must be chronological")
+
+    strategy = engine or StrategyEngine()
+    store = _BacktestStore(initial_cash)
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(
+            mode="paper",
+            fee_rate=fee_rate,
+            slippage_bps=slippage_bps,
+            default_leverage=(
+                strategy.config.default_leverage
+                if isinstance(strategy, StrategyEngine)
+                else Decimal("1")
+            ),
+        ),
+    )
+    risk_gate = RiskGate(limits=RiskLimits.from_env())
+    from paper_runner import _risk_context
+
+    previous_state = None
+    equity_curve: list[Decimal] = []
+    holding_minutes: list[Decimal] = []
+    mfe_values: list[Decimal] = []
+    mae_values: list[Decimal] = []
+    active_start: datetime | None = None
+    active_direction: str | None = None
+    active_entry = Decimal("0")
+    active_mfe = Decimal("0")
+    active_mae = Decimal("0")
+    max_exposure = Decimal("0")
+
+    for frame in historical_frames:
+        # Keep the baseline strategy observable, but never turn BUY/SELL into
+        # an alternative inventory model for the Futures backtest.
+        if hasattr(strategy, "signal"):
+            strategy.signal(frame)
+        decision = None
+        intent = None
+        if isinstance(strategy, StrategyEngine):
+            decision = strategy.positioning_decision(
+                frame,
+                now=frame.captured_at,
+                previous_state=previous_state,
+            )
+            previous_state = decision.state
+            current = store.get_position(symbol)
+            from engine import CurrentPosition
+
+            current_position = CurrentPosition(
+                direction=str((current or {}).get("position_side") or "FLAT"),  # type: ignore[arg-type]
+                quantity=Decimal(str((current or {}).get("quantity") or "0")),
+                entry_price=(
+                    Decimal(str((current or {}).get("entry_price")))
+                    if (current or {}).get("entry_price") is not None else None
+                ),
+            )
+            intent = strategy._intent_from_positioning(
+                decision, frame, current_position=current_position
+            )
+        market = MarketSnapshot(
+            last_price=values[len(equity_curve)],
+            mark_price=frame.mark_price or values[len(equity_curve)],
+            index_price=frame.index_price,
+            bid_price=frame.bid_price,
+            ask_price=frame.ask_price,
+            available_liquidity=frame.depth_25bps,
+            funding_rate=frame.funding_rate,
+            funding_timestamp=frame.captured_at if frame.funding_rate is not None else None,
+        )
+        current_before = store.get_position(symbol)
+        if current_before and Decimal(str(current_before.get("quantity") or "0")) > 0:
+            if active_start is None:
+                active_start = frame.captured_at
+                active_direction = str(current_before.get("position_side") or "LONG")
+                active_entry = Decimal(str(current_before.get("entry_price") or "0"))
+            if active_entry > 0:
+                excursion = (
+                    (market.mark_price - active_entry) / active_entry
+                    if active_direction == "LONG"
+                    else (active_entry - market.mark_price) / active_entry
+                )
+                active_mfe = max(active_mfe, excursion)
+                active_mae = min(active_mae, excursion)
+        if intent is not None and not store.is_halted():
+            context = _risk_context(store, intent, market, executor=executor)
+            risk_decision = risk_gate.evaluate(intent, context)
+            if risk_decision.executable_intent is not None:
+                executor.submit(intent, risk_decision, market=market)
+        if frame.funding_rate is not None and not store.is_halted():
+            executor.apply_funding(symbol, market)
+        if not store.is_halted():
+            executor.mark_to_market(symbol, market.mark_price or market.last_price)
+        current_after = store.get_position(symbol)
+        after_quantity = Decimal(str((current_after or {}).get("quantity") or "0"))
+        if after_quantity > 0 and active_start is None:
+            active_start = frame.captured_at
+            active_direction = str((current_after or {}).get("position_side") or "LONG")
+            active_entry = Decimal(str((current_after or {}).get("entry_price") or "0"))
+        if after_quantity > 0 and active_entry > 0:
+            excursion = (
+                (market.mark_price - active_entry) / active_entry
+                if active_direction == "LONG"
+                else (active_entry - market.mark_price) / active_entry
+            )
+            active_mfe = max(active_mfe, excursion)
+            active_mae = min(active_mae, excursion)
+            max_exposure = max(
+                max_exposure,
+                after_quantity * market.mark_price / initial_cash,
+            )
+        elif active_start is not None:
+            holding_minutes.append(
+                Decimal(str((frame.captured_at - active_start).total_seconds() / 60))
+            )
+            mfe_values.append(active_mfe)
+            mae_values.append(active_mae)
+            active_start = None
+            active_direction = None
+            active_entry = Decimal("0")
+            active_mfe = Decimal("0")
+            active_mae = Decimal("0")
+        equity_curve.append(executor.account_state()["equity"])
+
+    final_value = equity_curve[-1] if equity_curve else initial_cash
+    net_return = final_value / initial_cash - Decimal("1")
+    fees = sum(
+        (Decimal(str(trade.get("fee") or "0")) for trade in store.trades),
+        Decimal("0"),
+    )
+    slippage = sum(
+        (
+            abs(Decimal(str((trade.get("payload") or {}).get("slippage") or "0")))
+            for trade in store.trades
+        ),
+        Decimal("0"),
+    )
+    funding = -executor.account_state()["funding_pnl"]
+    gross_return = (final_value + fees + slippage + funding) / initial_cash - Decimal("1")
+    returns = [
+        (current / previous - Decimal("1"))
+        for previous, current in zip(equity_curve, equity_curve[1:])
+        if previous > 0
+    ]
+    sharpe, sortino, period_expectancy = _metric_from_returns(returns)
+    peak = initial_cash
+    max_drawdown = Decimal("0")
+    for value in equity_curve:
+        peak = max(peak, value)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - value) / peak)
+    closing_trades = [
+        trade for trade in store.trades
+        if (trade.get("payload") or {}).get("action") in {"REDUCE", "CLOSE"}
+    ]
+    outcomes = [Decimal(str(trade.get("realized_pnl") or "0")) for trade in closing_trades]
+    wins = [value for value in outcomes if value > 0]
+    losses = [value for value in outcomes if value < 0]
+    gross_profit = sum(wins, Decimal("0"))
+    gross_loss = abs(sum(losses, Decimal("0")))
+    average_win = sum(wins, Decimal("0")) / Decimal(len(wins)) if wins else Decimal("0")
+    average_loss = sum(losses, Decimal("0")) / Decimal(len(losses)) if losses else Decimal("0")
+    expectancy = (
+        sum(outcomes, Decimal("0")) / Decimal(len(outcomes)) / initial_cash
+        if outcomes else period_expectancy
+    )
     return BacktestResult(
-        symbol=symbol,
+        symbol=symbol.upper(),
         initial_cash=initial_cash,
         final_value=final_value,
-        total_return=total_return,
+        total_return=net_return,
         max_drawdown=max_drawdown,
-        total_trades=trades,
-        win_rate=win_rate,
-        loss_rate=loss_rate,
-        profit_factor=metric("Profit Factor"),
-        expectancy=metric("Expectancy"),
-        average_win=metric("Avg Winning Trade [%]", percent=True),
-        average_loss=metric("Avg Losing Trade [%]", percent=True),
-        sharpe=metric("Sharpe Ratio"),
-        sortino=metric("Sortino Ratio"),
-        exposure=metric("Max Gross Exposure [%]", percent=True),
-        average_holding_time_minutes=average_holding_minutes,
-        fees=Decimal(str(stats.get("Total Fees Paid", 0))),
-        slippage=abs(
-            Decimal(str(no_slippage.value().iloc[-1])) - final_value
+        total_trades=len(store.trades),
+        win_rate=Decimal(len(wins)) / Decimal(len(outcomes)) if outcomes else Decimal("0"),
+        loss_rate=Decimal(len(losses)) / Decimal(len(outcomes)) if outcomes else Decimal("0"),
+        profit_factor=gross_profit / gross_loss if gross_loss else Decimal("0"),
+        expectancy=expectancy,
+        average_win=average_win,
+        average_loss=average_loss,
+        sharpe=sharpe,
+        sortino=sortino,
+        exposure=max_exposure,
+        average_holding_time_minutes=(
+            sum(holding_minutes, Decimal("0")) / Decimal(len(holding_minutes))
+            if holding_minutes else Decimal("0")
         ),
+        fees=fees,
+        slippage=slippage,
+        funding=funding,
+        gross_return=gross_return,
+        net_return=net_return,
+        mfe=(sum(mfe_values, Decimal("0")) / Decimal(len(mfe_values)) if mfe_values else Decimal("0")),
+        mae=(sum(mae_values, Decimal("0")) / Decimal(len(mae_values)) if mae_values else Decimal("0")),
     )

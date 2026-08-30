@@ -19,3 +19,9 @@
   or copied third-party trading frameworks.
 - User Data Stream is isolated from public market streams and cannot override
   REST reconciliation as final truth.
+- `runtime_gate.py` owns the canonical readiness result. Its `live_allowed`
+  field is false until the externally verified release gates pass.
+- Futures public observation is primary; Spot is confirmation-only and has no
+  private trading or account authority.
+- Unknown, stale, future, or timestamp-inconsistent evidence is fail-closed
+  and cannot create a CLOSE action.

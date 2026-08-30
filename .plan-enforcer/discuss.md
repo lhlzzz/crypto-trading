@@ -11,7 +11,8 @@ runtime configuration, validation, and version management. Preserve bian as
 Binance public market data only; do not import A-share strategy logic.
 
 ## Non-Negotiables
-- NN1: Binance remains `PUBLIC_READ_ONLY / NO_TRADE`.
+- NN1: Binance public observation remains read-only; Futures trading is gated
+  by the canonical runtime result.
 - NN2: No Polymarket data, order creation, wallet access, or trading paths.
 - NN3: PostgreSQL remains the sole bian data authority.
 - NN4: Financial OS remains the browser/UI owner.

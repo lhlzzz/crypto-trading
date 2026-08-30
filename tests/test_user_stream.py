@@ -66,6 +66,11 @@ def test_spot_events_are_malformed_not_accepted() -> None:
     assert event.event_type == "malformed"
 
 
+def test_unknown_user_events_are_malformed_not_accepted() -> None:
+    event = normalize_user_event({"e": "unknownAccountEvent", "s": "BTCUSDT"})
+    assert event.event_type == "malformed"
+
+
 def test_malformed_event_does_not_raise() -> None:
     event = normalize_user_event("not-json")
     assert event.event_type == "malformed"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import os
 import time
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from typing import Any
 
 from backtesting import replay_positioning_frames
 from engine import CurrentPosition, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
-from binance_client import ClientConfig, PublicClient
+from binance_client import ClientConfig, FuturesPublicClient
 from execution import (
     BinanceExecutor,
     ExecutionConfig,
@@ -22,6 +23,7 @@ from execution import (
 )
 from reconciliation import Reconciler, apply_user_stream_event
 from risk import ExchangeRules, RiskContext, RiskGate, RiskLimits
+from runtime_gate import GateResult, evaluate_runtime_gate
 from scripts import bian_market
 from trade_intent import TradeIntent
 from trading_store import TradingStore
@@ -132,7 +134,7 @@ def _market_frame(
         str(report.get("received_timestamp", report["captured_at"]))
     )
     freshness = SourceFreshness(
-        source="binance_spot_klines",
+        source="binance_futures_klines",
         source_timestamp=source_timestamp,
         received_timestamp=received_timestamp,
         max_age_sec=int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")),
@@ -153,7 +155,7 @@ def _market_frame(
         }
     })
     source_timestamps = {
-        "spot_klines": {
+        "futures_klines": {
             "source_timestamp": source_timestamp.isoformat(),
             "received_timestamp": received_timestamp.isoformat(),
             "latency_ms": int((received_timestamp - source_timestamp).total_seconds() * 1000),
@@ -163,7 +165,7 @@ def _market_frame(
     }
     source_freshness = [freshness]
     for source, timestamps in source_timestamps.items():
-        if source == "spot_klines":
+        if source == "futures_klines":
             continue
         source_at = datetime.fromisoformat(str(timestamps["source_timestamp"]))
         received_at = datetime.fromisoformat(str(timestamps["received_timestamp"]))
@@ -364,7 +366,7 @@ def _risk_context(
     intent: TradeIntent,
     market: MarketSnapshot,
     *,
-    public_client: PublicClient | None = None,
+    public_client: FuturesPublicClient | None = None,
     executor: Executor | None = None,
 ) -> RiskContext:
     if executor is not None and hasattr(executor, "account_state"):
@@ -402,6 +404,23 @@ def _risk_context(
             tick_size=Decimal(raw_rules["tick_size"]),
             min_notional=Decimal(raw_rules["min_notional"]),
         )
+    liquidation_price = (
+        Decimal(str(position["liquidation_price"]))
+        if position.get("liquidation_price") is not None
+        else None
+    )
+    if (
+        liquidation_price is None
+        and intent.action == "OPEN"
+        and direction == "FLAT"
+        and isinstance(executor, PaperExecutor)
+    ):
+        liquidation_price = executor.liquidation_price_for(
+            intent.symbol,
+            intent.direction,
+            mark,
+            intent.leverage,
+        )
     return RiskContext(
         wallet_balance=Decimal(str(account.get("wallet_balance") or "0")),
         available_balance=Decimal(str(account.get("available_balance") or "0")),
@@ -420,15 +439,20 @@ def _risk_context(
         unrealized_pnl=Decimal(str(account.get("unrealized_pnl") or position.get("unrealized_pnl") or "0")),
         realized_pnl=Decimal(str(account.get("realized_pnl") or position.get("realized_pnl") or "0")),
         funding_pnl=Decimal(str(account.get("funding_pnl") or position.get("funding_pnl") or "0")),
-        leverage=intent.leverage,
-        margin_type="ISOLATED",
-        position_mode="ONE_WAY",
-        liquidation_price=(
-            Decimal(str(position["liquidation_price"]))
-            if position.get("liquidation_price") is not None
+        leverage=Decimal(str(position.get("leverage") or intent.leverage)),
+        account_leverage=(
+            Decimal(str(position["leverage"]))
+            if position.get("leverage") is not None
             else None
         ),
-        liquidation_distance_percent=Decimal("50"),
+        margin_type="ISOLATED",
+        position_mode="ONE_WAY",
+        liquidation_price=liquidation_price,
+        liquidation_distance_percent=(
+            abs(mark - liquidation_price) / mark * Decimal("100")
+            if mark > 0 and liquidation_price is not None
+            else None
+        ),
         exchange_rules=rules,
         positioning_confidence=intent.confidence,
         crowding_score=intent.crowding_score,
@@ -446,10 +470,19 @@ def run_cycle(
     engine: StrategyEngine | None = None,
     risk_gate: RiskGate | None = None,
     executor: Executor | None = None,
-    public_client: PublicClient | None = None,
+    public_client: FuturesPublicClient | None = None,
     mode: str = "paper",
+    runtime_gate: GateResult | None = None,
 ) -> dict[str, Any]:
     """Run one cycle through the shared strategy, risk, and executor path."""
+    if mode != "paper":
+        if runtime_gate is None:
+            raise RuntimeError("non-paper cycles require the canonical runtime gate")
+        if not runtime_gate.trading_enabled:
+            raise RuntimeError(
+                "canonical runtime gate blocks trading: "
+                + "; ".join(runtime_gate.reasons)
+            )
     store = store or TradingStore()
     engine = engine or StrategyEngine(StrategyConfig.from_env())
     risk_gate = risk_gate or RiskGate(limits=RiskLimits.from_env())
@@ -473,6 +506,10 @@ def run_cycle(
     except TypeError:
         intent = injected_intent or evaluate(frame)
     if intent is None:
+        if isinstance(executor, PaperExecutor):
+            if market.funding_rate is not None:
+                executor.apply_funding(symbol, market)
+            executor.mark_to_market(symbol, market.mark_price or market.last_price)
         store.record_system_event(
             event_type="NO_SIGNAL",
             severity="INFO",
@@ -524,6 +561,10 @@ def run_cycle(
         ),
     )
     result = executor.submit(intent, decision, market=market)
+    if isinstance(executor, PaperExecutor):
+        if market.funding_rate is not None:
+            executor.apply_funding(symbol, market)
+        executor.mark_to_market(symbol, market.mark_price or market.last_price)
     store.update_intent_status(intent.id, result.status)
     return {
         "status": result.status.lower(),
@@ -539,48 +580,65 @@ def run_cycle(
 
 
 def _assert_account_risk_config(client: Any) -> None:
-    """Read-only account risk preflight. Never changes leverage/margin/position mode."""
-    raw_mode = client.get_position_mode()
-    dual = str(raw_mode.get("dualSidePosition", "")).lower()
-    actual_mode = "HEDGE" if dual in {"true", "1"} else "ONE_WAY"
-    if actual_mode != "ONE_WAY":
-        raise SystemExit(f"position mode mismatch: {actual_mode}")
-    symbols = _symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT"))
-    margin = client.get_margin_type(symbols[0])
-    actual_margin = str(margin.get("marginType") or "").upper()
-    if actual_margin and actual_margin != "ISOLATED":
-        raise SystemExit(f"margin mode mismatch: {actual_margin}")
+    """Compatibility wrapper for callers that still expect a preflight check."""
+    gate = evaluate_runtime_gate(
+        mode=os.environ.get("BIAN_MODE", "testnet"),
+        client=client,
+        symbols=_symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT")),
+        probe_account=True,
+    )
+    if not gate.account_mode_ok or not gate.margin_mode_ok:
+        raise SystemExit("runtime gate blocked account configuration: " + "; ".join(gate.reasons))
 
 
-def _startup_recovery(mode: str, store: TradingStore) -> None:
+def _startup_recovery(mode: str, store: TradingStore) -> GateResult:
+    if mode == "live" and os.environ.get("BIAN_MARKET", "").strip().upper() != "FUTURES":
+        raise SystemExit("live mode requires BIAN_MARKET=FUTURES")
     if mode == "live":
-        if os.environ.get("BIAN_MARKET", "").strip().upper() != "FUTURES":
-            raise SystemExit("live mode requires BIAN_MARKET=FUTURES")
-        if os.environ.get("POSITIONING_DECISION_ENABLED", "false").strip().lower() not in {
-            "1", "true", "yes", "on",
-        }:
-            raise SystemExit("live mode requires POSITIONING_DECISION_ENABLED=true")
-        if os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() != "true":
-            raise SystemExit("live mode requires LIVE_TRADING_ENABLED=true")
         expected = os.environ.get("LIVE_CONFIRMATION_TOKEN")
         confirmed = os.environ.get("BIAN_LIVE_CONFIRMATION")
         if not expected or confirmed != expected:
             raise SystemExit("live mode requires explicit confirmation token")
-        if os.environ.get("FUTURES_POSITION_MODE", "ONE_WAY").strip().upper() != "ONE_WAY":
-            raise SystemExit("live mode requires FUTURES_POSITION_MODE=ONE_WAY")
-        if os.environ.get("FUTURES_MARGIN_MODE", "ISOLATED").strip().upper() != "ISOLATED":
-            raise SystemExit("live mode requires FUTURES_MARGIN_MODE=ISOLATED")
     store.initialize()
+    symbols = _symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT"))
+    client = None
+    if mode != "paper":
+        from binance_client import FuturesPrivateClient
+
+        # The client constructor enforces mode-specific credentials and live
+        # configuration before any authenticated request can be attempted.
+        client = FuturesPrivateClient(ClientConfig.from_env(mode))
+    preflight = evaluate_runtime_gate(
+        mode=mode,
+        store=store,
+        client=client,
+        symbols=symbols,
+        probe_account=mode != "paper",
+    )
+    if mode == "live" and not preflight.confirmation_ok:
+        raise SystemExit("runtime gate blocked live confirmation")
+    if not preflight.credentials_ok or not preflight.account_reachable and mode != "paper":
+        raise SystemExit("runtime gate blocked startup: " + "; ".join(preflight.reasons))
     if mode == "paper":
         result = Reconciler(store, mode=mode).recover()
     else:
-        from binance_client import FuturesPrivateClient
-
-        client = FuturesPrivateClient(ClientConfig.from_env())
-        _assert_account_risk_config(client)
+        assert client is not None
         result = Reconciler(store, client=client, mode=mode).recover()
     if not result.safe_to_trade:
         raise SystemExit(f"startup reconciliation blocked trading: {result.status}")
+    if mode in {"testnet", "live"} and not preflight.trading_enabled:
+        raise SystemExit("runtime gate blocked startup: " + "; ".join(preflight.reasons))
+    gate = replace(preflight, reconciliation_ok=result.safe_to_trade)
+    if not result.safe_to_trade:
+        gate = replace(
+            gate,
+            reasons=tuple(dict.fromkeys((*gate.reasons, "RECONCILIATION_NOT_VERIFIED"))),
+        )
+    if mode == "live" and not gate.live_allowed:
+        raise SystemExit("runtime gate hard-blocked live: " + "; ".join(gate.reasons))
+    if mode == "testnet" and not gate.data_health_ok:
+        raise SystemExit("runtime gate blocked testnet data health")
+    return gate
 
 
 async def _run_private_forever(
@@ -589,7 +647,8 @@ async def _run_private_forever(
     mode: str,
     store: TradingStore,
     executor: Executor,
-    public_client: PublicClient,
+    public_client: FuturesPublicClient,
+    runtime_gate: GateResult,
 ) -> None:
     from user_stream import UserStreamClient
 
@@ -599,7 +658,7 @@ async def _run_private_forever(
         mode=mode,
     )
     stream = UserStreamClient(
-        ClientConfig.from_env(),
+        ClientConfig.from_env(mode),
         on_event=lambda event: apply_user_stream_event(store, event),
         on_reconcile=lambda: reconciler.recover(),
     )
@@ -616,6 +675,7 @@ async def _run_private_forever(
                         executor=executor,
                         public_client=public_client,
                         mode=mode,
+                        runtime_gate=runtime_gate,
                     )
                     print(result, flush=True)
                 except Exception as exc:
@@ -633,11 +693,13 @@ def run_forever(symbols: list[str], *, mode: str | None = None) -> None:
     if resolved_mode not in {"paper", "testnet", "live"}:
         raise SystemExit("BIAN_MODE must be paper, testnet, or live")
     store = TradingStore()
-    _startup_recovery(resolved_mode, store)
-    public_client = PublicClient(ClientConfig.from_env())
+    runtime_gate = _startup_recovery(resolved_mode, store)
+    client_config = ClientConfig.from_env(resolved_mode)
+    public_client = FuturesPublicClient(client_config)
     executor = executor_from_env(
         store=store,
         config=ExecutionConfig.from_env(mode=resolved_mode),
+        client_config=client_config,
     )
     if resolved_mode == "paper":
         interval = max(1, int(os.environ.get("BIAN_PAPER_POLL_SEC", "60")))
@@ -651,6 +713,7 @@ def run_forever(symbols: list[str], *, mode: str | None = None) -> None:
                             executor=executor,
                             public_client=public_client,
                             mode=resolved_mode,
+                            runtime_gate=runtime_gate,
                         ),
                         flush=True,
                     )
@@ -665,6 +728,7 @@ def run_forever(symbols: list[str], *, mode: str | None = None) -> None:
             store=store,
             executor=executor,
             public_client=public_client,
+            runtime_gate=runtime_gate,
         )
     )
 
@@ -734,8 +798,27 @@ def main(argv: list[str] | None = None) -> int:
         run_shadow_forever(symbols)
         return 0
     if args.once:
+        store = TradingStore()
+        runtime_gate = _startup_recovery(args.mode, store)
+        client_config = ClientConfig.from_env(args.mode)
+        public_client = FuturesPublicClient(client_config)
+        executor = executor_from_env(
+            store=store,
+            config=ExecutionConfig.from_env(mode=args.mode),
+            client_config=client_config,
+        )
         for symbol in symbols:
-            print(run_cycle(symbol, mode=args.mode), flush=True)
+            print(
+                run_cycle(
+                    symbol,
+                    store=store,
+                    executor=executor,
+                    public_client=public_client,
+                    mode=args.mode,
+                    runtime_gate=runtime_gate,
+                ),
+                flush=True,
+            )
         return 0
     run_forever(symbols, mode=args.mode)
     return 0

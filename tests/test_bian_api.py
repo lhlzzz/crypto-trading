@@ -55,7 +55,9 @@ def test_front_data_exposes_versioned_read_only_contract() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["workspace"] == "bian"
-    assert payload["mode"] == "PUBLIC_READ_ONLY / NO_TRADE"
+    assert payload["api_mode"] == "READ_ONLY"
+    assert payload["trading_mode"] == "paper"
+    assert payload["runtime_gate"]["live_allowed"] is False
     assert payload["database_connected"] is True
     assert payload["markets"][0]["symbol"] == "BTCUSDT"
     assert payload["markets"][0]["last_price"] == "100"

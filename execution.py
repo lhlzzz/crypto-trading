@@ -10,7 +10,7 @@ import time
 from typing import Any, Literal
 from uuid import UUID
 
-from binance_client import ClientConfig, FuturesPrivateClient
+from binance_client import ClientConfig, FuturesPrivateClient, FuturesRiskRules
 from risk import RiskDecision
 from trade_intent import TradeIntent
 from trading_store import TradingStore
@@ -54,8 +54,8 @@ class ExecutionConfig:
     partial_fill_ratio: Decimal = Decimal("1")
     initial_usdt: Decimal = Decimal("1000")
     order_expiry_sec: int = 0
-    maintenance_margin_ratio: Decimal = Decimal("0.5")
     default_leverage: Decimal = Decimal("1")
+    risk_rules: FuturesRiskRules | None = None
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "ExecutionConfig":
@@ -70,10 +70,7 @@ class ExecutionConfig:
             ),
             initial_usdt=Decimal(os.environ.get("PAPER_INITIAL_USDT", "1000")),
             order_expiry_sec=max(0, int(os.environ.get("PAPER_ORDER_EXPIRY_SEC", "0"))),
-            maintenance_margin_ratio=Decimal(
-                os.environ.get("PAPER_MAINTENANCE_MARGIN_RATIO", "0.5")
-            ),
-            default_leverage=Decimal(os.environ.get("PAPER_DEFAULT_LEVERAGE", "1")),
+            default_leverage=Decimal(os.environ.get("DEFAULT_LEVERAGE", "1")),
         )
 
     def __post_init__(self) -> None:
@@ -85,10 +82,10 @@ class ExecutionConfig:
             raise ValueError("partial_fill_ratio must be in (0, 1]")
         if self.latency_ms < 0 or self.initial_usdt < 0 or self.order_expiry_sec < 0:
             raise ValueError("latency and initial balance cannot be negative")
-        if not Decimal("0") < self.maintenance_margin_ratio <= Decimal("1"):
-            raise ValueError("maintenance_margin_ratio must be in (0, 1]")
         if self.default_leverage <= 0:
             raise ValueError("default_leverage must be positive")
+        if self.risk_rules is None:
+            object.__setattr__(self, "risk_rules", FuturesRiskRules.conservative("*"))
 
 
 @dataclass(frozen=True)
@@ -376,8 +373,6 @@ class PaperExecutor(_BaseExecutor):
             requested_quantity=requested_quantity,
             current_executed=Decimal(str(local.get("executed_quantity", "0"))),
         )
-        self.apply_funding(intent.symbol, market)
-        self.mark_to_market(intent.symbol, _mark_price(market))
         return result
 
     def account_state(self) -> dict[str, Decimal]:
@@ -401,6 +396,23 @@ class PaperExecutor(_BaseExecutor):
             "margin_balance": wallet + unrealized,
         }
 
+    def liquidation_price_for(
+        self,
+        symbol: str,
+        direction: PositionDirection,
+        entry_price: Decimal,
+        leverage: Decimal,
+    ) -> Decimal:
+        """Return the paper model price used for pre-trade liquidation checks."""
+        if direction == "FLAT":
+            raise ValueError("FLAT has no liquidation price")
+        return self._liquidation_price(
+            direction,
+            entry_price,
+            leverage,
+            self._risk_rules(symbol),
+        )
+
     def mark_to_market(self, symbol: str, mark_price: Decimal) -> None:
         if mark_price <= 0:
             raise ValueError("mark price must be positive")
@@ -413,6 +425,7 @@ class PaperExecutor(_BaseExecutor):
             self._persist_position(symbol, direction="FLAT", quantity=Decimal("0"), entry_price=Decimal("0"),
                                    mark_price=mark_price, realized_pnl=_decimal_field(position, "realized_pnl"),
                                    unrealized_pnl=Decimal("0"), funding_pnl=_decimal_field(position, "funding_pnl"),
+                                   index_price=_decimal_field(position, "index_price", default="0") or None,
                                    leverage=_decimal_field(position, "leverage", default=str(self.config.default_leverage)),
                                    initial_margin=Decimal("0"), maintenance_margin=Decimal("0"),
                                    liquidation_price=None, fee_pnl=_decimal_field(position, "fee_pnl"))
@@ -427,8 +440,9 @@ class PaperExecutor(_BaseExecutor):
         leverage = _decimal_field(position, "leverage", default=str(self.config.default_leverage))
         notional = quantity * mark_price
         initial_margin = _decimal_field(position, "initial_margin", default=str(notional / leverage if leverage else notional))
-        maintenance_margin = initial_margin * self.config.maintenance_margin_ratio
-        liquidation_price = self._liquidation_price(direction, entry, leverage)
+        rules = self._risk_rules(symbol)
+        maintenance_margin = notional * rules.maintenance_margin_rate
+        liquidation_price = self._liquidation_price(direction, entry, leverage, rules)
         remaining = initial_margin + unrealized
         self._persist_position(
             symbol,
@@ -436,6 +450,7 @@ class PaperExecutor(_BaseExecutor):
             quantity=quantity,
             entry_price=entry,
             mark_price=mark_price,
+            index_price=_decimal_field(position, "index_price", default="0") or None,
             realized_pnl=_decimal_field(position, "realized_pnl"),
             unrealized_pnl=unrealized,
             funding_pnl=_decimal_field(position, "funding_pnl"),
@@ -490,6 +505,7 @@ class PaperExecutor(_BaseExecutor):
             position_side=direction,
             entry_price=_decimal_field(position, "entry_price", "average_price"),
             mark_price=mark,
+            index_price=market.index_price,
             funding_pnl=funding_pnl,
             leverage=_decimal_field(position, "leverage", default="1"),
             payload=extra,
@@ -525,6 +541,7 @@ class PaperExecutor(_BaseExecutor):
             quantity=Decimal("0"),
             entry_price=Decimal("0"),
             mark_price=mark_price,
+            index_price=None,
             realized_pnl=_decimal_field(self.store.get_position(symbol), "realized_pnl") + realized,
             unrealized_pnl=Decimal("0"),
             funding_pnl=_decimal_field(self.store.get_position(symbol), "funding_pnl"),
@@ -547,11 +564,33 @@ class PaperExecutor(_BaseExecutor):
         elif hasattr(self.store, "halted"):
             self.store.halted = True
 
-    def _liquidation_price(self, direction: str, entry: Decimal, leverage: Decimal) -> Decimal:
-        buffer = (Decimal("1") / leverage) * (Decimal("1") - self.config.maintenance_margin_ratio)
+    def _risk_rules(self, symbol: str) -> FuturesRiskRules:
+        configured = self.config.risk_rules
+        if configured is not None and configured.symbol in {"*", symbol.upper()}:
+            if configured.symbol == symbol.upper():
+                return configured
+            return FuturesRiskRules(
+                symbol=symbol.upper(),
+                maintenance_margin_rate=configured.maintenance_margin_rate,
+            )
+        return FuturesRiskRules.conservative(symbol)
+
+    def _liquidation_price(
+        self,
+        direction: str,
+        entry: Decimal,
+        leverage: Decimal,
+        rules: FuturesRiskRules,
+    ) -> Decimal:
+        if leverage <= 0:
+            raise ValueError("leverage must be positive")
+        denominator = Decimal("1") - rules.maintenance_margin_rate
+        if denominator <= 0:
+            raise ValueError("maintenance margin rate leaves no liquidation denominator")
+        maintenance_adjusted = (Decimal("1") - (Decimal("1") / leverage)) / denominator
         if direction == "LONG":
-            return max(Decimal("0"), entry * (Decimal("1") - buffer))
-        return entry * (Decimal("1") + buffer)
+            return max(Decimal("0"), entry * maintenance_adjusted)
+        return entry * (Decimal("2") - maintenance_adjusted)
 
     def _local_order(self, order_id: UUID) -> dict[str, Any] | None:
         getter = getattr(self.store, "get_order", None)
@@ -652,7 +691,10 @@ class PaperExecutor(_BaseExecutor):
         fee = fill_quantity * fill_price * self.config.fee_rate
         mid = ( (market.bid_price or market.last_price) + (market.ask_price or market.last_price) ) / Decimal("2")
         slippage = (fill_price - mid) * fill_quantity if intent.exchange_side() == "BUY" else (mid - fill_price) * fill_quantity
-        realized_delta = self._update_account(intent, fill_quantity, fill_price, fee, slippage)
+        realized_delta = self._update_account(
+            intent, fill_quantity, fill_price, fee, slippage,
+            index_price=market.index_price,
+        )
         trade_id = self.store.record_trade(
             order_id,
             symbol=intent.symbol,
@@ -780,15 +822,24 @@ class PaperExecutor(_BaseExecutor):
         maintenance_margin: Decimal,
         liquidation_price: Decimal | None,
         fee_pnl: Decimal,
+        index_price: Decimal | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
         notional = quantity * mark_price
+        current = self.store.get_position(symbol)
+        current_payload = (
+            current.get("payload")
+            if isinstance(current, dict) and isinstance(current.get("payload"), dict)
+            else {}
+        )
         payload = {
+            **current_payload,
             "mode": "paper",
             "market": "FUTURES",
             "position_side": direction,
             "entry_price": str(entry_price),
             "mark_price": str(mark_price),
+            "index_price": str(index_price) if index_price is not None else None,
             "notional": str(notional),
             "leverage": str(leverage),
             "margin_type": "ISOLATED",
@@ -811,6 +862,7 @@ class PaperExecutor(_BaseExecutor):
             position_side=direction,
             entry_price=entry_price,
             mark_price=mark_price,
+            index_price=index_price,
             notional=notional,
             leverage=leverage,
             margin_type="ISOLATED",
@@ -828,6 +880,8 @@ class PaperExecutor(_BaseExecutor):
         price: Decimal,
         fee: Decimal,
         slippage: Decimal,
+        *,
+        index_price: Decimal | None = None,
     ) -> Decimal:
         position = self.store.get_position(intent.symbol)
         current_direction = str((position or {}).get("position_side") or "FLAT")
@@ -872,6 +926,7 @@ class PaperExecutor(_BaseExecutor):
             )
             realized_delta = trading_pnl - fee
             current_realized = current_realized + trading_pnl
+            wallet = account["wallet_balance"] + realized_delta
             released = current_im * (close_qty / current_quantity) if current_quantity else current_im
             used = max(Decimal("0"), used - released)
             next_quantity = current_quantity - close_qty
@@ -904,13 +959,19 @@ class PaperExecutor(_BaseExecutor):
             funding_pnl=current_funding,
             leverage=leverage,
             initial_margin=next_im,
-            maintenance_margin=next_im * self.config.maintenance_margin_ratio,
+            maintenance_margin=next_im * self._risk_rules(intent.symbol).maintenance_margin_rate,
             liquidation_price=(
-                self._liquidation_price(direction, next_entry, leverage)
+                self._liquidation_price(
+                    direction,
+                    next_entry,
+                    leverage,
+                    self._risk_rules(intent.symbol),
+                )
                 if direction != "FLAT"
                 else None
             ),
             fee_pnl=fee_pnl,
+            index_price=index_price,
             extra={"slippage": str(slippage)},
         )
         return realized_delta

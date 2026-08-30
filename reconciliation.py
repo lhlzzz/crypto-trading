@@ -187,9 +187,6 @@ class Reconciler:
         recovered_orders = 0
         for order in local_orders:
             local_id = str(order["client_order_id"])
-            if order.get("status") == "UNKNOWN":
-                differences.append(f"order status is UNKNOWN: {local_id}")
-                continue
             exchange_order = broker_by_client_id.get(local_id)
             if exchange_order is None:
                 try:
@@ -269,15 +266,60 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
     """Apply a private futures event as a local observation, never as final truth."""
     event_type = getattr(event, "event_type", None)
     if event_type == "ACCOUNT_UPDATE":
+        mode = os.environ.get("BIAN_MODE", "testnet")
         for balance in getattr(event, "balance_updates", ()):
+            asset = str(balance.get("asset") or "").upper()
+            if not asset:
+                continue
+            current = getattr(store, "get_balance", lambda _asset: None)(asset) or {}
+            payload = dict(current.get("payload") or {})
+            payload.update({"source": "user_stream", "balance_change": balance.get("balance_change", "0")})
+            wallet = Decimal(str(balance.get("wallet_balance") or current.get("wallet_balance") or "0"))
+            available = Decimal(str(balance.get("available_balance") or current.get("available_balance") or wallet))
             store.upsert_balance(
-                balance["asset"],
-                free=Decimal(str(balance.get("available_balance") or "0")),
-                locked=Decimal("0"),
-                wallet_balance=Decimal(str(balance.get("wallet_balance") or "0")),
-                available_balance=Decimal(str(balance.get("available_balance") or "0")),
-                mode=os.environ.get("BIAN_MODE", "testnet"),
-                payload={"source": "user_stream"},
+                asset,
+                free=available,
+                locked=max(Decimal("0"), wallet - available),
+                wallet_balance=wallet,
+                available_balance=available,
+                margin_balance=Decimal(str(current.get("margin_balance") or wallet)),
+                used_margin=Decimal(str(current.get("used_margin") or max(Decimal("0"), wallet - available))),
+                unrealized_pnl=Decimal(str(current.get("unrealized_pnl") or "0")),
+                mode=mode,
+                payload=payload,
+            )
+        for position in getattr(event, "position_updates", ()):
+            symbol = str(position.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            amount = Decimal(str(position.get("quantity") or "0"))
+            current = getattr(store, "get_position", lambda _symbol: None)(symbol) or {}
+            direction, quantity = _exchange_position({
+                "positionAmt": str(amount),
+                "positionSide": position.get("position_side"),
+            })
+            entry = Decimal(str(position.get("entry_price") or current.get("entry_price") or "0"))
+            mark = current.get("mark_price")
+            index = current.get("index_price")
+            store.upsert_position(
+                symbol,
+                quantity=quantity,
+                average_price=entry,
+                realized_pnl=Decimal(str(position.get("realized_pnl") or current.get("realized_pnl") or "0")),
+                unrealized_pnl=Decimal(str(position.get("unrealized_pnl") or current.get("unrealized_pnl") or "0")),
+                market="FUTURES",
+                position_side=direction,
+                entry_price=entry,
+                mark_price=Decimal(str(mark)) if mark is not None else None,
+                index_price=Decimal(str(index)) if index is not None else None,
+                notional=(quantity * Decimal(str(mark))) if mark is not None else current.get("notional"),
+                leverage=current.get("leverage"),
+                margin_type=str(position.get("margin_type") or current.get("margin_type") or "ISOLATED").upper(),
+                initial_margin=current.get("initial_margin"),
+                maintenance_margin=current.get("maintenance_margin"),
+                liquidation_price=current.get("liquidation_price"),
+                funding_pnl=Decimal(str(current.get("funding_pnl") or "0")),
+                payload={**(current.get("payload") or {}), "source": "user_stream"},
             )
         return
     if event_type in {"malformed", "unknown"}:

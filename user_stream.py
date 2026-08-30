@@ -78,6 +78,12 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
     event_type = str(raw.get("e") or raw.get("eventType") or "unknown")
     if event_type in {"executionReport", "outboundAccountPosition"}:
         return UserStreamEvent(event_type="malformed", raw=raw)
+    if event_type == "listenKeyExpired":
+        return UserStreamEvent(
+            event_type=event_type,
+            event_time_ms=_int_or_none(raw.get("E")),
+            raw=raw,
+        )
     if event_type == "ORDER_TRADE_UPDATE":
         order = raw.get("o") if isinstance(raw.get("o"), dict) else {}
         realized = order.get("rp")
@@ -132,12 +138,7 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
             position_updates=positions,
             raw=raw,
         )
-    return UserStreamEvent(
-        event_type=event_type,
-        event_time_ms=_int_or_none(raw.get("E")),
-        symbol=_upper_or_none(raw.get("s")),
-        raw=raw,
-    )
+    return UserStreamEvent(event_type="malformed", raw=raw)
 
 
 class UserStreamClient:

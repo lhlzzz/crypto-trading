@@ -29,12 +29,21 @@ class StoreStub:
     def list_positions(self):
         return self.positions
 
+    def get_balance(self, asset):
+        return next((row for row in reversed(self.balances) if row["asset"] == asset), None)
+
+    def get_position(self, symbol):
+        return next((row for row in reversed(self.positions) if row["symbol"] == symbol), None)
+
     def set_halt(self, halted: bool, *, reason: str, source: str):
         self.halted = halted
         self.halt_calls.append((halted, reason, source))
 
     def upsert_balance(self, asset, **fields):
         self.balances.append({"asset": asset, **fields})
+
+    def upsert_position(self, symbol, **fields):
+        self.positions.append({"symbol": symbol, **fields})
 
     def update_order(self, order_id, **fields):
         self.updated.append((order_id, fields))
@@ -156,6 +165,54 @@ def test_user_stream_account_update_is_observation_only() -> None:
     apply_user_stream_event(store, event)
     assert store.balances[0]["wallet_balance"] == Decimal("50")
     assert store.halt_calls == []
+
+
+def test_account_update_patches_position_and_does_not_replace_unobserved_balance_state(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_MODE", "testnet")
+    store = StoreStub(
+        balances=[
+            {
+                "asset": "USDT",
+                "wallet_balance": "100",
+                "available_balance": "80",
+                "margin_balance": "99",
+                "used_margin": "20",
+                "mode": "testnet",
+                "payload": {"funding_pnl": "-2"},
+            }
+        ],
+        positions=[
+            {
+                "symbol": "BTCUSDT",
+                "quantity": "1",
+                "position_side": "LONG",
+                "entry_price": "100",
+                "mark_price": "101",
+                "index_price": "100.5",
+                "funding_pnl": "-2",
+                "payload": {"keep": "yes"},
+            }
+        ],
+    )
+    event = normalize_user_event(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "a": {
+                "B": [{"a": "USDT", "wb": "101", "cw": "81", "bc": "1"}],
+                "P": [{"s": "BTCUSDT", "pa": "1.2", "ep": "100", "up": "3", "cr": "0", "mt": "isolated", "ps": "BOTH"}],
+            },
+        }
+    )
+
+    apply_user_stream_event(store, event)
+
+    balance = store.balances[-1]
+    assert balance["available_balance"] == Decimal("81")
+    assert balance["used_margin"] == Decimal("20")
+    position = store.positions[-1]
+    assert position["position_side"] == "LONG"
+    assert position["quantity"] == Decimal("1.2")
+    assert position["mark_price"] == Decimal("101")
 
 
 def test_short_position_uses_position_side_not_negative_quantity() -> None:

@@ -83,20 +83,17 @@ class RiskLimits:
                 "MIN_LIQUIDATION_BUFFER_PERCENT", "15"
             ),
             min_data_quality_score=_decimal_env(
-                "MIN_DATA_QUALITY",
-                os.environ.get("POSITIONING_MIN_DATA_QUALITY", "0.8"),
+                "MIN_DATA_QUALITY", "0.8",
             ),
             min_liquidity_score=_decimal_env(
-                "MIN_LIQUIDITY_SCORE",
-                os.environ.get("POSITIONING_MIN_LIQUIDITY", "0.4"),
+                "MIN_LIQUIDITY_SCORE", "0.4",
             ),
             min_positioning_confidence=_decimal_env(
                 "MIN_POSITIONING_CONFIDENCE",
-                os.environ.get("POSITIONING_MIN_CONFIDENCE", "0.6"),
+                "0.6",
             ),
             max_crowding_score=_decimal_env(
-                "MAX_CROWDING",
-                os.environ.get("POSITIONING_MAX_CROWDING", "0.9"),
+                "MAX_CROWDING", "0.9",
             ),
         )
 
@@ -161,6 +158,7 @@ class RiskContext:
     realized_pnl: Decimal = Decimal("0")
     funding_pnl: Decimal = Decimal("0")
     leverage: Decimal = Decimal("1")
+    account_leverage: Decimal | None = None
     margin_type: str = "ISOLATED"
     position_mode: str = "ONE_WAY"
     liquidation_price: Decimal | None = None
@@ -239,6 +237,10 @@ class RiskGate:
                 return self._deny(intent, "kill switch blocks new opens")
         if context.evidence_conflict:
             return self._deny(intent, "positioning evidence is conflicted")
+        if intent.action in {"REDUCE", "CLOSE"} and intent.positioning_state in {
+            "UNKNOWN", "CONFLICTED",
+        }:
+            return self._deny(intent, "positioning state does not permit position reduction")
         if context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK":
             return self._deny(intent, "meme symbol is blocked")
         if context.meme_risk_tier == "OBSERVE" or intent.meme_risk_tier == "OBSERVE":
@@ -286,6 +288,8 @@ class RiskGate:
             return self._halt(intent, "position mode mismatch")
         if intent.leverage > self.limits.max_leverage or context.leverage > self.limits.max_leverage:
             return self._deny(intent, "maximum leverage exceeded")
+        if context.account_leverage is not None and intent.leverage != context.account_leverage:
+            return self._halt(intent, "intent leverage does not match validated account leverage")
 
         rules = context.exchange_rules
         if rules is not None:
@@ -383,11 +387,9 @@ class RiskGate:
             projected_position = normalized_notional
             if projected_position > max_position:
                 return self._deny(intent, "maximum position notional exceeded")
-            if (
-                context.liquidation_distance_percent is not None
-                and context.liquidation_distance_percent
-                < self.limits.min_liquidation_buffer_percent
-            ):
+            if context.liquidation_distance_percent is None:
+                return self._deny(intent, "liquidation price is not verified")
+            if context.liquidation_distance_percent < self.limits.min_liquidation_buffer_percent:
                 return self._deny(intent, "liquidation buffer is too small")
         else:
             if not intent.reduce_only:

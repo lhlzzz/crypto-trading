@@ -215,14 +215,14 @@ second strategy or execution path. `POSITIONING_DECISION_ENABLED` remains
 
 ## Meme Futures Capital Positioning V4 Addendum
 
-**Goal:** Upgrade bian from Spot-executed SMA plus Futures observation into a
-Binance USD-M Meme Futures capital-positioning trader, without a second
+**Goal:** Operate bian as a Binance USD-M Meme Futures capital-positioning
+trader, without a second
 engine, risk, execution, or database owner.
 **Constraints:** `POSITIONING_DECISION_ENABLED` stays `false` until shadow,
 paper, testnet, and recovery gates pass. Spot remains confirmation only.
 The authenticated adapter is USD-M `FuturesPrivateClient`; Paper cannot
 construct it. Live orders remain hard-blocked until later gates. Continue
-from `e4dbafe`; do not roll back the existing tests.
+from base `0cdb26e`; do not roll back the existing tests.
 **Out of scope:** COIN-M, options, margin, delivery, Spot live execution, LLM
 or social-signal order placement, Freqtrade/Hummingbot/NautilusTrader, and
 parallel `engine_v2` / `futures_engine` files.
@@ -256,40 +256,40 @@ parallel `engine_v2` / `futures_engine` files.
   periods, distinct price fields, and absent unsupported windows.
 
 ### Task 36: Phase C Futures orderbook A:I3
-- [ ] Replace production liquidity evidence with USD-M REST snapshot plus
+- [x] Replace production liquidity evidence with USD-M REST snapshot plus
   diff (`U`/`u`/`pu`). Invalidate and resnapshot on gap.
-- [ ] Keep Spot book as confirmation only.
-- [ ] Verification: Futures book gap, resync, and feature tests pass; Spot
+- [x] Keep Spot book as confirmation only.
+- [x] Verification: Futures book gap, resync, and feature tests pass; Spot
   depth is no longer the positioning liquidity owner.
 
 ### Task 37: Phase D Futures positioning features A:I5
-- [ ] Derive multi-window OI, taker, liquidation, basis, and impact features
+- [x] Derive multi-window OI, taker, liquidation, basis, and impact features
   from persisted Futures facts; leave missing windows absent.
-- [ ] Verification: feature tests prove no synthesis and no lookahead.
+- [x] Verification: feature tests prove no synthesis and no lookahead.
 
 ### Task 38: Phase E MarketFrame alignment A:I3
-- [ ] Extend the existing `MarketFrame` with the new Futures fields, 30m
+- [x] Extend the existing `MarketFrame` with the new Futures fields, 30m
   windows, and meme/BTC regime split. Do not create a second frame type.
-- [ ] Verification: snapshot rebuild tests include the new fields.
+- [x] Verification: snapshot rebuild tests include the new fields.
 
 ### Task 39: Phase F positioning state machine A:I5
-- [ ] Keep canonical states only; remove `TRANSITION` as a state value.
-- [ ] Require flow confirmation for building states; keep covering/unwind
+- [x] Keep canonical states only; transition is an independent decision field.
+- [x] Require flow confirmation for building states; keep covering/unwind
   distinct from building.
-- [ ] Verification: existing covering/unwind tests remain; invalid state
+- [x] Verification: existing covering/unwind tests remain; invalid state
   literals fail.
 
 ### Task 40: Phase G transition semantics A:I5
-- [ ] Make `transition_strength` a real previous-to-current state-change
+- [x] Make `transition_strength` a real previous-to-current state-change
   measure, not `abs(long_score-short_score)`.
-- [ ] Carry `transition_strength` on `TradeIntent`.
-- [ ] Verification: same scores with no state change yield strength 0.
+- [x] Carry `transition_strength` on `TradeIntent`.
+- [x] Verification: same scores with no state change yield strength 0.
 
 ### Task 41: Phase H evidence and replay
-- [ ] Treat missing critical evidence as `MISSING`, not `NEUTRAL`.
-- [ ] Replay persisted evidence to the same state, transition, scores, and
+- [x] Treat missing critical evidence as `MISSING`, not `NEUTRAL`.
+- [x] Replay persisted evidence to the same state, transition, scores, and
   direction.
-- [ ] Verification: determinism and missing-evidence tests pass.
+- [x] Verification: determinism and missing-evidence tests pass.
 
 ### Task 42: Phase I shadow A:I4
 - [ ] Keep `POSITIONING_DECISION_ENABLED=false`. Complete 1h/6h/24h public
@@ -297,15 +297,15 @@ parallel `engine_v2` / `futures_engine` files.
 - [ ] Verification: elapsed evidence exists; zero TradeIntents from shadow.
 
 ### Task 43: Phase J Futures paper A:I3
-- [ ] Upgrade the existing Paper executor to USD-M semantics: isolated
+- [x] Upgrade the existing Paper executor to USD-M semantics: isolated
   margin, conservative leverage, mark price, funding, liquidation, reduce-only.
-- [ ] Do not add a second executor class family.
-- [ ] Verification: paper futures open/reduce/close and reduce-only tests pass.
+- [x] Do not add a second executor class family.
+- [x] Verification: paper futures open/reduce/close and reduce-only tests pass.
 
 ### Task 44: Phase K backtest and walk-forward A:I4
-- [ ] Replay MarketFrames with cost-adjusted expectancy versus SMA, momentum,
+- [x] Replay MarketFrames with cost-adjusted expectancy versus SMA, momentum,
   and buy/hold-like baselines. Parameters come from train/validation only.
-- [ ] Verification: out-of-sample report exists; small samples are labeled
+- [x] Verification: out-of-sample report exists; small samples are labeled
   `INSUFFICIENT_SAMPLE`.
 
 ### Task 45: Phase L Testnet Futures lifecycle A:I3
@@ -315,15 +315,15 @@ parallel `engine_v2` / `futures_engine` files.
   restart evidence exists.
 
 ### Task 46: Phase M failure injection
-- [ ] Inject timeout, 429, 5xx, WS disconnect, DB failure, unknown order,
+- [x] Inject timeout, 429, 5xx, WS disconnect, DB failure, unknown order,
   stale OI/funding, and orderbook gap.
-- [ ] Verification: no duplicate orders, no leverage escalation, HALT on
+- [x] Verification: no duplicate orders, no leverage escalation, HALT on
   unresolved state.
 
 ### Task 47: Phase N production guards A:I3
-- [ ] Add `BIAN_MARKET=FUTURES`, meme universe mode, max leverage/margin,
+- [x] Add `BIAN_MARKET=FUTURES`, meme universe mode, max leverage/margin,
   liquidation buffer, and hard-block live unless all confirmation flags pass.
-- [ ] Verification: live-guard tests block incomplete combinations; API
+- [x] Verification: live-guard tests block incomplete combinations; API
   remains GET-only.
 
 ### Task 48: Phase O limited live A:I3 A:I4
@@ -333,14 +333,14 @@ parallel `engine_v2` / `futures_engine` files.
   BLOCK remains.
 
 ### Task 49: Legacy Spot assumption audit A:I6
-- [ ] Classify Spot private execution, Spot accounting, Spot user stream,
+- [x] Classify Spot private execution, Spot accounting, Spot user stream,
   quote-quantity, and SMA production assumptions as KEEP / REPLACE / DELETE.
-- [ ] Verification: STATE.md records the audit table.
+- [x] Verification: STATE.md records the audit table.
 
 ### Task 50: USD-M private adapter A:I3 A:I6
-- [ ] Replace Spot `PrivateClient` with `SpotPublicClient`,
+- [x] Replace Spot `PrivateClient` with `SpotPublicClient`,
   `FuturesPublicClient`, and `FuturesPrivateClient`.
-- [ ] Paper cannot construct the private client. Testnet host is
+- [x] Paper cannot construct the private client. Testnet host is
   `testnet.binancefuture.com`. No `quoteOrderQty`.
-- [ ] Verification: adapter tests cover paper block, live guards, HMAC
+- [x] Verification: adapter tests cover paper block, live guards, HMAC
   signature, client order id, HTTP 400, and Spot tombstone.

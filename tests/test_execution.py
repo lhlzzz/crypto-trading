@@ -12,6 +12,7 @@ from execution import (
     MarketSnapshot,
     PaperExecutor,
 )
+from binance_client import FuturesRiskRules
 from risk import RiskContext, RiskGate
 from trade_intent import TradeIntent
 
@@ -229,6 +230,33 @@ def test_paper_open_and_close_long() -> None:
     assert "BTC" not in store.balances
 
 
+def test_paper_close_realized_pnl_updates_wallet_and_equity() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    opened = _intent(quantity=Decimal("1"), leverage=Decimal("2"))
+    executor.submit(opened, _risk(opened), market=_market(last_price=Decimal("100")))
+    closed = _intent(
+        action="CLOSE",
+        reduce_only=True,
+        quantity=Decimal("1"),
+        created_at=datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc),
+    )
+    result = executor.submit(
+        closed,
+        _risk(closed, position_quantity=Decimal("1"), position_notional=Decimal("110")),
+        market=_market(last_price=Decimal("110"), mark_price=Decimal("110"), bid_price=Decimal("110"), ask_price=Decimal("110")),
+    )
+
+    assert result.status == "FILLED"
+    account = executor.account_state()
+    assert account["wallet_balance"] == Decimal("1009.9")
+    assert account["equity"] == Decimal("1009.9")
+    assert account["available_balance"] == Decimal("1009.9")
+
+
 def test_paper_open_and_close_short() -> None:
     store = MemoryStore()
     executor = PaperExecutor(
@@ -414,6 +442,29 @@ def test_paper_funding_is_recorded_separately() -> None:
     assert executor.account_state()["funding_pnl"] == payment
 
 
+def test_paper_funding_is_not_double_recorded_after_mark() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    intent = _intent(quantity=Decimal("1"), leverage=Decimal("2"))
+    executor.submit(intent, _risk(intent), market=_market(last_price=Decimal("100")))
+    funding_market = _market(
+        last_price=Decimal("100"),
+        funding_rate=Decimal("0.01"),
+        funding_timestamp=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+
+    first = executor.apply_funding("BTCUSDT", funding_market)
+    executor.mark_to_market("BTCUSDT", Decimal("100"))
+    second = executor.apply_funding("BTCUSDT", funding_market)
+
+    assert first == Decimal("-1")
+    assert second == Decimal("0")
+    assert executor.account_state()["funding_pnl"] == Decimal("-1")
+
+
 def test_paper_liquidation_halts() -> None:
     store = MemoryStore()
     intent = _intent(leverage=Decimal("5"), quantity=Decimal("1"))
@@ -423,7 +474,9 @@ def test_paper_liquidation_halts() -> None:
             mode="paper",
             fee_rate=Decimal("0"),
             slippage_bps=Decimal("0"),
-            maintenance_margin_ratio=Decimal("0.5"),
+            risk_rules=FuturesRiskRules(
+                symbol="BTCUSDT", maintenance_margin_rate=Decimal("0.5")
+            ),
             initial_usdt=Decimal("1000"),
         ),
     )
@@ -516,15 +569,17 @@ def test_futures_observation_to_paper_position_path() -> None:
         for source in (
             "futures_open_interest",
             "futures_funding",
-            "futures_taker_flow",
+            "futures_trade_flow",
+            "futures_taker_ratio",
         )
     }
     frame = MarketFrame(
         symbol="BTCUSDT",
         closes=(Decimal("100"), Decimal("101")),
         captured_at=captured,
-        net_spot_flow=Decimal("8"),
-        cvd_change=Decimal("8"),
+            net_spot_flow=Decimal("8"),
+            futures_trade_flow=Decimal("8"),
+            cvd_change=Decimal("8"),
         taker_buy_volume=Decimal("10"),
         taker_sell_volume=Decimal("3"),
         oi_change=Decimal("0.03"),
@@ -532,7 +587,7 @@ def test_futures_observation_to_paper_position_path() -> None:
         spread_bps=Decimal("2"),
         depth_25bps=Decimal("100"),
         market_regime="RISK_ON",
-        freshness=(SourceFreshness("futures_taker_flow", captured, captured, 900, captured),),
+        freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,
     )
     engine = StrategyEngine(StrategyConfig(positioning_decision_enabled=True))

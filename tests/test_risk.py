@@ -67,7 +67,7 @@ def test_risk_limits_load_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("MAX_ORDER_USDT", "12.5")
     monkeypatch.setenv("MAX_OPEN_ORDERS", "2")
     monkeypatch.setenv("MAX_LEVERAGE", "3")
-    monkeypatch.setenv("POSITIONING_MIN_DATA_QUALITY", "0.7")
+    monkeypatch.setenv("MIN_DATA_QUALITY", "0.7")
 
     limits = RiskLimits.from_env()
 

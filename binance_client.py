@@ -69,14 +69,14 @@ class ClientConfig:
     exchange_info_ttl_sec: int = 300
 
     @classmethod
-    def from_env(cls) -> "ClientConfig":
-        mode = os.environ.get("BIAN_MODE", "paper").strip().lower()
+    def from_env(cls, mode: str | None = None) -> "ClientConfig":
+        resolved_mode = (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
         credential_prefix = {
             "testnet": "BIAN_TESTNET",
             "live": "BIAN_LIVE",
-        }.get(mode, "BIAN")
+        }.get(resolved_mode, "BIAN")
         return cls(
-            mode=mode,
+            mode=resolved_mode,
             api_key=os.environ.get(f"{credential_prefix}_API_KEY"),
             api_secret=os.environ.get(f"{credential_prefix}_API_SECRET"),
             live_trading_enabled=_env_bool("LIVE_TRADING_ENABLED"),
@@ -99,6 +99,24 @@ class ClientConfig:
             or self.exchange_info_ttl_sec < 1
         ):
             raise ValueError("invalid Binance transport configuration")
+
+
+@dataclass(frozen=True)
+class FuturesRiskRules:
+    """Centralized paper liquidation inputs for a USD-M symbol."""
+
+    symbol: str
+    maintenance_margin_rate: Decimal = Decimal("0.005")
+
+    def __post_init__(self) -> None:
+        if not self.symbol.strip():
+            raise ValueError("Futures risk rules require a symbol")
+        if not Decimal("0") < self.maintenance_margin_rate < Decimal("1"):
+            raise ValueError("maintenance margin rate must be between 0 and 1")
+
+    @classmethod
+    def conservative(cls, symbol: str) -> "FuturesRiskRules":
+        return cls(symbol=symbol.upper().strip())
 
 
 def _env_bool(name: str) -> bool:
@@ -204,21 +222,25 @@ def _signed_query(secret: str, params: dict[str, Any]) -> str:
     return f"{query}&signature={signature}"
 
 
-def _futures_request(
+def _futures_transport(
     config: ClientConfig,
     method: str,
     path: str,
     *,
     params: dict[str, Any] | None = None,
-    signed: bool = False,
+    auth: str = "public",
+    retries: int = 0,
     operation: str,
 ) -> Any:
     query_params = dict(params or {})
     headers = {"Accept": "application/json", "User-Agent": "bian-futures-adapter/1.0"}
-    if signed:
-        if not config.api_key or not config.api_secret:
+    if auth in {"signed", "api_key"}:
+        if not config.api_key:
             raise BinanceAuthError(f"credentials are required for BIAN_MODE={config.mode}")
         headers["X-MBX-APIKEY"] = config.api_key
+    if auth == "signed":
+        if not config.api_key or not config.api_secret:
+            raise BinanceAuthError(f"credentials are required for BIAN_MODE={config.mode}")
         query = _signed_query(config.api_secret, query_params)
     else:
         query = urllib.parse.urlencode(
@@ -228,19 +250,84 @@ def _futures_request(
     if query:
         url = f"{url}?{query}"
     request = urllib.request.Request(url, method=method.upper(), headers=headers)
-    for attempt in range(config.retries + 1):
+    for attempt in range(max(0, retries) + 1):
         try:
             with urllib.request.urlopen(request, timeout=config.timeout_ms / 1000) as response:
                 return json.loads(response.read().decode("utf-8") or "null")
         except Exception as exc:
             translated = _translate_error(exc, operation=operation)
             retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
-            if not retryable or attempt >= config.retries:
+            if not retryable or attempt >= retries:
                 raise translated from exc
             delay_sec = config.backoff_ms / 1000 * (2 ** attempt)
             if delay_sec:
                 time.sleep(delay_sec)
-    raise AssertionError("Futures request retry loop must return or raise")
+    raise AssertionError("Futures transport loop must return or raise")
+
+
+def _futures_signed_request(
+    config: ClientConfig,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    operation: str,
+) -> Any:
+    """Retryable signed transport for read-only authenticated endpoints."""
+    return _futures_transport(
+        config,
+        method,
+        path,
+        params=params,
+        auth="signed",
+        retries=config.retries,
+        operation=operation,
+    )
+
+
+def _futures_order_request(
+    config: ClientConfig,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    operation: str,
+) -> Any:
+    """Single-attempt signed transport for order mutations.
+
+    A transport failure after submission is intentionally surfaced to the
+    caller as UNKNOWN. Re-submission belongs to exact-order reconciliation,
+    never to this transport helper.
+    """
+    return _futures_transport(
+        config,
+        method,
+        path,
+        params=params,
+        auth="signed",
+        retries=0,
+        operation=operation,
+    )
+
+
+def _futures_api_key_request(
+    config: ClientConfig,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    operation: str,
+) -> Any:
+    """USD-M user-stream transport: API key header, no signature."""
+    return _futures_transport(
+        config,
+        method,
+        path,
+        params=params,
+        auth="api_key",
+        retries=config.retries,
+        operation=operation,
+    )
 
 
 class SpotPublicClient:
@@ -411,6 +498,38 @@ class FuturesPublicClient:
             period=period, limit=max(1, min(limit, 500))
         )
 
+    def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
+        return self._get(
+            f"{self.base_url}/exchangeInfo",
+            symbol=symbol.upper() if symbol else None,
+        )
+
+    def get_symbol_rules(self, symbol: str) -> dict[str, str]:
+        normalized = symbol.upper().strip()
+        payload = self.get_exchange_info(normalized)
+        rows = payload.get("symbols") or []
+        row = next(
+            (item for item in rows if str(item.get("symbol", "")).upper() == normalized),
+            None,
+        )
+        if row is None:
+            raise BinanceAPIError(f"exchange info has no symbol: {normalized}")
+        filters = {str(item.get("filterType")): item for item in row.get("filters", [])}
+        lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
+        price = filters.get("PRICE_FILTER") or {}
+        notional = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
+        return {
+            "symbol": normalized,
+            "status": str(row.get("status", "")),
+            "min_qty": str(lot.get("minQty", "0")),
+            "max_qty": str(lot.get("maxQty", "0")),
+            "step_size": str(lot.get("stepSize", "0")),
+            "tick_size": str(price.get("tickSize", "0")),
+            "min_notional": str(notional.get("notional", notional.get("minNotional", "0"))),
+            "quantity_precision": str(row.get("quantityPrecision", "")),
+            "price_precision": str(row.get("pricePrecision", "")),
+        }
+
 
 class FuturesPrivateClient:
     """Authenticated USD-M Futures adapter. Paper cannot construct it."""
@@ -442,17 +561,58 @@ class FuturesPrivateClient:
         operation: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        return _futures_request(
+        return _futures_signed_request(
             self.config,
             method,
             path,
             params=params,
-            signed=True,
+            operation=operation,
+        )
+
+    def _order(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        return _futures_order_request(
+            self.config,
+            method,
+            path,
+            params=params,
+            operation=operation,
+        )
+
+    def _api_key(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        return _futures_api_key_request(
+            self.config,
+            method,
+            path,
+            params=params,
             operation=operation,
         )
 
     def get_account(self) -> dict[str, Any]:
         return self._signed("GET", "/fapi/v2/account", operation="get_account")
+
+    def get_server_time(self) -> dict[str, Any]:
+        return _futures_transport(
+            self.config,
+            "GET",
+            "/fapi/v1/time",
+            auth="public",
+            retries=self.config.retries,
+            operation="get_server_time",
+        )
 
     def get_balance(self, asset: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
         account = self.get_account()
@@ -532,7 +692,7 @@ class FuturesPrivateClient:
                 raise ValueError("LIMIT intents require price")
             params["price"] = str(price)
             params["timeInForce"] = (time_in_force or "GTC").upper()
-        return self._signed("POST", "/fapi/v1/order", operation="create_order", params=params)
+        return self._order("POST", "/fapi/v1/order", operation="create_order", params=params)
 
     def cancel_order(
         self,
@@ -540,7 +700,7 @@ class FuturesPrivateClient:
         order_id: int | str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._signed(
+        return self._order(
             "DELETE",
             "/fapi/v1/order",
             operation="cancel_order",
@@ -552,7 +712,7 @@ class FuturesPrivateClient:
         )
 
     def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
-        return self._signed(
+        return self._order(
             "DELETE",
             "/fapi/v1/allOpenOrders",
             operation="cancel_all_orders",
@@ -633,11 +793,11 @@ class FuturesPrivateClient:
 
 
     def create_listen_key(self) -> str:
-        payload = self._signed("POST", "/fapi/v1/listenKey", operation="create_listen_key")
+        payload = self._api_key("POST", "/fapi/v1/listenKey", operation="create_listen_key")
         return str(payload["listenKey"])
 
     def keepalive_listen_key(self) -> None:
-        self._signed("PUT", "/fapi/v1/listenKey", operation="keepalive_listen_key")
+        self._api_key("PUT", "/fapi/v1/listenKey", operation="keepalive_listen_key")
 
     def close_listen_key(self) -> None:
-        self._signed("DELETE", "/fapi/v1/listenKey", operation="close_listen_key")
+        self._api_key("DELETE", "/fapi/v1/listenKey", operation="close_listen_key")

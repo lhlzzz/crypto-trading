@@ -8,8 +8,13 @@ from engine import MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
 
 
 def test_backtesting_uses_strategy_engine_and_returns_metrics() -> None:
+    timestamps = [
+        datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(minutes=index)
+        for index in range(12)
+    ]
     result = run_backtest(
         [100, 101, 102, 101, 99, 98, 100, 103, 105, 104, 103, 106],
+        timestamps=timestamps,
         initial_cash=Decimal("1000"),
         engine=StrategyEngine(
             StrategyConfig(
@@ -42,6 +47,10 @@ def test_backtest_frames_are_timestamp_safe_and_prefix_only() -> None:
 
     result = run_backtest(
         [100, 101, 102, 103],
+        timestamps=[
+            datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(minutes=index)
+            for index in range(4)
+        ],
         engine=PrefixOnlyStrategy(),
     )
 
@@ -66,7 +75,8 @@ def _positioning_frame(timestamp: datetime, before: str, current: str) -> Market
             "spot_trade",
             "futures_open_interest",
             "futures_funding",
-            "futures_taker_flow",
+            "futures_trade_flow",
+            "futures_taker_ratio",
             "spot_book_ticker",
             "spot_orderbook",
         )
@@ -78,6 +88,7 @@ def _positioning_frame(timestamp: datetime, before: str, current: str) -> Market
         spot_buy_volume=Decimal("12"),
         spot_sell_volume=Decimal("4"),
         net_spot_flow=Decimal("8"),
+        futures_trade_flow=Decimal("8"),
         cvd_change=Decimal("8"),
         taker_buy_volume=Decimal("10"),
         taker_sell_volume=Decimal("3"),
@@ -119,3 +130,18 @@ def test_positioning_replay_rejects_non_chronological_frames() -> None:
         assert "chronological" in str(exc)
     else:
         raise AssertionError("expected chronological replay validation")
+
+
+def test_backtest_frames_use_futures_paper_execution_contract() -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    frames = [
+        _positioning_frame(start, "100", "101"),
+        _positioning_frame(start + timedelta(minutes=1), "101", "102"),
+    ]
+
+    result = run_backtest([], frames=frames, symbol="BTCUSDT")
+
+    assert result.net_return != result.gross_return
+    assert result.fees > 0
+    assert result.slippage >= 0
+    assert result.funding != 0

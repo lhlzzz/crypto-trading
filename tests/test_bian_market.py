@@ -396,7 +396,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "metadata": {"metadata": {"fundingRate": "0.0001"}},
             },
             {
-                "event_id": "taker", "event_type": "TAKER_FLOW",
+                "event_id": "taker", "event_type": "TAKER_RATIO",
                 "event_timestamp": "2026-08-26T00:04:55+00:00",
                 "received_timestamp": "2026-08-26T00:04:56+00:00",
                 "metadata": {"metadata": {"buyVol": "9", "sellVol": "4"}},
@@ -427,8 +427,8 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertEqual(features["funding_rate"], Decimal("0.0002"))
         self.assertEqual(features["taker_buy_volume"], Decimal("9"))
         self.assertEqual(features["basis_bps"], Decimal("2.5"))
-        self.assertEqual(features["long_liquidation_notional"], Decimal("250"))
-        self.assertEqual(features["short_liquidation_notional"], Decimal("0"))
+        self.assertEqual(features["observed_long_liquidation_notional"], Decimal("250"))
+        self.assertEqual(features["observed_short_liquidation_notional"], Decimal("0"))
         self.assertIn("spot_trade", features["source_timestamps"])
 
     def test_positioning_features_ignore_historical_liquidation_freshness(self):
@@ -456,7 +456,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             as_of=bian_market._event_datetime(as_of),
         )
 
-        self.assertIsNone(features["long_liquidation_notional"])
+        self.assertIsNone(features["observed_long_liquidation_notional"])
         self.assertNotIn("futures_liquidation", features["source_timestamps"])
 
     def test_positioning_features_derive_multi_window_flow_volume_impact_and_oi(self):
@@ -522,7 +522,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "metadata": {"liquidity_added": "15", "liquidity_removed": "4"},
             },
             {
-                "event_id": "taker-5m", "event_type": "TAKER_FLOW",
+                "event_id": "taker-5m", "event_type": "TAKER_RATIO",
                 "event_timestamp": "2026-08-26T12:10:00+00:00",
                 "received_timestamp": "2026-08-26T12:10:00+00:00",
                 "metadata": {"observationPeriod": "5m", "buyVol": "9", "sellVol": "4"},
@@ -604,7 +604,7 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         period_events = [
             event for event in report["events"]
             if event["event_type"] in {
-                "TAKER_FLOW", "GLOBAL_LONG_SHORT", "TOP_TRADER_LONG_SHORT",
+                "TAKER_RATIO", "GLOBAL_LONG_SHORT", "TOP_TRADER_LONG_SHORT",
             }
         ]
         self.assertEqual(len(report["events"]), 16)
@@ -639,13 +639,13 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
                 "metadata": {"markPrice": "101", "indexPrice": "100", "lastFundingRate": "0.0001"},
             },
             {
-                "event_id": "taker-5m", "event_type": "TAKER_FLOW",
+                "event_id": "taker-5m", "event_type": "TAKER_RATIO",
                 "event_timestamp": "2026-08-26T12:10:00+00:00",
                 "received_timestamp": "2026-08-26T12:10:00+00:00",
                 "metadata": {"observationPeriod": "5m", "buyVol": "9", "sellVol": "4"},
             },
             {
-                "event_id": "taker-30m", "event_type": "TAKER_FLOW",
+                "event_id": "taker-30m", "event_type": "TAKER_RATIO",
                 "event_timestamp": "2026-08-26T12:10:00+00:00",
                 "received_timestamp": "2026-08-26T12:10:00+00:00",
                 "metadata": {"observationPeriod": "30m", "buyVol": "40", "sellVol": "21"},
@@ -814,6 +814,63 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         feed = handler.feeds[0]
         self.assertEqual(feed.id, "BINANCE_FUTURES")
         self.assertFalse(feed.requires_authentication)
+
+    def test_futures_stream_handler_subscribes_to_primary_public_channels(self):
+        from cryptofeed.symbols import Symbols
+
+        async def callback(*args):
+            del args
+
+        with patch.object(Symbols, "populated", return_value=True), patch.object(
+            Symbols,
+            "get",
+            return_value=({"BTC-USDT": "BTCUSDT"}, None),
+        ):
+            handler = bian_market._build_futures_stream_handler(
+                ["BTC-USDT"],
+                callback,
+                ticker_callback=callback,
+                book_callback=callback,
+                funding_callback=callback,
+                liquidation_callback=callback,
+            )
+
+        subscription = handler.feeds[0].subscription
+        self.assertEqual(
+            set(subscription),
+            {"aggTrade", "bookTicker", "depth", "markPrice", "forceOrder"},
+        )
+        self.assertTrue(all(value == ["BTCUSDT"] for value in subscription.values()))
+
+    def test_futures_mark_index_funding_event_has_provenance(self):
+        funding = SimpleNamespace(
+            symbol="BTC-USDT",
+            price=Decimal("101"),
+            rate=Decimal("0.0001"),
+            timestamp=1_786_493_000.0,
+            raw={"E": 1_786_493_000_000, "i": "100", "r": "0.0001"},
+        )
+
+        _, event = bian_market._stream_funding(funding, 1_786_493_001.0)
+
+        self.assertEqual(event["market"], "FUTURES")
+        self.assertEqual(event["event_type"], "MARK_INDEX_FUNDING")
+        self.assertEqual(event["metadata"]["indexPrice"], "100")
+        self.assertEqual(event["metadata"]["lastFundingRate"], "0.0001")
+        self.assertEqual(event["latency_ms"], 1000)
+
+    def test_futures_universe_applies_allowlist_and_liquidity_tiers(self):
+        with patch.dict(__import__("os").environ, {"MEME_ALLOWLIST": "DOGEUSDT", "MEME_BLOCKLIST": ""}, clear=False):
+            features = bian_market.universe_features(
+                [
+                    {"symbol": "DOGEUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "1000", "status": "TRADING", "openInterest": "10"},
+                    {"symbol": "SHIBUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "10", "status": "TRADING", "openInterest": "10"},
+                ],
+                candidate_limit=2,
+            )
+
+        self.assertIn("DOGEUSDT", features["tiers"]["TRADEABLE"])
+        self.assertIn("SHIBUSDT", features["tiers"]["BLOCK"])
 
     def test_feed_handler_shutdown_uses_async_api_on_the_running_loop(self):
         class Handler:

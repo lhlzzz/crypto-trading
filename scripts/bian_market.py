@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 
+
 try:
     from database import configured_dsn, ensure_schema, record_collection_failure
 except ModuleNotFoundError:
@@ -27,6 +28,7 @@ SPOT_HOSTS = (
     "https://api.binance.com/api/v3",
     "https://data-api.binance.vision/api/v3",
 )
+FUTURES_HOSTS = ("https://fapi.binance.com/fapi/v1",)
 PRODUCT_ENDPOINTS = {
     "spot": ("https://api.binance.com/api/v3", "/exchangeInfo", "symbols"),
     "perpetual": ("https://fapi.binance.com/fapi/v1", "/exchangeInfo", "symbols"),
@@ -408,7 +410,7 @@ def positioning_feature_values(
     for event in visible:
         by_type.setdefault(str(event.get("event_type", "")), []).append(event)
 
-    all_trades = by_type.get("TRADE", [])
+    all_trades = by_type.get("FUTURES_TRADE", []) or by_type.get("TRADE", [])
     trades = [
         event for event in all_trades
         if _event_datetime(event["event_timestamp"]).timestamp() >= trade_start
@@ -512,11 +514,11 @@ def positioning_feature_values(
     oi_event = latest("OPEN_INTEREST")
     oi_value = _decimal(oi_event.get("quantity")) if oi_event else None
     mark_event = latest("MARK_INDEX_FUNDING")
-    taker_event = latest("TAKER_FLOW")
-    taker_5m_event = latest_period("TAKER_FLOW", "5m") or taker_event
+    taker_event = latest("TAKER_RATIO")
+    taker_5m_event = latest_period("TAKER_RATIO", "5m") or taker_event
     funding_event = latest("FUNDING")
     last_event = latest("LAST_PRICE")
-    taker_30m_event = latest_period("TAKER_FLOW", "30m")
+    taker_30m_event = latest_period("TAKER_RATIO", "30m")
     mark_funding_rates = [
         rate for event in by_type.get("MARK_INDEX_FUNDING", [])
         if (rate := decimal_metadata(event, "lastFundingRate")) is not None
@@ -567,15 +569,18 @@ def positioning_feature_values(
 
     timestamp_sources: dict[str, dict[str, Any]] = {}
     source_events = {
+        "futures_trade": latest("FUTURES_TRADE"),
+        "futures_trade_flow": latest("FUTURES_TRADE"),
         "spot_trade": latest("TRADE"),
         "futures_open_interest": oi_event,
         "futures_funding": mark_event if decimal_metadata(mark_event, "lastFundingRate") is not None else funding_event,
-        "futures_taker_flow": taker_event,
+        "futures_taker_ratio": taker_event,
         "futures_global_long_short": global_long_short_event,
         "futures_top_trader_long_short": top_trader_long_short_event,
-        "spot_book_ticker": book_event,
-        "spot_orderbook": orderbook_event,
-        "futures_mark_index": mark_event,
+        "futures_book_ticker": book_event,
+        "futures_orderbook": orderbook_event,
+        "futures_mark_price": mark_event,
+        "futures_index_price": mark_event,
         "futures_last_price": latest("LAST_PRICE"),
         # Liquidations are sparse. A historical force order outside the
         # current aggregation window is not proof that the source is stale;
@@ -595,9 +600,21 @@ def positioning_feature_values(
         }
 
     return {
-        "spot_buy_volume": flow.buy_volume if trades else None,
-        "spot_sell_volume": flow.sell_volume if trades else None,
-        "net_spot_flow": flow.net_flow if trades else None,
+        "futures_buy_volume": flow.buy_volume if trades else None,
+        "futures_sell_volume": flow.sell_volume if trades else None,
+        "futures_trade_flow": flow.net_flow if trades else None,
+        "spot_buy_volume": (
+            aggregate_trade_flow(by_type.get("TRADE", []), as_of=cutoff).buy_volume
+            if by_type.get("TRADE") else None
+        ),
+        "spot_sell_volume": (
+            aggregate_trade_flow(by_type.get("TRADE", []), as_of=cutoff).sell_volume
+            if by_type.get("TRADE") else None
+        ),
+        "net_spot_flow": (
+            aggregate_trade_flow(by_type.get("TRADE", []), as_of=cutoff).net_flow
+            if by_type.get("TRADE") else None
+        ),
         "cvd": flow.cvd if trades else None,
         "cvd_change": cvd_5m,
         "cvd_1m": cvd_windows["1m"],
@@ -643,6 +660,13 @@ def positioning_feature_values(
         ),
         "funding_percentile": funding_percentile,
         "funding_zscore": funding_zscore,
+        "taker_ratio": (
+            decimal_metadata(taker_5m_event, "buyVol")
+            / decimal_metadata(taker_5m_event, "sellVol")
+            if decimal_metadata(taker_5m_event, "buyVol") is not None
+            and decimal_metadata(taker_5m_event, "sellVol") not in {None, Decimal("0")}
+            else None
+        ),
         "basis_bps": decimal_metadata(mark_event, "basisBps"),
         "taker_buy_volume": decimal_metadata(taker_5m_event, "buyVol"),
         "taker_sell_volume": decimal_metadata(taker_5m_event, "sellVol"),
@@ -672,8 +696,12 @@ def positioning_feature_values(
         ),
         "liquidity_added": counter_delta("liquidity_added"),
         "liquidity_removed": counter_delta("liquidity_removed"),
-        "short_liquidation_notional": short_liquidations if liquidation_events else None,
-        "long_liquidation_notional": long_liquidations if liquidation_events else None,
+        "observed_short_liquidation_notional": short_liquidations if liquidation_events else None,
+        "observed_long_liquidation_notional": long_liquidations if liquidation_events else None,
+        "observed_liquidation_notional": (
+            long_liquidations + short_liquidations if liquidation_events else None
+        ),
+        "liquidation_observed": bool(liquidation_events),
         "liquidation_acceleration": liquidation_acceleration,
         "source_timestamps": timestamp_sources,
     }
@@ -754,6 +782,11 @@ class LocalOrderBook:
             raise OrderBookGap(
                 f"depth gap: expected {self.last_update_id + 1}, got {first}"
             )
+        previous_final = event.get("pu")
+        if previous_final is not None and int(previous_final) != self.last_update_id:
+            raise OrderBookGap(
+                f"depth bridge gap: expected pu={self.last_update_id}, got {previous_final}"
+            )
         for side, target in (("b", self.bids), ("a", self.asks)):
             for price_text, quantity_text in event.get(side, []):
                 price = Decimal(str(price_text))
@@ -809,25 +842,32 @@ class LocalOrderBook:
         }
 
 
-def _spot_depth_snapshot(symbol: str, *, limit: int = 1000) -> dict[str, Any]:
+def _depth_snapshot(
+    symbol: str, *, market: str = "SPOT", limit: int = 1000
+) -> dict[str, Any]:
     """Fetch the Binance REST depth snapshot used to initialize a local book."""
     normalized_symbol = symbol.replace("-", "").upper()
     bounded_limit = max(5, min(int(limit), 5000))
-    payload = _get_json(
-        f"{SPOT_HOSTS[0]}/depth?symbol={normalized_symbol}&limit={bounded_limit}"
-    )
+    host = SPOT_HOSTS[0] if market.upper() == "SPOT" else FUTURES_HOSTS[0]
+    payload = _get_json(f"{host}/depth?symbol={normalized_symbol}&limit={bounded_limit}")
     if not isinstance(payload, dict) or "lastUpdateId" not in payload:
         raise ValueError("Binance depth snapshot is missing lastUpdateId")
     return payload
+
+
+def _spot_depth_snapshot(symbol: str, *, limit: int = 1000) -> dict[str, Any]:
+    return _depth_snapshot(symbol, market="SPOT", limit=limit)
 
 
 def _resynchronize_local_order_book(
     standard_symbol: str,
     buffered_events: list[dict[str, Any]],
     books: dict[str, LocalOrderBook],
+    *,
+    market: str = "SPOT",
 ) -> LocalOrderBook:
     """Discard any stale book and reconstruct it from REST snapshot plus diffs."""
-    snapshot = _spot_depth_snapshot(standard_symbol)
+    snapshot = _depth_snapshot(standard_symbol, market=market)
     local_book = LocalOrderBook.synchronize(snapshot, buffered_events)
     local_book.snapshot_received_timestamp = datetime.now(timezone.utc)
     books[standard_symbol] = local_book
@@ -835,9 +875,9 @@ def _resynchronize_local_order_book(
 
 
 def _universe_ticker_rows() -> tuple[list[dict[str, Any]], str]:
-    """Return the complete lightweight USDT universe for scanner aggregation."""
+    """Return the USD-M Futures universe for scanner aggregation."""
     last_error: Exception | None = None
-    for host in SPOT_HOSTS:
+    for host in FUTURES_HOSTS:
         url = f"{host}/ticker/24hr"
         try:
             payload = _get_json(url)
@@ -855,7 +895,7 @@ def _universe_ticker_rows() -> tuple[list[dict[str, Any]], str]:
             return rows, url
         except Exception as exc:
             last_error = exc
-    raise RuntimeError(f"all Binance spot hosts failed: {last_error}")
+    raise RuntimeError(f"all Binance Futures hosts failed: {last_error}")
 
 
 def _ticker_rows(limit: int) -> tuple[list[dict[str, Any]], str]:
@@ -888,18 +928,58 @@ def classify_market_regime(
 
 
 def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> dict[str, Any]:
-    """Derive bounded Tier 1 scanner features from public 24h ticker fields.
+    """Derive bounded Futures universe tiers from public 24h ticker fields.
 
     These are cross-sectional observations, not a replacement for the
     timestamp-aligned intraday flow features used by positioning decisions.
     """
+    allowlist = {
+        item.strip().upper()
+        for item in os.environ.get("MEME_ALLOWLIST", "").split(",")
+        if item.strip()
+    }
+    blocklist = {
+        item.strip().upper()
+        for item in os.environ.get("MEME_BLOCKLIST", "").split(",")
+        if item.strip()
+    }
+    raw_volume_values = [
+        volume for row in rows
+        if (volume := _decimal(row.get("quoteVolume"))) is not None and volume > 0
+    ]
+    maximum_quote_volume = max(raw_volume_values, default=Decimal("0"))
     normalized: list[tuple[dict[str, Any], Decimal, Decimal]] = []
     for row in rows:
         price_change = _decimal(row.get("priceChangePercent"))
         quote_volume = _decimal(row.get("quoteVolume"))
         if price_change is None or quote_volume is None:
             continue
-        normalized.append((row, price_change, quote_volume))
+        symbol = str(row.get("symbol", "")).upper()
+        if symbol.endswith("USDT"):
+            if symbol in blocklist or (allowlist and symbol not in allowlist):
+                tier = "BLOCK"
+            else:
+                from risk import classify_meme_risk_tier
+                liquidity_score = (
+                    quote_volume / maximum_quote_volume
+                    if maximum_quote_volume > 0 else None
+                )
+                tier = classify_meme_risk_tier(
+                    liquidity_score=liquidity_score,
+                    data_quality_score=Decimal("1"),
+                    open_interest=_decimal(row.get("openInterest")),
+                    trading=str(row.get("status", "TRADING")).upper() == "TRADING",
+                )
+            row["market"] = "FUTURES"
+            row["contract_type"] = row.get("contractType", "PERPETUAL")
+            row["quote_asset"] = row.get("quoteAsset", "USDT")
+            row["base_asset"] = row.get("baseAsset") or symbol[:-4]
+            row["volume"] = _decimal(row.get("volume"))
+            row["quote_volume"] = quote_volume
+            row["last_price"] = _decimal(row.get("lastPrice"))
+            row["open_interest"] = _decimal(row.get("openInterest"))
+            row["meme_risk_tier"] = tier
+            normalized.append((row, price_change, quote_volume))
     advancers = sum(change > 0 for _, change, _ in normalized)
     decliners = sum(change < 0 for _, change, _ in normalized)
     unchanged = len(normalized) - advancers - decliners
@@ -934,7 +1014,15 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         key=lambda item: (item[2], abs(item[1]), str(item[0].get("symbol", ""))),
         reverse=True,
     )[:max(1, candidate_limit)]
+    tier_rows = {
+        tier: [str(row["symbol"]).upper() for row, _, _ in normalized if row.get("meme_risk_tier") == tier]
+        for tier in ("BLOCK", "OBSERVE", "REDUCED", "TRADEABLE")
+    }
+    tradeable_candidates = [
+        row for row, _, _ in candidates if row.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
+    ][: max(1, candidate_limit)]
     return {
+        "market": "FUTURES",
         "observation_window": "24h",
         "universe_size": len(normalized),
         "advancers": advancers,
@@ -949,7 +1037,9 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         ),
         "breadth_score": str(breadth_score),
         "market_regime": regime,
-        "candidate_symbols": [str(row["symbol"]).upper() for row, _, _ in candidates],
+            "candidate_symbols": [str(row["symbol"]).upper() for row in tradeable_candidates],
+        "tiers": tier_rows,
+        "symbols": [row for row, _, _ in normalized],
     }
 
 
@@ -958,14 +1048,20 @@ def get_klines(
     *,
     interval: str = "1m",
     limit: int = 100,
+    market: str = "FUTURES",
 ) -> dict[str, Any]:
-    """Fetch public klines for strategy consumers through the market owner."""
+    """Fetch public klines through the market owner.
+
+    Futures is the production default; Spot callers must opt in explicitly as
+    auxiliary confirmation data.
+    """
     normalized_symbol = symbol.strip().upper()
     if not normalized_symbol.endswith("USDT"):
         raise ValueError("strategy symbols must be public USDT pairs")
     bounded_limit = max(1, min(int(limit), 1000))
     last_error: Exception | None = None
-    for host in SPOT_HOSTS:
+    hosts = FUTURES_HOSTS if market.upper() == "FUTURES" else SPOT_HOSTS
+    for host in hosts:
         url = (
             f"{host}/klines?symbol={normalized_symbol}"
             f"&interval={interval}&limit={bounded_limit}"
@@ -989,6 +1085,7 @@ def get_klines(
                 "interval": interval,
                 "limit": bounded_limit,
                 "source_url": url,
+                "market": market.upper(),
                 "klines": closed,
                 "captured_at": received_at.isoformat(),
                 "source_timestamp": source_timestamp,
@@ -1173,7 +1270,7 @@ def collect_futures_observations(
         # Preserve the native window instead of fabricating unavailable 1m/3m data.
         for period in NATIVE_FUTURES_PERIODS:
             for event_type, rows in (
-                ("TAKER_FLOW", client.get_taker_buy_sell(symbol, period=period, limit=2)),
+                ("TAKER_RATIO", client.get_taker_buy_sell(symbol, period=period, limit=2)),
                 ("GLOBAL_LONG_SHORT", client.get_global_long_short_ratio(symbol, period=period, limit=2)),
                 ("TOP_TRADER_LONG_SHORT", client.get_top_trader_long_short_ratio(symbol, period=period, limit=2)),
             ):
@@ -1274,7 +1371,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         event.get("market", "SPOT"), event["event_type"],
                         event["source_timestamp"], event["received_timestamp"],
                         event["latency_ms"], event.get("price"), event.get("quantity"),
-                        event.get("quote_quantity"), event.get("direction"),
+                        event.get("notional"), event.get("direction"),
                         json.dumps(event),
                     ),
                 )
@@ -1394,6 +1491,8 @@ def _stream_report(markets: list[dict[str, Any]]) -> dict[str, Any]:
 def _stream_market(
     trade: Any,
     receipt_timestamp: float,
+    *,
+    market: str = "SPOT",
 ) -> tuple[str, dict[str, Any]] | None:
     price = _decimal(trade.price)
     if price is None:
@@ -1410,15 +1509,19 @@ def _stream_market(
             uuid.NAMESPACE_URL,
             f"bian:trade:{standard_symbol}:{source_timestamp.isoformat()}:{price}:{quantity}",
         )),
-        "event_type": "TRADE",
-        "source": "binance_spot_trade_stream",
-        "market": "SPOT",
+        "event_type": "FUTURES_TRADE" if market.upper() == "FUTURES" else "TRADE",
+        "source": (
+            "binance_futures_trade_stream"
+            if market.upper() == "FUTURES"
+            else "binance_spot_trade_stream"
+        ),
+        "market": market.upper(),
         "source_timestamp": source_timestamp.isoformat(),
         "received_timestamp": received_at.isoformat(),
         "latency_ms": _latency_ms(source_timestamp, received_at),
         "price": str(price),
         "quantity": str(quantity),
-        "quote_quantity": str(price * quantity),
+        "notional": str(price * quantity),
         "buyer_maker": buyer_maker,
         "direction": "SELL" if buyer_maker else "BUY",
     }
@@ -1447,6 +1550,8 @@ def _stream_market(
 def _stream_book_ticker(
     ticker: Any,
     receipt_timestamp: float,
+    *,
+    market: str = "SPOT",
 ) -> tuple[str, dict[str, Any]] | None:
     """Normalize bookTicker as an observation, not an executable quote."""
     bid = _decimal(ticker.bid)
@@ -1464,8 +1569,12 @@ def _stream_book_ticker(
             f"bian:bookticker:{standard_symbol}:{source_timestamp.isoformat()}:{bid}:{ask}",
         )),
         "event_type": "BOOK_TICKER",
-        "source": "binance_spot_book_ticker",
-        "market": "SPOT",
+        "source": (
+            "binance_futures_book_ticker"
+            if market.upper() == "FUTURES"
+            else "binance_spot_book_ticker"
+        ),
+        "market": market.upper(),
         "source_timestamp": source_timestamp.isoformat(),
         "received_timestamp": received_at.isoformat(),
         "latency_ms": _latency_ms(source_timestamp, received_at),
@@ -1489,6 +1598,7 @@ def _stream_orderbook(
     *,
     raw: dict[str, Any] | None = None,
     books: dict[str, LocalOrderBook],
+    market: str = "SPOT",
 ) -> tuple[str, dict[str, Any]] | None:
     """Apply a verified snapshot/diff update to the local order book.
 
@@ -1524,6 +1634,7 @@ def _stream_orderbook(
         source_timestamp=source_timestamp,
         received_at=received_at,
         timestamp_semantics=timestamp_semantics,
+        market=market,
     )
 
 
@@ -1534,6 +1645,7 @@ def _orderbook_event(
     source_timestamp: datetime,
     received_at: datetime,
     timestamp_semantics: str,
+    market: str = "SPOT",
 ) -> tuple[str, dict[str, Any]] | None:
     """Normalize one already-synchronized local book for feature persistence."""
     features = local_book.features()
@@ -1549,8 +1661,12 @@ def _orderbook_event(
             f"bian:orderbook:{symbol}:{local_book.last_update_id}:{source_timestamp.isoformat()}",
         )),
         "event_type": "ORDERBOOK",
-        "source": "binance_spot_diff_depth",
-        "market": "SPOT",
+        "source": (
+            "binance_futures_diff_depth"
+            if market.upper() == "FUTURES"
+            else "binance_spot_diff_depth"
+        ),
+        "market": market.upper(),
         "source_timestamp": source_timestamp.isoformat(),
         "received_timestamp": received_at.isoformat(),
         "latency_ms": _latency_ms(source_timestamp, received_at),
@@ -1616,20 +1732,83 @@ def _stream_liquidation(
     return standard_symbol, event
 
 
+def _stream_funding(
+    funding: Any,
+    receipt_timestamp: float,
+) -> tuple[str, dict[str, Any]] | None:
+    """Normalize Binance Futures mark/index/funding websocket updates."""
+    mark_price = _decimal(getattr(funding, "price", None))
+    if mark_price is None or mark_price <= 0:
+        return None
+    standard_symbol = str(funding.symbol)
+    source_timestamp = _event_datetime(funding.timestamp or receipt_timestamp)
+    received_at = _event_datetime(receipt_timestamp)
+    raw = getattr(funding, "raw", {})
+    index_price = _decimal(raw.get("i")) if isinstance(raw, dict) else None
+    rate = _decimal(getattr(funding, "rate", None))
+    event = {
+        "symbol": standard_symbol.replace("-", ""),
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:mark-index-funding:{standard_symbol}:{source_timestamp.isoformat()}:{mark_price}",
+        )),
+        "event_type": "MARK_INDEX_FUNDING",
+        "source": "binance_futures_mark_price_stream",
+        "market": "FUTURES",
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": str(mark_price),
+        "quantity": None,
+        "direction": None,
+        "metadata": {
+            **(raw if isinstance(raw, dict) else {}),
+            "markPrice": str(mark_price),
+            "indexPrice": str(index_price) if index_price is not None else None,
+            "lastFundingRate": str(rate) if rate is not None else None,
+        },
+    }
+    return standard_symbol, event
+
+
 def _build_futures_stream_handler(
     symbols: list[str],
-    callback: Callable[[Any, float], Awaitable[None]],
+    callback: Callable[[Any, float], Awaitable[None]] | None = None,
+    *,
+    ticker_callback: Callable[[Any, float], Awaitable[None]] | None = None,
+    book_callback: Callable[[Any, float], Awaitable[None]] | None = None,
+    funding_callback: Callable[[Any, float], Awaitable[None]] | None = None,
+    liquidation_callback: Callable[[Any, float], Awaitable[None]] | None = None,
 ) -> Any:
     from cryptofeed import FeedHandler
-    from cryptofeed.defines import LIQUIDATIONS
+    from cryptofeed.defines import FUNDING, L2_BOOK, LIQUIDATIONS, TICKER, TRADES
     from cryptofeed.exchanges import BinanceFutures
 
+    channels: list[str] = []
+    callbacks: dict[str, Callable[..., Awaitable[None]]] = {}
+    if callback is not None:
+        channels.append(TRADES)
+        callbacks[TRADES] = callback
+    if ticker_callback is not None:
+        channels.append(TICKER)
+        callbacks[TICKER] = ticker_callback
+    if book_callback is not None:
+        channels.append(L2_BOOK)
+        callbacks[L2_BOOK] = book_callback
+    if funding_callback is not None:
+        channels.append(FUNDING)
+        callbacks[FUNDING] = funding_callback
+    if liquidation_callback is not None:
+        channels.append(LIQUIDATIONS)
+        callbacks[LIQUIDATIONS] = liquidation_callback
+    if not channels:
+        raise ValueError("at least one Futures public channel is required")
     handler = FeedHandler()
     handler.add_feed(
         BinanceFutures(
             symbols=symbols,
-            channels=[LIQUIDATIONS],
-            callbacks={LIQUIDATIONS: callback},
+            channels=channels,
+            callbacks=callbacks,
             retries=-1,
             timeout=60,
             http_proxy=_http_proxy(),
@@ -1648,6 +1827,7 @@ async def stream(
     *,
     flush_sec: float,
     dsn: str | None = None,
+    market: str = "SPOT",
 ) -> None:
     """Maintain a public ticker stream and persist the latest batch per interval."""
     pending: dict[str, dict[str, Any]] = {}
@@ -1657,17 +1837,19 @@ async def stream(
     depth_buffers: dict[str, list[dict[str, Any]]] = {}
 
     async def on_trade(trade: Any, receipt_timestamp: float) -> None:
-        market = _stream_market(trade, receipt_timestamp)
-        if market is None:
+        normalized = _stream_market(trade, receipt_timestamp, market=market)
+        if normalized is None:
             return
-        symbol, snapshot = market
+        symbol, snapshot = normalized
         pending[symbol] = snapshot
         event = snapshot.get("market_data_event")
         if event:
             pending_events.append(event)
 
     async def on_ticker(ticker: Any, receipt_timestamp: float) -> None:
-        normalized = _stream_book_ticker(ticker, receipt_timestamp)
+        normalized = _stream_book_ticker(
+            ticker, receipt_timestamp, market=market
+        )
         if normalized is not None:
             _, event = normalized
             pending_observations[(event["symbol"], event["event_type"])] = event
@@ -1688,11 +1870,13 @@ async def stream(
                     standard_symbol,
                     list(buffered),
                     local_books,
+                    market=market,
                 )
             except (OrderBookGap, ValueError, RuntimeError, OSError) as exc:
                 local_books.pop(standard_symbol, None)
                 LOGGER.warning(
-                    "spot order book resynchronization failed: %s",
+                    "%s order book resynchronization failed: %s",
+                    market.lower(),
                     type(exc).__name__,
                 )
                 return None
@@ -1710,13 +1894,18 @@ async def stream(
                 source_timestamp=source_timestamp,
                 received_at=received_at,
                 timestamp_semantics=semantics,
+                market=market,
             )
 
         if standard_symbol not in local_books or "lastUpdateId" in raw:
             normalized = await resynchronize()
         else:
             normalized = _stream_orderbook(
-                book, receipt_timestamp, raw=raw, books=local_books
+                book,
+                receipt_timestamp,
+                raw=raw,
+                books=local_books,
+                market=market,
             )
             if normalized is None and standard_symbol not in local_books:
                 normalized = await resynchronize()
@@ -1758,12 +1947,34 @@ async def stream(
                 except Exception:
                     pass
 
-    handler = _build_stream_handler(
-        symbols,
-        on_trade,
-        ticker_callback=on_ticker,
-        book_callback=on_book,
-    )
+    if market.upper() == "FUTURES":
+        async def on_funding(funding: Any, receipt_timestamp: float) -> None:
+            normalized = _stream_funding(funding, receipt_timestamp)
+            if normalized is not None:
+                _, event = normalized
+                pending_observations[(event["symbol"], event["event_type"])] = event
+
+        async def on_liquidation(liquidation: Any, receipt_timestamp: float) -> None:
+            normalized = _stream_liquidation(liquidation, receipt_timestamp)
+            if normalized is not None:
+                _, event = normalized
+                pending_events.append(event)
+
+        handler = _build_futures_stream_handler(
+            symbols,
+            on_trade,
+            ticker_callback=on_ticker,
+            book_callback=on_book,
+            funding_callback=on_funding,
+            liquidation_callback=on_liquidation,
+        )
+    else:
+        handler = _build_stream_handler(
+            symbols,
+            on_trade,
+            ticker_callback=on_ticker,
+            book_callback=on_book,
+        )
     loop = asyncio.get_running_loop()
     flush_task = asyncio.create_task(flush())
     handler.run(start_loop=False, install_signal_handlers=False)
@@ -1826,7 +2037,9 @@ async def stream_futures_liquidations(
                 except Exception:
                     pass
 
-    handler = _build_futures_stream_handler(symbols, on_liquidation)
+    handler = _build_futures_stream_handler(
+        symbols, liquidation_callback=on_liquidation
+    )
     loop = asyncio.get_running_loop()
     flush_task = asyncio.create_task(flush())
     handler.run(start_loop=False, install_signal_handlers=False)
@@ -1947,7 +2160,7 @@ async def observe(
     """Continuously observe candidates without enabling any trading decision.
 
     Tier 1 scanner/Futures observations are refreshed on a bounded cadence.
-    Tier 2 Spot flow/depth and public Futures liquidation streams are restarted
+    Tier 2 Futures trade/book/mark/index/liquidation streams are restarted
     only when the selected candidate universe materially changes.
     """
     fallback = list(dict.fromkeys(fallback_symbols))
@@ -1973,11 +2186,11 @@ async def observe(
                 await _stop_observation_streams(stream_tasks)
                 stream_tasks = [
                     asyncio.create_task(
-                        stream(candidate_set, flush_sec=flush_sec, dsn=dsn)
-                    ),
-                    asyncio.create_task(
-                        stream_futures_liquidations(
-                            candidate_set, flush_sec=flush_sec, dsn=dsn
+                        stream(
+                            candidate_set,
+                            flush_sec=flush_sec,
+                            dsn=dsn,
+                            market="FUTURES",
                         )
                     ),
                 ]

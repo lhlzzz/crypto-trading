@@ -159,6 +159,145 @@ def test_private_testnet_create_order_preserves_client_order_id() -> None:
     assert headers["x-mbx-apikey"] == "key"
 
 
+def test_create_order_timeout_does_not_resubmit() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
+    )
+
+    with patch(
+        "binance_client.urllib.request.urlopen",
+        side_effect=TimeoutError("timed out"),
+    ) as urlopen:
+        with pytest.raises(BinanceConnectionError):
+            client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
+
+    assert urlopen.call_count == 1
+
+
+def test_create_order_5xx_does_not_resubmit() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
+    )
+    error = urllib.error.HTTPError(
+        "https://testnet.binancefuture.com/fapi/v1/order",
+        503,
+        "Service Unavailable",
+        hdrs=None,
+        fp=io.BytesIO(b"temporarily unavailable"),
+    )
+
+    with patch("binance_client.urllib.request.urlopen", side_effect=error) as urlopen:
+        with pytest.raises(BinanceConnectionError):
+            client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
+
+    assert urlopen.call_count == 1
+
+
+def test_unknown_order_can_be_resolved_by_get_order() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
+    )
+    response = MagicMock()
+    response.read.return_value = b'{"orderId":7,"status":"FILLED"}'
+    response.__enter__.return_value = response
+
+    with patch(
+        "binance_client.urllib.request.urlopen",
+        side_effect=[TimeoutError("timed out"), response],
+    ) as urlopen:
+        with pytest.raises(BinanceConnectionError):
+            client.create_order(
+                "BTCUSDT",
+                "BUY",
+                "MARKET",
+                quantity="0.01",
+                client_order_id="BIAN-UNKNOWN-1",
+            )
+        resolved = client.get_order("BTCUSDT", client_order_id="BIAN-UNKNOWN-1")
+
+    assert resolved["status"] == "FILLED"
+    assert urlopen.call_count == 2
+
+
+def test_create_order_rejected_http_400_is_not_retried() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
+    )
+    error = urllib.error.HTTPError(
+        "https://testnet.binancefuture.com/fapi/v1/order",
+        400,
+        "Bad Request",
+        hdrs=None,
+        fp=io.BytesIO(b"Filter failure"),
+    )
+
+    with patch("binance_client.urllib.request.urlopen", side_effect=error) as urlopen:
+        with pytest.raises(BinanceOrderError):
+            client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
+
+    assert urlopen.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_path", "payload"),
+    [
+        ("create_listen_key", "/fapi/v1/listenKey", b'{"listenKey":"abc"}'),
+        ("keepalive_listen_key", "/fapi/v1/listenKey", b"{}"),
+        ("close_listen_key", "/fapi/v1/listenKey", b"{}"),
+    ],
+)
+def test_listen_key_requests_are_api_key_only(
+    method: str, expected_path: str, payload: bytes
+) -> None:
+    response = MagicMock()
+    response.read.return_value = payload
+    response.__enter__.return_value = response
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=0)
+    )
+
+    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen, patch(
+        "binance_client.time.time", return_value=1_700_000_000
+    ):
+        result = getattr(client, method)()
+
+    request = urlopen.call_args.args[0]
+    parsed = urllib.parse.urlparse(request.full_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    headers = {key.lower(): value for key, value in request.header_items()}
+    assert request.get_method() == {
+        "create_listen_key": "POST",
+        "keepalive_listen_key": "PUT",
+        "close_listen_key": "DELETE",
+    }[method]
+    assert parsed.path == expected_path
+    assert headers["x-mbx-apikey"] == "key"
+    assert "signature" not in query
+    assert "timestamp" not in query
+    assert "recvwindow" not in query
+    if method == "create_listen_key":
+        assert result == "abc"
+
+
+def test_create_order_client_order_id_is_preserved_on_single_attempt() -> None:
+    response = MagicMock()
+    response.read.return_value = b'{"orderId":9,"status":"NEW"}'
+    response.__enter__.return_value = response
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
+    )
+
+    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen:
+        client.create_order(
+            "BTCUSDT", "BUY", "MARKET", quantity="0.01", client_order_id="BIAN-IDEMPOTENT-1"
+        )
+
+    request = urlopen.call_args.args[0]
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+    assert query["newClientOrderId"] == ["BIAN-IDEMPOTENT-1"]
+    assert urlopen.call_count == 1
+
+
 def test_order_client_error_is_translated() -> None:
     client = FuturesPrivateClient(
         ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=0)

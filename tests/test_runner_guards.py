@@ -9,6 +9,7 @@ import pytest
 from engine import MarketFrame
 from paper_runner import (
     _startup_recovery,
+    _risk_context,
     _test_only_signal_injection,
     run_cycle,
     run_shadow_cycle,
@@ -45,6 +46,61 @@ def test_paper_startup_recovery_allows_clean_store() -> None:
     store = StoreStub()
     _startup_recovery("paper", store)
     assert store.initialized is True
+
+
+def test_non_paper_cycle_requires_canonical_runtime_gate() -> None:
+    with pytest.raises(RuntimeError, match="canonical runtime gate"):
+        run_cycle("BTCUSDT", mode="testnet")
+
+
+def test_paper_risk_context_uses_symbol_aware_model_liquidation_price() -> None:
+    from decimal import Decimal
+    from execution import ExecutionConfig, MarketSnapshot, PaperExecutor
+    from trade_intent import TradeIntent
+
+    class ContextStore:
+        def __init__(self):
+            self.balances = {}
+            self.positions = {}
+
+        def initialize(self):
+            return None
+
+        def is_halted(self):
+            return False
+
+        def get_balance(self, asset):
+            return self.balances.get(asset)
+
+        def upsert_balance(self, asset, **fields):
+            self.balances[asset] = {"asset": asset, **fields}
+
+        def get_position(self, symbol):
+            return self.positions.get(symbol)
+
+    store = ContextStore()
+    executor = PaperExecutor(store=store, config=ExecutionConfig(mode="paper"))
+    intent = TradeIntent(
+        symbol="BTCUSDT",
+        direction="LONG",
+        action="OPEN",
+        reduce_only=False,
+        leverage=Decimal("2"),
+        order_type="MARKET",
+        quantity=Decimal("1"),
+        confidence=Decimal("1"),
+        reason="test",
+        strategy_version="test",
+    )
+    context = _risk_context(
+        store,
+        intent,
+        MarketSnapshot(last_price=Decimal("100"), mark_price=Decimal("100")),
+        executor=executor,
+    )
+
+    assert context.liquidation_price is not None
+    assert context.liquidation_distance_percent is not None
 
 
 def test_live_startup_requires_explicit_confirmation(monkeypatch) -> None:
