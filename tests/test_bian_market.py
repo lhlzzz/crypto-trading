@@ -154,6 +154,40 @@ class BianMarketTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         sleep.assert_called_once()
 
+    def test_rest_retry_jitter_stays_within_configured_backoff(self):
+        error = bian_market.urllib.error.HTTPError(
+            "https://example.test", 503, "Service Unavailable", {}, None,
+        )
+        with patch.object(bian_market.urllib.request, "urlopen", side_effect=error), patch.dict(
+            __import__("os").environ,
+            {"BIAN_HTTP_BACKOFF_SEC": "0.25", "BIAN_HTTP_MAX_BACKOFF_SEC": "0.3"},
+            clear=False,
+        ), patch.object(bian_market.random, "uniform", return_value=0.1), patch.object(
+            bian_market.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(RuntimeError):
+                bian_market._get_json("https://example.test", attempts=2)
+
+        sleep.assert_called_once_with(0.3)
+
+    def test_non_retryable_public_http_failure_logs_safe_diagnostics(self):
+        error = bian_market.urllib.error.HTTPError(
+            "https://example.test/private", 400, "Bad Request", {}, None,
+        )
+        with patch.object(bian_market.urllib.request, "urlopen", side_effect=error), self.assertLogs(
+            bian_market.LOGGER, level="WARNING"
+        ) as logs:
+            with self.assertRaises(RuntimeError):
+                bian_market._get_json("https://example.test/private", attempts=3)
+
+        self.assertEqual(len(logs.records), 1)
+        record = logs.records[0]
+        self.assertEqual(record.operation, "private")
+        self.assertEqual(record.host, "example.test")
+        self.assertEqual(record.attempt, 1)
+        self.assertEqual(record.retryable, False)
+        self.assertFalse(hasattr(record, "Authorization"))
+
     def test_uses_explicit_or_standard_proxy_for_rest_snapshots(self):
         with patch.dict(
             __import__("os").environ,
@@ -167,6 +201,24 @@ class BianMarketTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(bian_market._http_proxy(), "http://standard-proxy:7897")
+
+    def test_public_rest_opener_builds_explicit_proxy_handler(self):
+        sentinel = object()
+        with patch.dict(
+            __import__("os").environ,
+            {"BIAN_HTTP_PROXY": "http://explicit-proxy:7897"},
+            clear=True,
+        ), patch.object(bian_market.urllib.request, "build_opener", return_value=sentinel) as build:
+            bian_market._HTTP_OPENER = None
+            bian_market._HTTP_OPENER_PROXY = None
+            assert bian_market._get_http_opener() is sentinel
+
+        proxy_handler = build.call_args.args[0]
+        assert isinstance(proxy_handler, bian_market.urllib.request.ProxyHandler)
+        assert proxy_handler.proxies == {
+            "http": "http://explicit-proxy:7897",
+            "https": "http://explicit-proxy:7897",
+        }
 
     def test_persist_uses_run_and_symbol_conflict_target(self):
         cursor = MagicMock()
@@ -342,6 +394,45 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_persist_serializes_decimal_market_payload(self):
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        report = {
+            "run_id": "79b6f086-7417-4a83-ad83-4d33d2cb34f5",
+            "collection_kind": "rest_24h",
+            "captured_at": "2026-08-15T00:00:00+00:00",
+            "source_url": "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            "markets": [{
+                "symbol": "BTCUSDT",
+                "last_price": Decimal("100"),
+                "price_change_percent": Decimal("1"),
+                "quote_volume": Decimal("1000"),
+                "payload": {"lastPrice": Decimal("100")},
+            }],
+            "product_coverage": [{
+                "product_type": "perpetual", "status": "ok", "symbol_count": 1,
+                "source_url": "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                "captured_at": "2026-08-15T00:00:00+00:00",
+                "detail": {"max": Decimal("1000")},
+            }],
+            "events": [{
+                "event_id": "event-1", "symbol": "BTCUSDT", "market": "FUTURES",
+                "event_type": "TRADE", "source_timestamp": "2026-08-15T00:00:00+00:00",
+                "received_timestamp": "2026-08-15T00:00:00+00:00", "latency_ms": 0,
+                "price": Decimal("100"), "quantity": Decimal("1"),
+                "notional": Decimal("100"), "direction": "BUY",
+            }],
+        }
+
+        with patch.object(bian_market, "ensure_schema"), patch(
+            "psycopg2.connect", return_value=connection,
+        ):
+            bian_market.persist(report)
+
+        assert cursor.execute.call_count >= 4
+
     def test_positioning_features_deduplicate_duplicate_trade_event_ids(self):
         as_of = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
         event = {
@@ -358,6 +449,29 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
         self.assertEqual(features["spot_buy_volume"], Decimal("3"))
         self.assertEqual(features["cvd_1m"], Decimal("3"))
+
+    def test_trade_flow_reports_quantity_and_notional_cvd(self):
+        as_of = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        events = [
+            {
+                "event_id": "buy", "event_type": "TRADE",
+                "event_timestamp": "2026-08-26T11:59:30+00:00",
+                "received_timestamp": "2026-08-26T11:59:30+00:00",
+                "price": "100", "quantity": "2", "metadata": {"buyer_maker": False},
+            },
+            {
+                "event_id": "sell", "event_type": "TRADE",
+                "event_timestamp": "2026-08-26T11:59:40+00:00",
+                "received_timestamp": "2026-08-26T11:59:40+00:00",
+                "price": "200", "quantity": "1", "metadata": {"buyer_maker": True},
+            },
+        ]
+
+        flow = bian_market.aggregate_trade_flow(events, as_of=as_of)
+        assert flow.cvd == Decimal("1")
+        assert flow.buy_notional == Decimal("200")
+        assert flow.sell_notional == Decimal("200")
+        assert flow.delta_notional == Decimal("0")
 
     def test_positioning_features_use_persisted_metadata_and_received_boundary(self):
         as_of = "2026-08-26T00:05:00+00:00"
@@ -830,6 +944,30 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         )
 
         self.assertEqual(pending_events, [gap])
+        self.assertEqual(pending_observations[("BTCUSDT", "ORDERBOOK")], fresh)
+
+    def test_orderbook_unsafe_is_not_overwritten_by_a_later_fresh_snapshot(self):
+        pending_events: list[dict] = []
+        pending_observations: dict[tuple[str, str], dict] = {}
+        unsafe = {
+            "symbol": "BTCUSDT",
+            "event_type": "ORDERBOOK",
+            "metadata": {"health_status": "UNSAFE"},
+        }
+        fresh = {
+            "symbol": "BTCUSDT",
+            "event_type": "ORDERBOOK",
+            "metadata": {"bid_depth_5": "1"},
+        }
+
+        bian_market._queue_orderbook_observation(
+            pending_events, pending_observations, unsafe
+        )
+        bian_market._queue_orderbook_observation(
+            pending_events, pending_observations, fresh
+        )
+
+        self.assertEqual(pending_events, [unsafe])
         self.assertEqual(pending_observations[("BTCUSDT", "ORDERBOOK")], fresh)
 
     def test_force_order_is_observation_with_explicit_side_semantics(self):

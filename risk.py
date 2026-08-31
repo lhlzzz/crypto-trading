@@ -80,7 +80,8 @@ class RiskLimits:
     min_liquidity_score: Decimal = Decimal("0.4")
     min_positioning_confidence: Decimal = Decimal("0.6")
     max_crowding_score: Decimal = Decimal("0.9")
-    max_meme_notional_usdt: Decimal = Decimal("500")
+    max_meme_symbol_notional_usdt: Decimal = Decimal("500")
+    max_meme_portfolio_notional_usdt: Decimal = Decimal("500")
     max_directional_meme_exposure_usdt: Decimal = Decimal("500")
 
     @classmethod
@@ -115,8 +116,13 @@ class RiskLimits:
             max_crowding_score=_decimal_env(
                 "MAX_CROWDING", "0.9",
             ),
-            max_meme_notional_usdt=_decimal_env(
-                "MAX_MEME_NOTIONAL_USDT", "500",
+            max_meme_symbol_notional_usdt=_decimal_env(
+                "MAX_MEME_SYMBOL_NOTIONAL_USDT",
+                "500",
+            ),
+            max_meme_portfolio_notional_usdt=_decimal_env(
+                "MAX_MEME_PORTFOLIO_NOTIONAL_USDT",
+                "500",
             ),
             max_directional_meme_exposure_usdt=_decimal_env(
                 "MAX_DIRECTIONAL_MEME_EXPOSURE_USDT", "500",
@@ -140,7 +146,8 @@ class RiskLimits:
                 self.min_liquidity_score,
                 self.min_positioning_confidence,
                 self.max_crowding_score,
-                self.max_meme_notional_usdt,
+                self.max_meme_symbol_notional_usdt,
+                self.max_meme_portfolio_notional_usdt,
                 self.max_directional_meme_exposure_usdt,
             )
         ):
@@ -154,8 +161,6 @@ class RiskLimits:
             )
         ):
             raise ValueError("risk count limits cannot be negative")
-
-
 @dataclass(frozen=True)
 class ExchangeRules:
     symbol: str
@@ -225,6 +230,23 @@ class RiskDecision:
     intent: TradeIntent
     adjusted_intent: TradeIntent | None = None
     violations: tuple[str, ...] = ()
+    strategy_action: str | None = None
+    risk_decision: RiskDecisionType | None = None
+    risk_adjustment: str | None = None
+    final_action: str | None = None
+    final_quantity: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        executable = self.executable_intent
+        object.__setattr__(self, "strategy_action", self.strategy_action or self.intent.action)
+        object.__setattr__(self, "risk_decision", self.risk_decision or self.decision)
+        object.__setattr__(
+            self,
+            "risk_adjustment",
+            self.risk_adjustment or ("SIZE" if self.adjusted_intent is not None else None),
+        )
+        object.__setattr__(self, "final_action", self.final_action or (executable.action if executable else None))
+        object.__setattr__(self, "final_quantity", self.final_quantity or (executable.quantity if executable else None))
 
     @property
     def executable_intent(self) -> TradeIntent | None:
@@ -462,12 +484,12 @@ class RiskGate:
             }:
                 if (
                     context.symbol_meme_notional + projected_position
-                    > self.limits.max_meme_notional_usdt
+                    > self.limits.max_meme_symbol_notional_usdt
                 ):
                     return self._deny(intent, "maximum meme symbol exposure exceeded")
                 if (
                     context.total_meme_notional + projected_position
-                    > self.limits.max_meme_notional_usdt
+                    > self.limits.max_meme_portfolio_notional_usdt
                 ):
                     return self._deny(intent, "maximum total meme exposure exceeded")
                 if (

@@ -157,7 +157,7 @@ class _BaseExecutor(Executor):
                 intent_id=intent.id,
                 decision=risk_decision.decision,
                 reason=risk_decision.reason,
-                payload={"mode": self.config.mode, "market": "FUTURES"},
+                payload=self._risk_audit_payload(risk_decision),
             )
             raise ExecutionRejected(risk_decision.reason)
         approved = risk_decision.executable_intent
@@ -167,10 +167,25 @@ class _BaseExecutor(Executor):
             intent_id=intent.id,
             decision=risk_decision.decision,
             reason=risk_decision.reason,
-            payload={"mode": self.config.mode, "market": "FUTURES"},
+            payload=self._risk_audit_payload(risk_decision),
         )
         self.store.record_intent(approved, status="RISK_APPROVED")
         return approved
+
+    def _risk_audit_payload(self, decision: RiskDecision) -> dict[str, Any]:
+        """Persist strategy, risk, adjustment, and executable outcomes together."""
+        return {
+            "mode": self.config.mode,
+            "market": "FUTURES",
+            "strategy_action": decision.strategy_action,
+            "risk_decision": decision.risk_decision,
+            "risk_adjustment": decision.risk_adjustment,
+            "final_action": decision.final_action,
+            "final_quantity": (
+                str(decision.final_quantity)
+                if decision.final_quantity is not None else None
+            ),
+        }
 
     def _create_order(
         self,
@@ -504,6 +519,11 @@ class PaperExecutor(_BaseExecutor):
         payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
         last = payload.get("last_funding_settlement_timestamp")
         stamp = settlement.isoformat()
+        funding_key = getattr(self.store, "funding_settlement_exists", None)
+        if funding_key is not None and funding_key(
+            mode=self.config.mode, symbol=symbol, settlement_timestamp=settlement
+        ):
+            return Decimal("0")
         if last is not None:
             try:
                 last_timestamp = datetime.fromisoformat(str(last))
@@ -558,6 +578,17 @@ class PaperExecutor(_BaseExecutor):
                 "funding_pnl": str(-signed),
             },
         )
+        recorder = getattr(self.store, "record_funding_settlement", None)
+        if recorder is not None:
+            recorder(
+                mode=self.config.mode,
+                symbol=symbol,
+                settlement_timestamp=settlement,
+                rate=market.funding_rate,
+                notional=notional,
+                payment=-signed,
+                position_side=direction,
+            )
         return -signed
 
     def _liquidate(

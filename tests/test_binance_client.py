@@ -60,6 +60,21 @@ def test_futures_public_client_retries_transient_timeout() -> None:
     sleep.assert_called_once_with(0.025)
 
 
+def test_futures_public_client_uses_shared_public_rest_opener() -> None:
+    response = MagicMock()
+    response.read.return_value = b'{"markPrice":"100"}'
+    response.__enter__.return_value = response
+    opener = MagicMock()
+    opener.open.return_value = response
+    client = FuturesPublicClient(ClientConfig(mode="paper"))
+
+    with patch("binance_client._get_http_opener", return_value=opener) as get_opener:
+        assert client.get_mark_price("BTCUSDT") == {"markPrice": "100"}
+
+    get_opener.assert_called_once_with()
+    opener.open.assert_called_once()
+
+
 def test_futures_public_client_reads_aggregate_trades(monkeypatch) -> None:
     client = FuturesPublicClient(ClientConfig(mode="paper"))
     calls = []

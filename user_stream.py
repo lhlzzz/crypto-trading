@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import random
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
@@ -175,6 +178,7 @@ class UserStreamClient:
         reconnect_delay_sec: float = 2,
         max_failures: int = 3,
         keepalive_sec: float = 1800,
+        max_backoff_sec: float | None = None,
     ) -> None:
         self.config = config or ClientConfig.from_env()
         if self.config.mode == "paper":
@@ -189,9 +193,19 @@ class UserStreamClient:
         self._reconnects = 0
         self._reconnect_delay_sec = reconnect_delay_sec
         self._max_failures = max_failures
+        self._max_backoff_sec = max_backoff_sec if max_backoff_sec is not None else float(
+            os.environ.get("BIAN_WS_MAX_BACKOFF_SEC", "16")
+        )
         self._keepalive_sec = max(0.01, float(keepalive_sec))
         self._seen_event_ids: set[str] = set()
         self.stream_failure_reason: str | None = None
+        self.state = "DISCONNECTED"
+        self.connection_attempts = 0
+        self.connected_at: datetime | None = None
+        self.last_message_at: datetime | None = None
+        self.last_error_at: datetime | None = None
+        self.reconnect_count = 0
+        self.consecutive_failures = 0
 
     def _client(self) -> Any:
         if self._rest is None:
@@ -203,9 +217,13 @@ class UserStreamClient:
         return f"{host}/ws/{listen_key}"
 
     async def connect_once(self) -> Any:
+        self.state = "CONNECTING"
+        self.connection_attempts += 1
         listen_key = self._client().create_listen_key()
         self._listen_key = listen_key
         websocket = await _maybe_await(self._websocket_connect(self._ws_url(listen_key)))
+        self.state = "LIVE"
+        self.connected_at = datetime.now(timezone.utc)
         return websocket
 
     async def run_forever(self) -> None:
@@ -222,18 +240,32 @@ class UserStreamClient:
                     if self.stream_failure_reason is not None:
                         raise RuntimeError(self.stream_failure_reason)
                     failures = 0
+                    self.consecutive_failures = 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     failures += 1
+                    self.consecutive_failures = failures
+                    self.last_error_at = datetime.now(timezone.utc)
                     _dispatch(self.on_reconcile)
                     if failures >= self._max_failures:
+                        self.state = "FAILED"
                         reason = f"futures user stream unrecoverable: {exc}"
                         _dispatch(self.on_halt, reason)
                         _dispatch(self.on_reconcile)
                         raise
+                    self.state = "RECONNECTING"
                     self._reconnects += 1
-                    await asyncio.sleep(self._reconnect_delay_sec * failures)
+                    self.reconnect_count += 1
+                    base = min(
+                        max(0.0, self._reconnect_delay_sec) * (2 ** (failures - 1)),
+                        max(0.0, self._max_backoff_sec),
+                    )
+                    delay = min(
+                        max(0.0, base + (random.uniform(0.0, 0.1) if base else 0.0)),
+                        max(0.0, self._max_backoff_sec),
+                    )
+                    await asyncio.sleep(delay)
                 finally:
                     await _close_ws(websocket)
         finally:
@@ -248,6 +280,7 @@ class UserStreamClient:
                 await websocket.wait_closed()
             return
         async for message in websocket:
+            self.last_message_at = datetime.now(timezone.utc)
             self._message_received(message)
             if self.stream_failure_reason is not None:
                 return
@@ -281,6 +314,8 @@ class UserStreamClient:
 
     async def close(self) -> None:
         self._stopped = True
+        if self.state != "FAILED":
+            self.state = "DISCONNECTED"
         if self._listen_key is not None:
             closer = getattr(self._client(), "close_listen_key", None)
             if closer is not None:

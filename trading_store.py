@@ -529,7 +529,7 @@ class TradingStore:
                 valid_timestamps = received_dt >= source_dt and source_dt <= now and received_dt <= now
                 valid_latency = latency_ms >= 0 and latency_ms == int((received_dt - source_dt).total_seconds() * 1000)
                 reported_status = str(payload.get("health_status", "")).upper()
-                if reported_status in {"GAP", "ERROR"}:
+                if reported_status in {"GAP", "UNSAFE", "ERROR"}:
                     status = reported_status
                 elif not valid_timestamps or not valid_latency:
                     status = "ERROR"
@@ -549,6 +549,46 @@ class TradingStore:
                     "status": status,
                     "transport_source": payload.get("source"),
                 })
+        # Liveness and sparse event existence are separate observations. A
+        # quiet force-order channel is healthy when its heartbeat is fresh.
+        for symbol in sorted(requested_symbols or symbols):
+            heartbeat = canonical.get("FUTURES_LIQUIDATION", {}).get(symbol)
+            heartbeat_row = next(
+                (
+                    row for row in result
+                    if row["source"] == "FUTURES_LIQUIDATION"
+                    and row["symbol"] == symbol
+                ),
+                None,
+            )
+            if heartbeat_row is not None:
+                heartbeat_row["liveness_source"] = "FUTURES_LIQUIDATION_LIVENESS"
+            event_record = next(
+                (
+                    (source_at, received_at, payload)
+                    for row_symbol, market, event_type, source_at, received_at, _, payload
+                    in rows
+                    if str(row_symbol).upper() == symbol
+                    and str(event_type).upper() == "FORCE_ORDER"
+                ),
+                None,
+            )
+            result.append({
+                "source": "FUTURES_LIQUIDATION_EVENT",
+                "event_type": "FORCE_ORDER",
+                "symbol": symbol,
+                "market": "FUTURES",
+                "source_timestamp": (
+                    _as_utc(event_record[0]).isoformat() if event_record else None
+                ),
+                "received_timestamp": (
+                    _as_utc(event_record[1]).isoformat() if event_record else None
+                ),
+                "latency_ms": None,
+                "age_sec": None,
+                "status": "PRESENT" if event_record else "MISSING",
+                "semantics": "observed_liquidation_not_total_market_volume",
+            })
         return result
 
     @staticmethod
@@ -1010,6 +1050,7 @@ class TradingStore:
         *,
         event_type: str,
         status: str,
+        event_id: UUID | str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> None:
         import psycopg2
@@ -1019,10 +1060,18 @@ class TradingStore:
                 cursor.execute(
                     """
                     INSERT INTO order_events(
-                        order_id, event_type, status, event_at, payload
-                    ) VALUES (%s, %s, %s, %s, CAST(%s AS JSONB))
+                        order_id, event_id, event_type, status, event_at, payload
+                    ) VALUES (%s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                    ON CONFLICT (event_id) DO NOTHING
                     """,
-                    (str(order_id), event_type, status, _now(), _json(payload)),
+                    (
+                        str(order_id),
+                        str(event_id) if event_id is not None else None,
+                        event_type,
+                        status,
+                        _now(),
+                        _json(payload),
+                    ),
                 )
 
     def record_trade(
@@ -1039,6 +1088,7 @@ class TradingStore:
         market: str = "FUTURES",
         position_side: str | None = None,
         funding: Decimal = Decimal("0"),
+        source_event_id: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> UUID:
         import psycopg2
@@ -1051,9 +1101,11 @@ class TradingStore:
                     INSERT INTO trades(
                         trade_id, order_id, symbol, side, quantity, price,
                         fee, fee_asset, realized_pnl, executed_at, market, mode,
-                        position_side, funding, payload
+                        position_side, funding, source_event_id, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, CAST(%s AS JSONB))
+                              %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                    ON CONFLICT (source_event_id) DO UPDATE
+                    SET source_event_id = EXCLUDED.source_event_id
                     RETURNING trade_id
                     """,
                     (
@@ -1071,11 +1123,76 @@ class TradingStore:
                         self._mode((payload or {}).get("mode")),
                         position_side,
                         funding,
+                        source_event_id,
                         _json(payload),
                     ),
                 )
                 row = cursor.fetchone()
                 return UUID(str(row[0]))
+
+    def funding_settlement_exists(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        settlement_timestamp: datetime,
+    ) -> bool:
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM funding_settlements
+                    WHERE mode = %s AND symbol = %s AND settlement_timestamp = %s
+                    """,
+                    (self._mode(mode), symbol.upper(), _as_utc(settlement_timestamp)),
+                )
+                return cursor.fetchone() is not None
+
+    def record_funding_settlement(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        settlement_timestamp: datetime,
+        rate: Decimal,
+        notional: Decimal,
+        payment: Decimal,
+        position_side: str,
+    ) -> bool:
+        """Persist the mode/symbol/settlement idempotency boundary."""
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO funding_settlements(
+                        mode, symbol, settlement_timestamp, rate, notional,
+                        payment, position_side, recorded_at, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                    ON CONFLICT (mode, symbol, settlement_timestamp) DO NOTHING
+                    RETURNING mode
+                    """,
+                    (
+                        self._mode(mode),
+                        symbol.upper(),
+                        _as_utc(settlement_timestamp),
+                        rate,
+                        notional,
+                        payment,
+                        position_side,
+                        _now(),
+                        _json({
+                            "mode": self._mode(mode),
+                            "symbol": symbol.upper(),
+                            "settlement_timestamp": _as_utc(settlement_timestamp).isoformat(),
+                        }),
+                    ),
+                )
+                return cursor.fetchone() is not None
 
     def upsert_position(
         self,
@@ -1474,6 +1591,36 @@ class TradingStore:
                 for gate, status in cursor.fetchall():
                     if gate in values and status:
                         values[gate] = str(status).upper()
+        return values
+
+    def runtime_gate_evidence(self) -> dict[str, dict[str, Any]]:
+        """Return latest persisted status and verification timestamp per gate."""
+        import psycopg2
+
+        values: dict[str, dict[str, Any]] = {}
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON ((payload->>'gate'))
+                           payload->>'gate', payload->>'status', event_at, payload
+                    FROM system_events
+                    WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
+                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet')
+                    ORDER BY (payload->>'gate'), event_at DESC
+                    """
+                )
+                for gate, status, event_at, payload in cursor.fetchall():
+                    if gate:
+                        values[str(gate)] = {
+                            "status": str(status or "NOT_STARTED").upper(),
+                            "event_at": event_at,
+                            "verified_at": (
+                                payload.get("verified_at")
+                                if isinstance(payload, dict)
+                                else None
+                            ),
+                        }
         return values
 
     def trading_summary(self) -> dict[str, Any]:

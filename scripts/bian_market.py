@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import random
 import sys
 import time
 import urllib.error
@@ -17,6 +18,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
+
+# Running this owner as ``python scripts/bian_market.py`` does not place the
+# repository root on sys.path. Keep root-owned contracts importable in both
+# module and script execution modes.
+PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 
 try:
@@ -37,6 +46,50 @@ PRODUCT_ENDPOINTS = {
 }
 USER_AGENT = "bian-market/1.1 (+public-read-only)"
 LOGGER = logging.getLogger(__name__)
+STREAM_STATES = frozenset({"CONNECTING", "LIVE", "DISCONNECTED", "RECONNECTING", "FAILED"})
+_HTTP_OPENER: Any | None = None
+_HTTP_OPENER_PROXY: str | None = None
+
+
+class _DefaultHTTPTransport:
+    """Keep the stdlib urlopen seam while using the process proxy policy."""
+
+    @staticmethod
+    def open(request: urllib.request.Request, *, timeout: float) -> Any:
+        return urllib.request.urlopen(request, timeout=timeout)
+
+
+@dataclass
+class StreamHealth:
+    """Operational counters for one public websocket stream."""
+
+    state: str = "CONNECTING"
+    connection_attempts: int = 0
+    connected_at: datetime | None = None
+    last_message_at: datetime | None = None
+    last_error_at: datetime | None = None
+    reconnect_count: int = 0
+    consecutive_failures: int = 0
+
+    def __post_init__(self) -> None:
+        if self.state not in STREAM_STATES:
+            raise ValueError(f"invalid stream state: {self.state}")
+
+
+def _get_http_opener() -> Any:
+    """Return the one public REST opener used by every collector request."""
+    global _HTTP_OPENER, _HTTP_OPENER_PROXY
+    proxy = os.environ.get("BIAN_HTTP_PROXY")
+    if _HTTP_OPENER is None or _HTTP_OPENER_PROXY != proxy:
+        _HTTP_OPENER = (
+            urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            if proxy
+            else _DefaultHTTPTransport()
+        )
+        _HTTP_OPENER_PROXY = proxy
+    return _HTTP_OPENER
 
 
 def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -72,34 +125,61 @@ def _get_json(
     attempts: int | None = None,
 ) -> Any:
     """Fetch JSON with bounded retry for transient public API failures."""
-    attempts = attempts or _int_env("BIAN_HTTP_ATTEMPTS", 3)
+    attempts = max(1, attempts or _int_env("BIAN_HTTP_ATTEMPTS", 3))
     backoff_sec = _float_env("BIAN_HTTP_BACKOFF_SEC", 0.25, minimum=0.0)
+    max_backoff_sec = _float_env(
+        "BIAN_HTTP_MAX_BACKOFF_SEC", 8.0, minimum=0.0
+    )
     last_error: Exception | None = None
+    opener = _get_http_opener()
+    parsed = urlparse(url)
+    operation = parsed.path.rsplit("/", 1)[-1] or "request"
+    host = parsed.netloc or "unknown"
 
     for attempt in range(attempts):
+        started = time.monotonic()
         request = urllib.request.Request(
             url,
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            with opener.open(request, timeout=timeout_sec) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            error_class = type(exc).__name__
             last_error = RuntimeError(f"HTTP {exc.code} from {url}")
             retry_after = exc.headers.get("Retry-After")
             retryable = exc.code == 429 or 500 <= exc.code < 600
             if retry_after and retry_after.isdecimal():
-                delay = float(retry_after)
+                delay = min(float(retry_after), max_backoff_sec)
             else:
-                delay = backoff_sec * (2**attempt)
+                delay = min(backoff_sec * (2**attempt), max_backoff_sec)
             if not retryable:
-                break
+                delay = 0.0
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            error_class = type(exc).__name__
             last_error = RuntimeError(f"request failed for {url}: {exc}")
-            delay = backoff_sec * (2**attempt)
+            retryable = isinstance(exc, OSError)
+            delay = min(backoff_sec * (2**attempt), max_backoff_sec)
 
-        if attempt + 1 < attempts and delay:
-            time.sleep(delay)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        LOGGER.warning(
+            "public REST request failed",
+            extra={
+                "operation": operation,
+                "host": host,
+                "attempt": attempt + 1,
+                "error_class": error_class,
+                "retryable": retryable,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+
+        if attempt + 1 < attempts and retryable and delay:
+            jitter = random.uniform(0.0, min(0.1, max_backoff_sec))
+            time.sleep(min(delay + jitter, max_backoff_sec))
+        elif not retryable:
+            break
 
     raise last_error or RuntimeError(f"request failed for {url}")
 
@@ -200,6 +280,9 @@ class TradeFlowAggregate:
     buy_volume: Decimal = Decimal("0")
     sell_volume: Decimal = Decimal("0")
     cvd: Decimal = Decimal("0")
+    buy_notional: Decimal = Decimal("0")
+    sell_notional: Decimal = Decimal("0")
+    delta_notional: Decimal = Decimal("0")
 
     @property
     def net_flow(self) -> Decimal:
@@ -217,12 +300,15 @@ def aggregate_trade_flow(
     cutoff = _event_datetime(as_of) if as_of is not None else None
     buy = Decimal("0")
     sell = Decimal("0")
+    buy_notional = Decimal("0")
+    sell_notional = Decimal("0")
     for event in sorted(events, key=lambda item: _event_datetime(item["event_timestamp"])):
         event_time = _event_datetime(event["event_timestamp"])
         received_time = _event_datetime(event.get("received_timestamp", event_time))
         if cutoff is not None and (event_time > cutoff or received_time > cutoff):
             continue
         quantity = _decimal(event.get("quantity")) or Decimal("0")
+        notional = _event_notional(event)
         metadata = event.get("metadata") or {}
         embedded = metadata.get("metadata") if isinstance(metadata, dict) else None
         buyer_maker = event.get(
@@ -231,9 +317,18 @@ def aggregate_trade_flow(
         )
         if bool(buyer_maker):
             sell += quantity
+            sell_notional += notional
         else:
             buy += quantity
-    return TradeFlowAggregate(buy_volume=buy, sell_volume=sell, cvd=buy - sell)
+            buy_notional += notional
+    return TradeFlowAggregate(
+        buy_volume=buy,
+        sell_volume=sell,
+        cvd=buy - sell,
+        buy_notional=buy_notional,
+        sell_notional=sell_notional,
+        delta_notional=buy_notional - sell_notional,
+    )
 
 
 FLOW_WINDOWS: tuple[tuple[str, int], ...] = (
@@ -603,6 +698,10 @@ def positioning_feature_values(
         "futures_buy_volume": flow.buy_volume if trades else None,
         "futures_sell_volume": flow.sell_volume if trades else None,
         "futures_trade_flow": flow.net_flow if trades else None,
+        "futures_buy_notional": flow.buy_notional if trades else None,
+        "futures_sell_notional": flow.sell_notional if trades else None,
+        "futures_delta_notional": flow.delta_notional if trades else None,
+        "notional_cvd": flow.delta_notional if trades else None,
         "spot_buy_volume": (
             aggregate_trade_flow(by_type.get("TRADE", []), as_of=cutoff).buy_volume
             if by_type.get("TRADE") else None
@@ -727,7 +826,7 @@ class OrderBookGap(RuntimeError):
 
 @dataclass
 class LocalOrderBook:
-    """Minimal Binance snapshot + diff-depth book with gap fail-closed behavior."""
+    """Single local book state machine with fail-closed sequence handling."""
 
     bids: dict[Decimal, Decimal] = field(default_factory=dict)
     asks: dict[Decimal, Decimal] = field(default_factory=dict)
@@ -737,6 +836,12 @@ class LocalOrderBook:
     snapshot_update_id: int | None = None
     snapshot_sync_origin: str = "UNKNOWN"
     snapshot_received_timestamp: datetime | None = None
+    state: str = "UNINITIALIZED"
+    received_U: int | None = None
+    received_u: int | None = None
+    expected_next: int | None = None
+    error_class: str | None = None
+    recovery_attempt: int = 0
 
     @classmethod
     def from_snapshot(
@@ -754,6 +859,8 @@ class LocalOrderBook:
             snapshot_update_id=update_id,
             snapshot_sync_origin=sync_origin,
             snapshot_received_timestamp=received_at,
+            state="SYNCING",
+            expected_next=update_id + 1,
         )
 
     @classmethod
@@ -780,6 +887,11 @@ class LocalOrderBook:
             int(first["U"]) <= (book.last_update_id or 0) + 1
             <= int(first["u"])
         ):
+            book.state = "GAP"
+            book.received_U = int(first["U"])
+            book.received_u = int(first["u"])
+            book.expected_next = (book.last_update_id or 0) + 1
+            book.error_class = "OrderBookGap"
             raise OrderBookGap("buffered depth events do not bridge snapshot")
         for event in applicable:
             book.apply_diff(event)
@@ -789,15 +901,27 @@ class LocalOrderBook:
         first = int(event["U"])
         last = int(event["u"])
         if self.last_update_id is None:
+            self.state = "UNSAFE"
+            self.error_class = "OrderBookGap"
             raise OrderBookGap("book must be initialized from a REST snapshot")
         if last <= self.last_update_id:
             return False
         if first > self.last_update_id + 1:
+            self.state = "GAP"
+            self.received_U = first
+            self.received_u = last
+            self.expected_next = self.last_update_id + 1
+            self.error_class = "OrderBookGap"
             raise OrderBookGap(
                 f"depth gap: expected {self.last_update_id + 1}, got {first}"
             )
         previous_final = event.get("pu")
         if previous_final is not None and int(previous_final) != self.last_update_id:
+            self.state = "GAP"
+            self.received_U = first
+            self.received_u = last
+            self.expected_next = self.last_update_id + 1
+            self.error_class = "OrderBookGap"
             raise OrderBookGap(
                 f"depth bridge gap: expected pu={self.last_update_id}, got {previous_final}"
             )
@@ -816,10 +940,15 @@ class LocalOrderBook:
                 elif delta < 0:
                     self.liquidity_removed += abs(delta)
         self.last_update_id = last
+        self.received_U = first
+        self.received_u = last
+        self.expected_next = last + 1
+        self.state = "VALID"
+        self.error_class = None
         return True
 
     def features(self, mid_price: Decimal | None = None) -> dict[str, Decimal]:
-        if not self.bids or not self.asks:
+        if self.state != "VALID" or not self.bids or not self.asks:
             return {}
         bids = sorted(self.bids.items(), reverse=True)
         asks = sorted(self.asks.items())
@@ -977,6 +1106,7 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             contract_type = str(row.get("contractType", "PERPETUAL")).upper()
             quote_asset = str(row.get("quoteAsset", "USDT")).upper()
             trading = str(row.get("status", "TRADING")).upper() == "TRADING"
+            reason_codes: list[str] = []
             if (
                 symbol in blocklist
                 or (allowlist and symbol not in allowlist)
@@ -985,6 +1115,16 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
                 or quote_asset != "USDT"
             ):
                 tier = "BLOCK"
+                if symbol in blocklist:
+                    reason_codes.append("BLOCKLIST")
+                if allowlist and symbol not in allowlist:
+                    reason_codes.append("NOT_ALLOWLISTED")
+                if not trading:
+                    reason_codes.append("NOT_TRADING")
+                if contract_type != "PERPETUAL":
+                    reason_codes.append("NOT_PERPETUAL")
+                if quote_asset != "USDT":
+                    reason_codes.append("NOT_USDT_QUOTE")
             else:
                 from risk import classify_meme_risk_tier
                 liquidity_score = (
@@ -998,6 +1138,17 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
                     open_interest=_decimal(row.get("openInterest")),
                     trading=trading,
                 )
+                if spread_bps := _decimal(row.get("spreadBps")):
+                    if spread_bps >= Decimal("50"):
+                        reason_codes.append("SPREAD_TOO_WIDE")
+                if quote_volume <= 0:
+                    reason_codes.append("LIQUIDITY_MISSING")
+                if (_decimal(row.get("openInterest")) or Decimal("0")) <= 0:
+                    reason_codes.append("OI_NOT_POSITIVE")
+                if tier == "TRADEABLE":
+                    reason_codes.append("QUALIFIED")
+                else:
+                    reason_codes.append(tier)
             row["market"] = "FUTURES"
             row["contract_type"] = contract_type
             row["quote_asset"] = quote_asset
@@ -1006,6 +1157,13 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             row["quote_volume"] = quote_volume
             row["last_price"] = _decimal(row.get("lastPrice"))
             row["open_interest"] = _decimal(row.get("openInterest"))
+            row["meme_risk_tier"] = tier
+            row["classification_source"] = "binance_futures_exchange_info_and_24h_ticker"
+            row["classification_version"] = os.environ.get(
+                "MEME_CLASSIFICATION_VERSION", "meme-universe-v1"
+            )
+            row["classified_at"] = datetime.now(timezone.utc).isoformat()
+            row["reason_codes"] = reason_codes
             row["meme_risk_tier"] = tier
             normalized.append((row, price_change, quote_volume))
     advancers = sum(change > 0 for _, change, _ in normalized)
@@ -1438,7 +1596,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         market["price_change_percent"],
                         market["quote_volume"],
                         report["source_url"],
-                        json.dumps(market["payload"]),
+                        json.dumps(market["payload"], default=str),
                     ),
                 )
             for event in events:
@@ -1458,7 +1616,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         event["source_timestamp"], event["received_timestamp"],
                         event["latency_ms"], event.get("price"), event.get("quantity"),
                         event.get("notional"), event.get("direction"),
-                        json.dumps(event),
+                        json.dumps(event, default=str),
                     ),
                 )
                 if event.get("event_type") == "FORCE_ORDER":
@@ -1480,7 +1638,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                             event["event_id"], event["symbol"], event["direction"],
                             price, quantity, price * quantity,
                             event["source_timestamp"], event["received_timestamp"],
-                            event["latency_ms"], json.dumps(event),
+                            event["latency_ms"], json.dumps(event, default=str),
                         ),
                     )
             for item in coverage:
@@ -1503,7 +1661,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         item["symbol_count"],
                         item["source_url"],
                         item["captured_at"],
-                        json.dumps(item["detail"]),
+                        json.dumps(item["detail"], default=str),
                     ),
                 )
             cursor.execute(
@@ -1719,7 +1877,7 @@ def _stream_orderbook(
     standard_symbol = str(book.symbol)
     received_at = _event_datetime(receipt_timestamp)
     if "lastUpdateId" in raw:
-        local_book = LocalOrderBook.from_snapshot(raw)
+        local_book = LocalOrderBook.from_snapshot(raw, sync_origin="STREAM_SNAPSHOT")
         books[standard_symbol] = local_book
         source_timestamp = received_at
         timestamp_semantics = "receipt_observed_snapshot"
@@ -1751,7 +1909,7 @@ def _queue_orderbook_observation(
 ) -> None:
     """Keep order book faults as immutable evidence through a later resync."""
     health_status = str((event.get("metadata") or {}).get("health_status", "")).upper()
-    if health_status in {"GAP", "ERROR"}:
+    if health_status in {"GAP", "UNSAFE", "ERROR"}:
         pending_events.append(event)
         return
     pending_observations[(event["symbol"], event["event_type"])] = event
@@ -1768,7 +1926,7 @@ def _orderbook_event(
 ) -> tuple[str, dict[str, Any]] | None:
     """Normalize one already-synchronized local book for feature persistence."""
     features = local_book.features()
-    if not features:
+    if not features and (local_book.state != "SYNCING" or not local_book.bids or not local_book.asks):
         return None
     symbol = _storage_symbol(standard_symbol)
     best_bid = max(local_book.bids)
@@ -1794,9 +1952,16 @@ def _orderbook_event(
         "direction": None,
         "metadata": {
             **{key: str(value) for key, value in features.items()},
+            "health_status": local_book.state if local_book.state != "VALID" else None,
+            "state": local_book.state,
             "bestBid": str(best_bid),
             "bestAsk": str(best_ask),
             "lastUpdateId": local_book.last_update_id,
+            "received_U": local_book.received_U,
+            "received_u": local_book.received_u,
+            "expected_next": local_book.expected_next,
+            "error_class": local_book.error_class,
+            "recovery_attempt": local_book.recovery_attempt,
             "timestamp_semantics": timestamp_semantics,
             "snapshotSyncOrigin": local_book.snapshot_sync_origin,
             "snapshotLastUpdateId": local_book.snapshot_update_id,
@@ -1905,21 +2070,38 @@ def _build_futures_stream_handler(
 
     channels: list[str] = []
     callbacks: dict[str, Callable[..., Awaitable[None]]] = {}
+    stream_health: dict[str, StreamHealth] = {}
+
+    def monitored(channel: str, target: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+        health = StreamHealth(connection_attempts=1)
+        stream_health[channel] = health
+
+        async def callback_wrapper(*args: Any, **kwargs: Any) -> None:
+            now = datetime.now(timezone.utc)
+            if health.connected_at is None:
+                health.connected_at = now
+            health.state = "LIVE"
+            health.last_message_at = now
+            health.consecutive_failures = 0
+            await target(*args, **kwargs)
+
+        return callback_wrapper
+
     if callback is not None:
         channels.append(TRADES)
-        callbacks[TRADES] = callback
+        callbacks[TRADES] = monitored(TRADES, callback)
     if ticker_callback is not None:
         channels.append(TICKER)
-        callbacks[TICKER] = ticker_callback
+        callbacks[TICKER] = monitored(TICKER, ticker_callback)
     if book_callback is not None:
         channels.append(L2_BOOK)
-        callbacks[L2_BOOK] = book_callback
+        callbacks[L2_BOOK] = monitored(L2_BOOK, book_callback)
     if funding_callback is not None:
         channels.append(FUNDING)
-        callbacks[FUNDING] = funding_callback
+        callbacks[FUNDING] = monitored(FUNDING, funding_callback)
     if liquidation_callback is not None:
         channels.append(LIQUIDATIONS)
-        callbacks[LIQUIDATIONS] = liquidation_callback
+        callbacks[LIQUIDATIONS] = monitored(LIQUIDATIONS, liquidation_callback)
     if not channels:
         raise ValueError("at least one Futures public channel is required")
     handler = FeedHandler()
@@ -1928,11 +2110,12 @@ def _build_futures_stream_handler(
             symbols=[_futures_feed_symbol(symbol) for symbol in symbols],
             channels=channels,
             callbacks=callbacks,
-            retries=-1,
+            retries=_int_env("BIAN_WS_MAX_RECONNECTS", 5, minimum=0),
             timeout=60,
             http_proxy=_http_proxy(),
         )
     )
+    handler.bian_stream_health = stream_health
     return handler
 
 
@@ -2013,9 +2196,12 @@ async def stream(
                     "source_timestamp": received_at.isoformat(),
                     "received_timestamp": received_at.isoformat(),
                     "latency_ms": 0,
-                    "metadata": {
-                        "health_status": "GAP",
+                        "metadata": {
+                        "health_status": "UNSAFE",
+                        "state": "UNSAFE",
                         "reason": type(exc).__name__,
+                        "error_class": type(exc).__name__,
+                        "recovery_attempt": 1,
                     },
                 }
             depth_buffers.pop(standard_symbol, None)

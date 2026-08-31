@@ -93,6 +93,7 @@ def test_missing_required_source_blocks_data_health() -> None:
     )
     assert gate.data_health_ok is False
     assert gate.paper_ready is False
+    assert "FUTURES_DEPTH_MISSING" in gate.reasons
 
 
 def test_stale_required_source_blocks_data_health() -> None:
@@ -102,6 +103,23 @@ def test_stale_required_source_blocks_data_health() -> None:
         reconciliation_ok=True,
     )
     assert gate.data_health_ok is False
+    assert "FUTURES_DEPTH_STALE" in gate.reasons
+
+
+def test_future_source_timestamp_blocks_data_health() -> None:
+    store = RequiredFreshStore()
+    original = store.market_data_freshness
+
+    def future_rows(*, max_age_sec: int, symbols=()):
+        rows = original(max_age_sec=max_age_sec, symbols=symbols)
+        rows[0]["source_timestamp"] = "2999-01-01T00:00:00+00:00"
+        return rows
+
+    store.market_data_freshness = future_rows
+    gate = evaluate_runtime_gate(mode="paper", store=store, reconciliation_ok=True)
+
+    assert gate.data_health_ok is False
+    assert any(reason.endswith("_FUTURE_TIMESTAMP") for reason in gate.reasons)
 
 
 def test_gate_verification_timestamp() -> None:
@@ -204,3 +222,22 @@ def test_runtime_gate_uses_verified_evidence_dynamically(monkeypatch) -> None:
 
     assert pending.testnet_ready is False
     assert passed.testnet_ready is True
+
+
+def test_runtime_gate_rejects_stale_persisted_gate_evidence(monkeypatch) -> None:
+    monkeypatch.setenv("GATE_EVIDENCE_MAX_AGE_SEC", "1")
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+        gate_evidence={
+            "paper": {
+                "status": "PASSED",
+                "verified_at": "2020-01-01T00:00:00+00:00",
+            }
+        },
+    )
+
+    assert gate.paper_gate_status == "FAILED"
+    assert "PAPER_EVIDENCE_STALE" in gate.reasons
+    assert gate.verification_age_sec is not None

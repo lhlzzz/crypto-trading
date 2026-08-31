@@ -92,3 +92,14 @@ independent episode analysis, and baseline/stressed-cost metrics are required;
 The API contract and release identity default to `2026-08-15` and can be
 overridden independently with `BIAN_OPERATOR_CONTRACT_VERSION` and
 `BIAN_RELEASE_VERSION`.
+
+## Validation Status (2026-08-31)
+
+Code verification is green: `246` tests pass, Python 3.12 `compileall` passes,
+`git diff --check` passes, and PostgreSQL schema/status reports no missing
+tables. Public Binance access is not currently a stable runtime dependency:
+`markPrice` was reachable in a direct smoke, while OI, funding, aggregate
+trades, ticker collection, and Futures WebSocket observation encountered SSL
+EOF or connection-reset failures. Therefore the 30-minute, 2-hour, 6-hour,
+24-hour, 24-hour Paper, seven-day Shadow, Alpha OOS, and Testnet gates are not
+verified. Live remains blocked.

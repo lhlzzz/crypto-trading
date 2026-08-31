@@ -282,13 +282,27 @@ def test_blocked_meme_tier_is_denied() -> None:
 
 def test_meme_notional_cap() -> None:
     decision = RiskGate(
-        RiskLimits(max_meme_notional_usdt=Decimal("15"))
+        RiskLimits(max_meme_symbol_notional_usdt=Decimal("15"))
     ).evaluate(
         _intent(quantity=Decimal("0.1")),
         _context(symbol_meme_notional=Decimal("6")),
     )
     assert decision.decision == "DENY"
     assert "meme symbol" in decision.reason
+
+
+def test_meme_portfolio_cap_is_separate_from_symbol_cap() -> None:
+    decision = RiskGate(
+        RiskLimits(
+            max_meme_symbol_notional_usdt=Decimal("100"),
+            max_meme_portfolio_notional_usdt=Decimal("15"),
+        )
+    ).evaluate(
+        _intent(quantity=Decimal("0.1")),
+        _context(total_meme_notional=Decimal("6")),
+    )
+    assert decision.decision == "DENY"
+    assert "total meme" in decision.reason
 
 
 def test_directional_meme_cap() -> None:

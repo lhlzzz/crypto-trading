@@ -138,9 +138,9 @@ use futures position semantics. Spot remains public confirmation only.
 Legacy quote-order quantity is migrated out of the active schema. SMA stays a
 research baseline until positioning gates pass.
 
-## Current verification (2026-08-30)
+## Current verification (2026-08-31)
 
-- `226` tests pass; `compileall` and `git diff --check` pass.
+- `246` tests pass; `compileall` and `git diff --check` pass.
 - Futures order writes are single-attempt; transport uncertainty records
   `UNKNOWN` and reconciliation queries the exact client order ID.
 - listenKey create/keepalive/close use API-key-only transport.
@@ -163,3 +163,22 @@ research baseline until positioning gates pass.
   verification timestamp and age.
 - Balances are isolated by composite `(mode, asset)` identity and UserStream
   `ACCOUNT_UPDATE` observations are explicitly marked `PARTIAL`.
+- Public Futures observation now uses the shared `BIAN_HTTP_PROXY` opener with
+  bounded retry jitter and sanitized operation/host diagnostics. The
+  `FuturesPublicClient` public path uses that same opener.
+- Orderbook `GAP` and `UNSAFE` evidence is preserved instead of being replaced
+  by a later fresh observation; `UNSAFE` is excluded from source health.
+- Meme caps are separate: symbol, portfolio, and directional exposure. The
+  old combined `MAX_MEME_NOTIONAL_USDT` alias is removed.
+- Direct collector execution is covered, including root imports and Decimal
+  JSON payload serialization.
+
+## Runtime Gate Status (2026-08-31)
+
+- `CODE_READY=true`.
+- `REAL_DATA_READY=false`: Binance public REST/WebSocket transport is
+  externally unstable (`SSL: UNEXPECTED_EOF_WHILE_READING`, connection reset).
+- `PAPER_READY=false`, `SHADOW_READY=false`, `TESTNET_READY=false`,
+  `ALPHA_SUPPORTED` is not established, and `LIVE_PREFLIGHT_READY=false`.
+- Testnet is `BLOCKED_BY_EXTERNAL_CREDENTIALS`; no credentials were present.
+- `LIVE=BLOCKED` and `POSITIONING_DECISION_ENABLED=false` remain unchanged.

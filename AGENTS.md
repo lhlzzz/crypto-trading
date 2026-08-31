@@ -30,3 +30,9 @@ calling Risk, Execution, TradeIntent creation, or order submission.
 `runtime_gate.py` is the canonical readiness owner. Its `live_allowed` result
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
+
+Current validation status on 2026-08-31: code checks pass (`246` pytest
+tests, compileall, and diff check), PostgreSQL schema/status is healthy, and
+Live remains blocked. Binance public REST/WebSocket transport is externally
+unstable, Testnet credentials are absent, and no elapsed realtime, Paper,
+Shadow, Alpha OOS, or Testnet evidence may be treated as verified.

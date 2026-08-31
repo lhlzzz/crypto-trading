@@ -422,6 +422,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
         local["order_id"],
         event_type="USER_STREAM_ORDER_UPDATE",
         status=status,
+        event_id=event_id,
         payload=getattr(event, "raw", {}),
     )
     if (
@@ -442,6 +443,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 realized_pnl=Decimal(str(getattr(event, "realized_pnl", "0") or "0")),
                 market="FUTURES",
                 position_side=position_side or None,
+                source_event_id=event_id,
                 payload={
                     "source": "user_stream",
                     "event_id": event_id,

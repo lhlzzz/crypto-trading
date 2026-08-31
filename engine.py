@@ -319,6 +319,10 @@ class MarketFrame:
     futures_buy_volume: Decimal | None = None
     futures_sell_volume: Decimal | None = None
     futures_trade_flow: Decimal | None = None
+    futures_buy_notional: Decimal | None = None
+    futures_sell_notional: Decimal | None = None
+    futures_delta_notional: Decimal | None = None
+    notional_cvd: Decimal | None = None
     cvd: Decimal | None = None
     cvd_change: Decimal | None = None
     cvd_1m: Decimal | None = None
@@ -403,6 +407,8 @@ class MarketFrame:
             "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
             "futures_buy_volume", "futures_sell_volume", "futures_trade_flow", "cvd",
+            "futures_buy_notional", "futures_sell_notional", "futures_delta_notional",
+            "notional_cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
             "cvd_1h", "cvd_30m", "cvd_acceleration", "volume_ratio_1m",
             "volume_ratio_5m", "volume_ratio_15m", "volume_zscore",
@@ -767,6 +773,8 @@ class StrategyEngine:
             "closes", "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
             "futures_buy_volume", "futures_sell_volume", "futures_trade_flow", "cvd",
+            "futures_buy_notional", "futures_sell_notional", "futures_delta_notional",
+            "notional_cvd",
             "cvd_change", "cvd_1m", "cvd_3m", "cvd_5m", "cvd_15m",
             "cvd_1h", "cvd_30m", "cvd_acceleration", "price_cvd_divergence",
             "volume_ratio_1m", "volume_ratio_5m", "volume_ratio_15m",

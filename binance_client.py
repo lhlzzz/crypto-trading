@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
 
+from scripts.bian_market import _get_http_opener
+
 from binance_common.configuration import ConfigurationRestAPI
 from binance_sdk_spot import (
     BadRequestError,
@@ -431,11 +433,10 @@ class FuturesPublicClient:
         request = urllib.request.Request(
             url, headers={"Accept": "application/json", "User-Agent": "bian-futures-observer/1.0"}
         )
+        opener = _get_http_opener()
         for attempt in range(self.config.retries + 1):
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.config.timeout_ms / 1000
-                ) as response:
+                with opener.open(request, timeout=self.config.timeout_ms / 1000) as response:
                     return json.loads(response.read().decode("utf-8"))
             except Exception as exc:
                 translated = _translate_error(exc, operation="futures_observation")

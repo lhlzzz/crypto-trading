@@ -46,6 +46,14 @@ def max_data_age_sec() -> int:
         return 900
 
 
+def gate_evidence_max_age_sec() -> int:
+    """Bound how long an externally verified gate may be reused."""
+    try:
+        return max(1, int(os.environ.get("GATE_EVIDENCE_MAX_AGE_SEC", "86400")))
+    except ValueError:
+        return 86400
+
+
 _GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
 _EXTERNAL_GATES = ("observation", "paper", "shadow", "testnet")
 REQUIRED_FUTURES_SOURCES = frozenset(
@@ -81,7 +89,12 @@ def _persisted_gate_statuses(
     """Read verified evidence; configuration alone is never sufficient."""
     values = {name: "NOT_STARTED" for name in _EXTERNAL_GATES}
     if supplied is not None:
-        values.update({key: str(value).upper() for key, value in supplied.items()})
+        values.update({
+            key: str(value.get("status", "NOT_STARTED")).upper()
+            if isinstance(value, Mapping)
+            else str(value).upper()
+            for key, value in supplied.items()
+        })
     getter = getattr(store, "runtime_gate_statuses", None) if store is not None else None
     if getter is None:
         getter = getattr(store, "get_runtime_gate_statuses", None) if store is not None else None
@@ -89,13 +102,77 @@ def _persisted_gate_statuses(
         try:
             persisted = getter()
             if isinstance(persisted, Mapping):
-                values.update({key: str(value).upper() for key, value in persisted.items()})
+                values.update({
+                    key: str(value.get("status", "NOT_STARTED")).upper()
+                    if isinstance(value, Mapping)
+                    else str(value).upper()
+                    for key, value in persisted.items()
+                })
         except Exception:
             return {name: "FAILED" for name in _EXTERNAL_GATES}
     for name in _EXTERNAL_GATES:
         if values[name] not in _GATE_STATUSES:
             values[name] = "FAILED"
     return values
+
+
+def _data_health_report(
+    store: Any | None,
+    *,
+    max_age_sec: int,
+    symbols: Iterable[str],
+) -> tuple[bool, tuple[str, ...]]:
+    """Evaluate source health and preserve the first blocker per source."""
+    if store is None or not hasattr(store, "market_data_freshness"):
+        return False, ("DATA_HEALTH_NOT_AVAILABLE",)
+    try:
+        rows = store.market_data_freshness(max_age_sec=max_age_sec, symbols=symbols)
+    except Exception as exc:
+        return False, (f"DATA_HEALTH_ERROR:{type(exc).__name__}",)
+    now = datetime.now(timezone.utc)
+    reasons: list[str] = []
+    for source in sorted(REQUIRED_FUTURES_SOURCES):
+        source_rows = [
+            row for row in rows
+            if str(row.get("source") or row.get("event_type") or "").upper() == source
+        ]
+        if not source_rows:
+            reasons.append(f"{source}_MISSING")
+            continue
+        for row in source_rows:
+            if not str(row.get("symbol", "")).strip():
+                reasons.append(f"{source}_MISSING")
+                continue
+            status = str(row.get("status", "MISSING")).upper()
+            if status != "FRESH":
+                reasons.append(f"{source}_{status}")
+                continue
+            if row.get("latency_ms") is None:
+                reasons.append(f"{source}_ERROR")
+                continue
+            try:
+                source_at = datetime.fromisoformat(str(row["source_timestamp"]))
+                received_at = datetime.fromisoformat(str(row["received_timestamp"]))
+                if source_at.tzinfo is None:
+                    source_at = source_at.replace(tzinfo=timezone.utc)
+                if received_at.tzinfo is None:
+                    received_at = received_at.replace(tzinfo=timezone.utc)
+                if source_at > now or received_at > now:
+                    reasons.append(f"{source}_FUTURE_TIMESTAMP")
+                elif received_at < source_at:
+                    reasons.append(f"{source}_TIMESTAMP_INVALID")
+                elif int(row["latency_ms"]) != int(
+                    (received_at - source_at).total_seconds() * 1000
+                ):
+                    reasons.append(f"{source}_LATENCY_INVALID")
+                elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
+                    os.environ.get("MAX_DATA_LATENCY_MS", "2000")
+                ):
+                    reasons.append(f"{source}_LATENCY_EXCEEDED")
+            except (KeyError, TypeError, ValueError):
+                reasons.append(f"{source}_ERROR")
+    unique = tuple(dict.fromkeys(reasons))
+    return not unique, unique
 
 
 @dataclass(frozen=True)
@@ -245,40 +322,10 @@ def _data_health(
     max_age_sec: int,
     symbols: Iterable[str],
 ) -> bool:
-    if store is None or not hasattr(store, "market_data_freshness"):
-        return False
-    rows = store.market_data_freshness(max_age_sec=max_age_sec, symbols=symbols)
-    now = datetime.now(timezone.utc)
-    for source in REQUIRED_FUTURES_SOURCES:
-        source_rows = [
-            row for row in rows
-            if str(row.get("source") or row.get("event_type") or "").upper() == source
-        ]
-        if not source_rows or any(not str(row.get("symbol", "")).strip() for row in source_rows):
-            return False
-        for row in source_rows:
-            if str(row.get("status", "")).upper() != "FRESH":
-                return False
-            if row.get("latency_ms") is None:
-                return False
-            try:
-                source_at = datetime.fromisoformat(str(row["source_timestamp"]))
-                received_at = datetime.fromisoformat(str(row["received_timestamp"]))
-                if source_at.tzinfo is None:
-                    source_at = source_at.replace(tzinfo=timezone.utc)
-                if received_at.tzinfo is None:
-                    received_at = received_at.replace(tzinfo=timezone.utc)
-                if received_at < source_at or source_at > now or received_at > now:
-                    return False
-                if int(row["latency_ms"]) != int((received_at - source_at).total_seconds() * 1000):
-                    return False
-                if source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
-                    os.environ.get("MAX_DATA_LATENCY_MS", "2000")
-                ):
-                    return False
-            except (KeyError, TypeError, ValueError):
-                return False
-    return True
+    ok, _ = _data_health_report(
+        store, max_age_sec=max_age_sec, symbols=symbols
+    )
+    return ok
 
 
 def _risk_config_ok() -> bool:
@@ -422,9 +469,10 @@ def evaluate_runtime_gate(
         reasons.append("LEVERAGE_PARITY_NOT_VERIFIED")
 
     if data_health_ok is None:
-        data_health_ok = _data_health(
+        data_health_ok, health_reasons = _data_health_report(
             store, max_age_sec=max_data_age_sec(), symbols=selected_symbols
         )
+        reasons.extend(health_reasons)
     if not data_health_ok:
         reasons.append("DATA_HEALTH_NOT_VERIFIED")
 
@@ -447,6 +495,38 @@ def evaluate_runtime_gate(
         reasons.append("LIVE_CONFIRMATION_MISSING")
 
     statuses = _persisted_gate_statuses(store, gate_evidence)
+    evidence_ages: list[int] = []
+    supplied_evidence: Mapping[str, Any] = gate_evidence or {}
+    evidence_records: dict[str, Any] = dict(supplied_evidence)
+    evidence_getter = getattr(store, "runtime_gate_evidence", None) if store is not None else None
+    if evidence_getter is not None:
+        try:
+            evidence = evidence_getter()
+        except Exception:
+            evidence = {}
+        if isinstance(evidence, Mapping):
+            evidence_records.update(evidence)
+    now = datetime.now(timezone.utc)
+    for gate_name, row in evidence_records.items():
+        if gate_name not in statuses or not isinstance(row, Mapping):
+            continue
+        raw_verified_at = row.get("verified_at") or row.get("event_at")
+        if not raw_verified_at:
+            continue
+        try:
+            verified_at_dt = datetime.fromisoformat(
+                str(raw_verified_at).replace("Z", "+00:00")
+            )
+            if verified_at_dt.tzinfo is None:
+                verified_at_dt = verified_at_dt.replace(tzinfo=timezone.utc)
+            age = max(0, int((now - verified_at_dt).total_seconds()))
+            evidence_ages.append(age)
+            if age > gate_evidence_max_age_sec() and statuses[gate_name] == "PASSED":
+                statuses[gate_name] = "FAILED"
+                reasons.append(f"{gate_name.upper()}_EVIDENCE_STALE")
+        except ValueError:
+            statuses[gate_name] = "FAILED"
+            reasons.append(f"{gate_name.upper()}_EVIDENCE_INVALID")
     observation_gate_status = statuses["observation"]
     paper_gate_status = statuses["paper"]
     shadow_gate_status = statuses["shadow"]
@@ -537,6 +617,8 @@ def evaluate_runtime_gate(
         alpha_gate_status=alpha_status,
         meme_universe_ready=meme_ready,
         verified_at=verified_at,
-        verification_age_sec=0,
-        verification_source="runtime_gate",
+        verification_age_sec=max(evidence_ages) if evidence_ages else 0,
+        verification_source=(
+            "persisted_gate_evidence" if evidence_ages else "runtime_gate"
+        ),
     )

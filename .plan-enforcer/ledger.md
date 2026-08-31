@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 69 total  |  1 done  |  61 verified  |  0 skipped  |  2 blocked  |  5 remaining
- Drift: 5  |  Last reconcile: T63 |  Tier: structural
+ 69 total  |  0 done  |  60 verified  |  0 skipped  |  2 blocked  |  7 remaining
+ Drift: 5  |  Last reconcile: T69 |  Tier: structural
 
 ## Task Ledger
 
@@ -74,12 +74,12 @@
 | T61 | Live switches and paper smoke | verified | paper fill; live blocked | D15,V34 | HARD BLOCK until gates pass |
 | T62 | Full pytest/compile/diff | verified | 210 pass; compile; diffcheck | D15,V38 | no commit without evidence |
 | T63 | Restore and validate Futures realtime sources | verified | 76 tests; nine BTCUSDT sources FRESH | D16,V39,V40 | Real REST/stream evidence retained |
-| T64 | Validate data, orderbook, flow, funding contracts | verified | 233 tests; py3.12 compile; diffcheck | D16,V40,V41,V42,V44 | Accounting, backtest, recon, stream covered |
+| T64 | Validate data, orderbook, flow, funding contracts | verified | 246 tests; compile; diff; schema ok | D16,V40,V41,V42,V44,V47 | Accounting, backtest, recon, stream covered |
 | T65 | Run 30-minute Futures realtime smoke | blocked | real WS reset and REST disconnect | D16,D17,V43,V45,V46 | External transport unstable; no duration pass |
 | T66 | Run 24-hour Futures paper validation | pending |  | D16 | Simulated execution on real market data |
 | T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
 | T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
-| T69 | Final static validation, commit, and push | verified | 233 tests; py3.12 compile; diff; pushed | D16,D17,V44,V46,C:9b56a2f | Never upgrade unverified gates |
+| T69 | Final static validation, commit, and push | pending | 246 tests; compile; diff; push pending | D16,D17,V47 | Commit/push follows final worktree review |
 
 ## Decision Log
 
@@ -123,6 +123,7 @@
 | R20 | T63-T65 | 0 | Contract suite verified; smoke restart follows symbol fix |
 | R21 | T63-T65 | 0 | Real reset found lost GAP audit event; fixed and tested |
 | R22 | T63-T69 | 1 | T65 remains runtime-blocked; later gates not advanced |
+| R23 | T63-T69 | 2 | Fixed direct-script root import and Decimal JSON serialization; runtime gates remain |
 
 ## Reconciliation History
 

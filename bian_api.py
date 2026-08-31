@@ -224,9 +224,11 @@ def health() -> dict[str, Any]:
         database.get("status") == "ok"
         and collection.get("status") == "fresh"
     )
+    blocked = _trading_halted()
+    status = "blocked" if blocked else "healthy" if healthy else "degraded"
     return {
         "service": "bian",
-        "status": "ok" if healthy else "degraded",
+        "status": status,
         "contract_version": BIAN_OPERATOR_CONTRACT_VERSION,
         "release_version": BIAN_RELEASE_VERSION,
         "environment": BIAN_ENVIRONMENT,
@@ -278,14 +280,16 @@ def get_trading_status() -> dict[str, Any]:
         "shadow_gate_status": gate.shadow_gate_status,
         "testnet_gate_status": gate.testnet_gate_status,
         "alpha_gate_status": gate.alpha_gate_status,
+        "meme_universe_ready": gate.meme_universe_ready,
         "data_health": gate.data_health,
         "reconciliation": gate.reconciliation,
+        "risk_status": gate.risk_status,
         "verified_at": gate.verified_at,
         "verification_age_sec": gate.verification_age_sec,
+        "reasons": list(gate.reasons),
         "database_status": database_status,
         "trading_halted": halted,
         "runtime_gate": gate.as_dict(),
-        "risk_status": gate.risk_status,
         "live_orders_allowed": gate.live_allowed,
         "counts": counts,
         "summary": summary,
