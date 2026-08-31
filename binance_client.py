@@ -6,10 +6,12 @@ import time
 import json
 import hmac
 import hashlib
+import random
 import urllib.parse
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -57,6 +59,38 @@ class BinanceAPIError(BinanceError):
     """A non-order Binance API operation failed."""
 
 
+@dataclass
+class TransportMetadata:
+    """Runtime evidence shared by Futures REST operations."""
+
+    connected_at: datetime | None = None
+    last_message_at: datetime | None = None
+    reconnect_count: int = 0
+    last_disconnect_at: datetime | None = None
+    last_error: str | None = None
+    transport_latency_ms: int | None = None
+    proxy_mode: str = "DIRECT"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "connected_at": (
+                self.connected_at.isoformat() if self.connected_at else None
+            ),
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "reconnect_count": self.reconnect_count,
+            "last_disconnect_at": (
+                self.last_disconnect_at.isoformat()
+                if self.last_disconnect_at
+                else None
+            ),
+            "last_error": self.last_error,
+            "transport_latency_ms": self.transport_latency_ms,
+            "proxy_mode": self.proxy_mode,
+        }
+
+
 @dataclass(frozen=True)
 class ClientConfig:
     """Configuration loaded from environment or an explicit test mapping."""
@@ -70,6 +104,7 @@ class ClientConfig:
     retries: int = 3
     backoff_ms: int = 250
     exchange_info_ttl_sec: int = 300
+    transport_metadata: TransportMetadata = field(default_factory=TransportMetadata)
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "ClientConfig":
@@ -102,6 +137,7 @@ class ClientConfig:
             or self.exchange_info_ttl_sec < 1
         ):
             raise ValueError("invalid Binance transport configuration")
+        self.transport_metadata.proxy_mode = _proxy_mode()
 
 
 def _env_bool(name: str) -> bool:
@@ -118,6 +154,16 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return max(minimum, int(os.environ.get(name, default)))
     except ValueError:
         return default
+
+
+def _proxy_mode() -> str:
+    return "CONFIGURED" if (
+        os.environ.get("BIAN_HTTP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    ) else "DIRECT"
 
 
 def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
@@ -235,18 +281,34 @@ def _futures_transport(
     if query:
         url = f"{url}?{query}"
     request = urllib.request.Request(url, method=method.upper(), headers=headers)
+    opener = _get_http_opener()
+    metadata = config.transport_metadata
+    metadata.proxy_mode = _proxy_mode()
     for attempt in range(max(0, retries) + 1):
+        started = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=config.timeout_ms / 1000) as response:
-                return json.loads(response.read().decode("utf-8") or "null")
+            with opener.open(request, timeout=config.timeout_ms / 1000) as response:
+                payload = json.loads(response.read().decode("utf-8") or "null")
+            now = datetime.now(timezone.utc)
+            metadata.connected_at = metadata.connected_at or now
+            metadata.last_message_at = now
+            metadata.transport_latency_ms = int(
+                (time.monotonic() - started) * 1000
+            )
+            metadata.last_error = None
+            return payload
         except Exception as exc:
             translated = _translate_error(exc, operation=operation)
+            metadata.last_error = str(translated)
+            metadata.last_disconnect_at = datetime.now(timezone.utc)
             retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
             if not retryable or attempt >= retries:
                 raise translated from exc
+            metadata.reconnect_count += 1
             delay_sec = config.backoff_ms / 1000 * (2 ** attempt)
             if delay_sec:
-                time.sleep(delay_sec)
+                jitter = random.uniform(0, min(delay_sec * 0.25, 0.1))
+                time.sleep(delay_sec + jitter)
     raise AssertionError("Futures transport loop must return or raise")
 
 

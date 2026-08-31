@@ -829,6 +829,25 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertTrue(book.apply_diff({"U": 11, "u": 11, "b": [["100", "4"]], "a": []}))
         with self.assertRaises(bian_market.OrderBookGap):
             book.apply_diff({"U": 13, "u": 13, "b": [], "a": []})
+        self.assertEqual(book.state, "GAP")
+        self.assertEqual(book.features(), {})
+        self.assertEqual(book.bids, {})
+        self.assertEqual(book.asks, {})
+
+    def test_stream_health_tracks_disconnect_and_reconnect_metadata(self):
+        health = bian_market.StreamHealth()
+        now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+
+        health.mark_connected(now)
+        health.mark_message(now, latency_ms=12)
+        health.mark_disconnected("SSL EOF")
+        health.mark_reconnecting()
+
+        self.assertEqual(health.state, "RECONNECTING")
+        self.assertEqual(health.reconnect_count, 1)
+        self.assertEqual(health.last_error, "SSL EOF")
+        self.assertIsNotNone(health.last_disconnect_at)
+        self.assertEqual(health.transport_latency_ms, 12)
 
     def test_local_order_book_synchronizes_buffered_events_after_snapshot(self):
         book = bian_market.LocalOrderBook.synchronize(
@@ -847,11 +866,12 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         book = SimpleNamespace(symbol="BTC-USDT")
         gap = {"E": 1_786_493_002_000, "U": 13, "u": 13, "b": [["100", "4"]], "a": []}
 
-        self.assertIsNone(
-            bian_market._stream_orderbook(
-                book, 1_786_493_002.0, raw=gap, books=books
-            )
+        normalized = bian_market._stream_orderbook(
+            book, 1_786_493_002.0, raw=gap, books=books
         )
+        assert normalized is not None
+        assert normalized[1]["metadata"]["health_status"] == "UNSAFE"
+        assert normalized[1]["price"] is None
         self.assertNotIn("BTC-USDT", books)
 
         snapshot = {"lastUpdateId": 12, "bids": [["100", "2"]], "asks": [["101", "3"]]}
@@ -919,8 +939,9 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             books=books,
         )
 
-        self.assertIsNone(normalized)
+        self.assertIsNotNone(normalized)
         self.assertNotIn("BTC-USDT", books)
+        self.assertEqual(normalized[1]["metadata"]["health_status"], "UNSAFE")
 
     def test_orderbook_gap_is_not_overwritten_by_a_later_fresh_snapshot(self):
         pending_events: list[dict] = []

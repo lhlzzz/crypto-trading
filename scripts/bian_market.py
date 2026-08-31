@@ -70,15 +70,46 @@ class StreamHealth:
     last_error_at: datetime | None = None
     reconnect_count: int = 0
     consecutive_failures: int = 0
+    last_disconnect_at: datetime | None = None
+    last_error: str | None = None
+    transport_latency_ms: int | None = None
+    proxy_mode: str = "DIRECT"
 
     def __post_init__(self) -> None:
         if self.state not in STREAM_STATES:
             raise ValueError(f"invalid stream state: {self.state}")
+        self.proxy_mode = "CONFIGURED" if _http_proxy() else "DIRECT"
+
+    def mark_connected(self, now: datetime) -> None:
+        self.connected_at = self.connected_at or now
+        self.state = "LIVE"
+        self.consecutive_failures = 0
+
+    def mark_message(self, now: datetime, latency_ms: int | None = None) -> None:
+        self.mark_connected(now)
+        self.last_message_at = now
+        if latency_ms is not None:
+            self.transport_latency_ms = max(0, int(latency_ms))
+
+    def mark_disconnected(self, error: Exception | str) -> None:
+        now = datetime.now(timezone.utc)
+        self.state = "DISCONNECTED"
+        self.last_disconnect_at = now
+        self.last_error_at = now
+        self.last_error = str(error)
+        self.consecutive_failures += 1
+
+    def mark_reconnecting(self) -> None:
+        self.state = "RECONNECTING"
+        self.reconnect_count += 1
 
 
 def _get_http_opener() -> Any:
     """Return the one public REST opener used by every collector request."""
     global _HTTP_OPENER, _HTTP_OPENER_PROXY
+    # urllib.request.urlopen already honors standard proxy environment
+    # variables. Build an explicit opener only for BIAN_HTTP_PROXY so the
+    # existing transport seam remains observable and both paths share policy.
     proxy = os.environ.get("BIAN_HTTP_PROXY")
     if _HTTP_OPENER is None or _HTTP_OPENER_PROXY != proxy:
         _HTTP_OPENER = (
@@ -887,11 +918,7 @@ class LocalOrderBook:
             int(first["U"]) <= (book.last_update_id or 0) + 1
             <= int(first["u"])
         ):
-            book.state = "GAP"
-            book.received_U = int(first["U"])
-            book.received_u = int(first["u"])
-            book.expected_next = (book.last_update_id or 0) + 1
-            book.error_class = "OrderBookGap"
+            book._invalidate(first, "OrderBookGap")
             raise OrderBookGap("buffered depth events do not bridge snapshot")
         for event in applicable:
             book.apply_diff(event)
@@ -901,27 +928,18 @@ class LocalOrderBook:
         first = int(event["U"])
         last = int(event["u"])
         if self.last_update_id is None:
-            self.state = "UNSAFE"
-            self.error_class = "OrderBookGap"
+            self._invalidate(event, "OrderBookGap", state="UNSAFE")
             raise OrderBookGap("book must be initialized from a REST snapshot")
         if last <= self.last_update_id:
             return False
         if first > self.last_update_id + 1:
-            self.state = "GAP"
-            self.received_U = first
-            self.received_u = last
-            self.expected_next = self.last_update_id + 1
-            self.error_class = "OrderBookGap"
+            self._invalidate(event, "OrderBookGap")
             raise OrderBookGap(
                 f"depth gap: expected {self.last_update_id + 1}, got {first}"
             )
         previous_final = event.get("pu")
         if previous_final is not None and int(previous_final) != self.last_update_id:
-            self.state = "GAP"
-            self.received_U = first
-            self.received_u = last
-            self.expected_next = self.last_update_id + 1
-            self.error_class = "OrderBookGap"
+            self._invalidate(event, "OrderBookGap")
             raise OrderBookGap(
                 f"depth bridge gap: expected pu={self.last_update_id}, got {previous_final}"
             )
@@ -946,6 +964,24 @@ class LocalOrderBook:
         self.state = "VALID"
         self.error_class = None
         return True
+
+    def _invalidate(
+        self,
+        event: dict[str, Any],
+        error_class: str,
+        *,
+        state: str = "GAP",
+    ) -> None:
+        """Discard stale depth immediately; no old feature can be reused."""
+        self.bids.clear()
+        self.asks.clear()
+        self.state = state
+        self.received_U = int(event.get("U", 0))
+        self.received_u = int(event.get("u", 0))
+        self.expected_next = (
+            self.last_update_id + 1 if self.last_update_id is not None else None
+        )
+        self.error_class = error_class
 
     def features(self, mid_price: Decimal | None = None) -> dict[str, Decimal]:
         if self.state != "VALID" or not self.bids or not self.asks:
@@ -1887,9 +1923,16 @@ def _stream_orderbook(
             return None
         try:
             local_book.apply_diff(raw)
-        except OrderBookGap:
+        except OrderBookGap as exc:
             books.pop(standard_symbol, None)
-            return None
+            return _orderbook_health_event(
+                standard_symbol,
+                state="UNSAFE",
+                error_class=type(exc).__name__,
+                raw=raw,
+                received_at=received_at,
+                market=market,
+            )
         source_timestamp = _event_datetime(raw.get("E", receipt_timestamp))
         timestamp_semantics = "exchange_event"
     return _orderbook_event(
@@ -1900,6 +1943,48 @@ def _stream_orderbook(
         timestamp_semantics=timestamp_semantics,
         market=market,
     )
+
+
+def _orderbook_health_event(
+    standard_symbol: str,
+    *,
+    state: str,
+    error_class: str,
+    raw: dict[str, Any],
+    received_at: datetime,
+    market: str,
+) -> tuple[str, dict[str, Any]]:
+    """Persist a gap/failure as evidence instead of silently dropping it."""
+    source_timestamp = _event_datetime(raw.get("E", received_at.timestamp()))
+    symbol = _storage_symbol(standard_symbol)
+    event = {
+        "symbol": symbol,
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:orderbook-health:{symbol}:{source_timestamp.isoformat()}:{error_class}",
+        )),
+        "event_type": "ORDERBOOK",
+        "source": (
+            "binance_futures_diff_depth"
+            if market.upper() == "FUTURES"
+            else "binance_spot_diff_depth"
+        ),
+        "market": market.upper(),
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": None,
+        "quantity": None,
+        "direction": None,
+        "metadata": {
+            "health_status": state,
+            "state": state,
+            "error_class": error_class,
+            "received_U": raw.get("U"),
+            "received_u": raw.get("u"),
+        },
+    }
+    return standard_symbol, event
 
 
 def _queue_orderbook_observation(
@@ -2077,13 +2162,18 @@ def _build_futures_stream_handler(
         stream_health[channel] = health
 
         async def callback_wrapper(*args: Any, **kwargs: Any) -> None:
+            started = time.monotonic()
             now = datetime.now(timezone.utc)
-            if health.connected_at is None:
-                health.connected_at = now
-            health.state = "LIVE"
-            health.last_message_at = now
-            health.consecutive_failures = 0
-            await target(*args, **kwargs)
+            health.mark_connected(now)
+            try:
+                await target(*args, **kwargs)
+            except Exception as exc:
+                health.mark_disconnected(exc)
+                raise
+            health.mark_message(
+                datetime.now(timezone.utc),
+                int((time.monotonic() - started) * 1000),
+            )
 
         return callback_wrapper
 
@@ -2235,7 +2325,9 @@ async def stream(
                 normalized = await resynchronize()
         if normalized is not None:
             _, event = normalized
-            pending_observations[(event["symbol"], event["event_type"])] = event
+            _queue_orderbook_observation(
+                pending_events, pending_observations, event
+            )
 
     async def flush() -> None:
         while True:

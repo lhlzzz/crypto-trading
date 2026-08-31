@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 69 total  |  0 done  |  61 verified  |  0 skipped  |  2 blocked  |  6 remaining
- Drift: 5  |  Last reconcile: T69 |  Tier: structural
+ 71 total  |  0 done  |  63 verified  |  0 skipped  |  2 blocked  |  6 remaining
+ Drift: 6  |  Last reconcile: T71 |  Tier: structural
 
 ## Task Ledger
 
@@ -80,6 +80,8 @@
 | T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
 | T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
 | T69 | Final static validation, commit, and push | verified | 246 tests; compile; diff; pushed | D16,D17,V47,C:203f2b3 | Never upgrade unverified gates |
+| T70 | Unify Futures transport runtime metadata | verified | 248 tests; retry metadata proven | D18,V48 | Shared REST opener; no order retry |
+| T71 | Fail-close OrderBook GAP evidence | verified | 248 tests; GAP clears depth | D18,V48 | GAP persists UNSAFE until resync |
 
 ## Decision Log
 
@@ -102,6 +104,7 @@
 | D15 | T51-T62 | Unplanned: targeted futures semantic reset | User locked TradeIntent/risk/paper/stream/recon rewrite; do not replan T1-T50 |
 | D16 | T63-T69 | Continue existing readiness ledger | User supplied final validation pack; preserve external gates |
 | D17 | T65 | Persist resync GAP before fresh book coalescing | Real WS reset exposed overwritten fault evidence |
+| D18 | T70-T71 | Targeted P0 repair in existing owners | User supplied transport/GAP requirements; no new owner |
 
 ## Reconciliation History
 

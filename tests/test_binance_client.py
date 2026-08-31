@@ -75,6 +75,38 @@ def test_futures_public_client_uses_shared_public_rest_opener() -> None:
     opener.open.assert_called_once()
 
 
+def test_futures_transport_records_runtime_metadata_and_retries() -> None:
+    response = MagicMock()
+    response.read.return_value = b'{"serverTime": 1}'
+    response.__enter__.return_value = response
+    opener = MagicMock()
+    opener.open.side_effect = [TimeoutError("reset"), response]
+    config = ClientConfig(mode="paper", retries=1, backoff_ms=25)
+
+    with patch("binance_client._get_http_opener", return_value=opener), patch(
+        "binance_client.time.sleep"
+    ), patch("binance_client.random.uniform", return_value=0):
+        assert config.transport_metadata is not None
+        assert config.transport_metadata.proxy_mode in {"DIRECT", "CONFIGURED"}
+        assert config.transport_metadata.as_dict()["last_error"] is None
+        from binance_client import _futures_transport
+
+        assert _futures_transport(
+            config,
+            "GET",
+            "/fapi/v1/time",
+            retries=1,
+            operation="get_server_time",
+        ) == {"serverTime": 1}
+
+    metadata = config.transport_metadata
+    assert metadata.connected_at is not None
+    assert metadata.last_message_at is not None
+    assert metadata.reconnect_count == 1
+    assert metadata.transport_latency_ms is not None
+    assert metadata.last_error is None
+
+
 def test_futures_public_client_reads_aggregate_trades(monkeypatch) -> None:
     client = FuturesPublicClient(ClientConfig(mode="paper"))
     calls = []
