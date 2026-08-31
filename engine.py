@@ -24,6 +24,9 @@ PositioningState = Literal[
 Direction = Literal["LONG", "SHORT", "FLAT"]
 Action = Literal["OPEN", "REDUCE", "CLOSE"]
 MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
+EvidenceStatus = Literal[
+    "REQUIRED", "AVAILABLE", "STALE", "UNSAFE", "MISSING", "CONFLICTING"
+]
 MarketRegime = Literal[
     "RISK_ON", "RISK_OFF", "TRENDING_UP", "TRENDING_DOWN",
     "HIGH_VOL", "LOW_VOL", "NEUTRAL",
@@ -232,6 +235,33 @@ class EvidenceVector:
 
 
 @dataclass(frozen=True)
+class EvidenceSufficiency:
+    """Explain whether critical positioning evidence can support an entry."""
+
+    required: tuple[str, ...] = ()
+    available: tuple[str, ...] = ()
+    stale: tuple[str, ...] = ()
+    unsafe: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+    conflicting: tuple[str, ...] = ()
+
+    @property
+    def sufficient(self) -> bool:
+        return not (self.stale or self.unsafe or self.missing or self.conflicting)
+
+    def as_dict(self) -> dict[str, list[str] | bool]:
+        return {
+            "required": list(self.required),
+            "available": list(self.available),
+            "stale": list(self.stale),
+            "unsafe": list(self.unsafe),
+            "missing": list(self.missing),
+            "conflicting": list(self.conflicting),
+            "sufficient": self.sufficient,
+        }
+
+
+@dataclass(frozen=True)
 class PositioningWeights:
     price: Decimal = Decimal("1")
     futures_trade_flow: Decimal = Decimal("2")
@@ -262,6 +292,7 @@ class PositioningDecision:
     data_quality_score: Decimal
     reason_codes: tuple[str, ...]
     evidence: EvidenceVector
+    evidence_sufficiency: EvidenceSufficiency
     evidence_snapshot_id: UUID
     market_regime: MarketRegime
     source_timestamps: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -285,6 +316,7 @@ class PositioningDecision:
             "data_quality_score": str(self.data_quality_score),
             "reason_codes": list(self.reason_codes),
             "evidence": self.evidence.__dict__,
+            "evidence_sufficiency": self.evidence_sufficiency.as_dict(),
             "evidence_snapshot_id": str(self.evidence_snapshot_id),
             "market_regime": self.market_regime,
             "source_timestamps": dict(self.source_timestamps),
@@ -390,6 +422,7 @@ class MarketFrame:
     meme_risk_tier: MemeRiskTier = "OBSERVE"
     freshness: tuple[SourceFreshness, ...] = ()
     data_quality_score: Decimal | None = None
+    evidence_status: Mapping[str, EvidenceStatus] = field(default_factory=dict)
     source_timestamps: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @classmethod
@@ -403,6 +436,10 @@ class MarketFrame:
         captured_at = _aware(datetime.fromisoformat(str(payload["timestamp"])))
         inputs = dict(payload.get("input_features") or {})
         source_timestamps = dict(payload.get("source_timestamps") or {})
+        evidence_status = {
+            str(name): str(status).upper()
+            for name, status in (inputs.get("evidence_status") or {}).items()
+        }
         decimal_fields = {
             "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
@@ -474,6 +511,7 @@ class MarketFrame:
             market_regime=market_regime,  # type: ignore[arg-type]
             meme_risk_tier=str(inputs.get("meme_risk_tier", "OBSERVE")),  # type: ignore[arg-type]
             freshness=tuple(freshness),
+            evidence_status=evidence_status,  # type: ignore[arg-type]
             source_timestamps=source_timestamps,
             **values,
         )
@@ -648,7 +686,9 @@ class StrategyEngine:
         evaluation_now = _aware(now or timestamp)
         if timestamp > evaluation_now:
             return self._unknown_decision(frame, timestamp, "FUTURE_DATA")
-        evidence, quality, reasons = self._evidence(frame, evaluation_now)
+        evidence, quality, reasons, sufficiency = self._evidence(
+            frame, evaluation_now
+        )
         long_score, short_score = self._scores(evidence)
         crowding = self._crowding_score(frame)
         liquidity = self._liquidity_score(frame)
@@ -676,6 +716,7 @@ class StrategyEngine:
             and quality >= self.config.minimum_data_quality
             and liquidity >= self.config.minimum_liquidity_score
             and crowding <= self.config.maximum_crowding
+            and sufficiency.sufficient
         )
         if state == "LONG_BUILDING" and passes:
             if edge >= self.config.minimum_positioning_edge:
@@ -699,6 +740,8 @@ class StrategyEngine:
             reasons.append("LIQUIDITY_LOW")
         if quality < self.config.minimum_data_quality:
             reasons.append("DATA_QUALITY_LOW")
+        if not sufficiency.sufficient:
+            reasons.append("POSITIONING_EVIDENCE_INSUFFICIENT")
         if (
             prior is not None
             and prior != state
@@ -724,6 +767,7 @@ class StrategyEngine:
             data_quality_score=quality,
             reason_codes=tuple(dict.fromkeys(reasons)),
             evidence=evidence,
+            evidence_sufficiency=sufficiency,
             evidence_snapshot_id=snapshot_id,
             market_regime=frame.market_regime,
             source_timestamps=frame.source_timestamps,
@@ -743,6 +787,16 @@ class StrategyEngine:
             crowding_score=Decimal("0"), liquidity_score=Decimal("0"),
             data_quality_score=Decimal("0"), reason_codes=(reason,),
             evidence=EvidenceVector(), evidence_snapshot_id=snapshot_id,
+            evidence_sufficiency=EvidenceSufficiency(
+                required=(
+                    "price", "futures_trade_flow", "oi", "funding",
+                    "taker", "orderbook", "spread", "liquidity",
+                ),
+                missing=(
+                    "price", "futures_trade_flow", "oi", "funding",
+                    "taker", "orderbook", "spread", "liquidity",
+                ),
+            ),
             market_regime=frame.market_regime,
             source_timestamps=frame.source_timestamps,
             input_features=self._input_features(frame),
@@ -800,6 +854,7 @@ class StrategyEngine:
             "relative_strength_15m", "relative_strength_1h",
             "advance_decline_ratio",
             "market_regime", "meme_risk_tier", "data_quality_score",
+            "evidence_status",
         )
         return {name: getattr(frame, name) for name in names}
 
@@ -895,10 +950,15 @@ class StrategyEngine:
 
     def _evidence(
         self, frame: MarketFrame, now: datetime
-    ) -> tuple[EvidenceVector, Decimal, list[str]]:
+    ) -> tuple[EvidenceVector, Decimal, list[str], EvidenceSufficiency]:
         reasons: list[str] = []
         if not frame.freshness:
-            return EvidenceVector(), Decimal("0"), ["MISSING_FRESHNESS"]
+            return (
+                EvidenceVector(),
+                Decimal("0"),
+                ["MISSING_FRESHNESS"],
+                self._evidence_sufficiency(frame, now),
+            )
 
         def _item_fresh(item: SourceFreshness) -> bool:
             return (
@@ -1018,13 +1078,95 @@ class StrategyEngine:
             reasons.append("TAKER_BUY")
         elif _negative(taker_signal):
             reasons.append("TAKER_SELL")
+        sufficiency = self._evidence_sufficiency(frame, now)
+        for name in sufficiency.stale:
+            reasons.append(f"EVIDENCE_STALE:{name}")
+        for name in sufficiency.unsafe:
+            reasons.append(f"EVIDENCE_UNSAFE:{name}")
+        for name in sufficiency.missing:
+            reasons.append(f"EVIDENCE_MISSING:{name}")
+        for name in sufficiency.conflicting:
+            reasons.append(f"EVIDENCE_CONFLICTING:{name}")
+        if sufficiency.missing or sufficiency.stale or sufficiency.unsafe:
+            quality = min(
+                quality, self.config.minimum_data_quality - Decimal("0.01")
+            )
         return EvidenceVector(
             price=price_signal, futures_trade_flow=flow_signal, cvd=cvd_signal, oi=oi_signal,
             funding=funding_signal, taker=taker_signal, orderbook=orderbook_signal,
             liquidation=liquidation_signal, relative_strength=relative_signal,
             basis=basis_signal, market_regime=regime_signal,
             quality=quality, freshness=freshness,
-        ), quality, reasons
+        ), quality, reasons, sufficiency
+
+    @staticmethod
+    def _evidence_sufficiency(
+        frame: MarketFrame, now: datetime
+    ) -> EvidenceSufficiency:
+        source_for = {
+            "price": "futures_mark_price",
+            "futures_trade_flow": "futures_trade_flow",
+            "oi": "futures_open_interest",
+            "funding": "futures_funding",
+            "taker": "futures_taker_ratio",
+            "orderbook": "futures_orderbook",
+            "spread": "futures_book_ticker",
+            "liquidity": "futures_orderbook",
+        }
+        values = {
+            "price": frame.last_price or frame.mark_price or (
+                frame.closes[-1] if frame.closes else None
+            ),
+            "futures_trade_flow": frame.futures_trade_flow,
+            "oi": frame.oi_change,
+            "funding": frame.funding_rate,
+            "taker": (
+                frame.taker_buy_volume
+                if frame.taker_buy_volume is not None
+                and frame.taker_sell_volume is not None
+                else None
+            ),
+            "orderbook": frame.depth_25bps,
+            "spread": frame.spread_bps,
+            "liquidity": frame.depth_25bps,
+        }
+        freshness = {item.source.lower(): item for item in frame.freshness}
+        statuses = {
+            str(name): str(status).upper()
+            for name, status in frame.evidence_status.items()
+        }
+        available: list[str] = []
+        stale: list[str] = []
+        unsafe: list[str] = []
+        missing: list[str] = []
+        conflicting: list[str] = []
+        for name, source in source_for.items():
+            explicit = statuses.get(name) or statuses.get(source)
+            if explicit in {"UNSAFE", "GAP", "ERROR"}:
+                unsafe.append(name)
+                continue
+            if values[name] is None:
+                missing.append(name)
+                continue
+            item = freshness.get(source.lower())
+            if item is not None and not (
+                _aware(item.received_timestamp) <= _aware(now)
+                and _aware(item.source_timestamp) <= _aware(now)
+                and item.age_sec <= max(1, item.max_age_sec)
+            ):
+                stale.append(name)
+                continue
+            available.append(name)
+        if frame.price_cvd_divergence:
+            conflicting.extend(("price", "futures_trade_flow"))
+        return EvidenceSufficiency(
+            required=tuple(source_for),
+            available=tuple(available),
+            stale=tuple(stale),
+            unsafe=tuple(unsafe),
+            missing=tuple(missing),
+            conflicting=tuple(conflicting),
+        )
 
     def _scores(self, evidence: EvidenceVector) -> tuple[Decimal, Decimal]:
         weights = self.config.positioning_weights

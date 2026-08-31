@@ -232,6 +232,43 @@ def test_paper_open_and_close_long() -> None:
     assert "BTC" not in store.balances
 
 
+def test_paper_exit_remains_possible_while_store_is_halted() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(
+            mode="paper",
+            fee_rate=Decimal("0"),
+            slippage_bps=Decimal("0"),
+        ),
+    )
+    opened = _intent(quantity=Decimal("0.1"))
+    executor.submit(opened, _risk(opened), market=_market())
+    store.halted = True
+
+    close = _intent(
+        action="CLOSE",
+        reduce_only=True,
+        quantity=Decimal("0.1"),
+        positioning_state="UNKNOWN",
+        meme_risk_tier="BLOCK",
+    )
+    decision = _risk(
+        close,
+        halted=True,
+        evidence_conflict=True,
+        data_quality_score=Decimal("0"),
+        liquidity_score=Decimal("0"),
+        positioning_confidence=Decimal("0"),
+        meme_risk_tier="BLOCK",
+    )
+
+    result = executor.submit(close, decision, market=_market())
+
+    assert decision.decision == "ALLOW"
+    assert result.status == "FILLED"
+
+
 def test_paper_close_realized_pnl_updates_wallet_and_equity() -> None:
     store = MemoryStore()
     executor = PaperExecutor(

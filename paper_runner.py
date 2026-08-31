@@ -154,6 +154,20 @@ def _market_frame(
             "advance_decline_ratio", "market_regime", "meme_risk_tier",
         }
     })
+    evidence_status: dict[str, str] = {}
+    for event in positioning_events or []:
+        if str(event.get("event_type", "")).upper() != "ORDERBOOK":
+            continue
+        metadata = event.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        state = str(
+            metadata.get("health_status") or metadata.get("state") or ""
+        ).upper()
+        if state in {"GAP", "UNSAFE", "ERROR"}:
+            evidence_status["orderbook"] = "UNSAFE"
+        elif state == "VALID":
+            evidence_status["orderbook"] = "AVAILABLE"
     source_timestamps = {
         "futures_klines": {
             "source_timestamp": source_timestamp.isoformat(),
@@ -184,6 +198,7 @@ def _market_frame(
         captured_at=captured_at,
         quote_volume=_decimal(raw_klines[-1][7]) if len(raw_klines[-1]) > 7 else None,
         freshness=tuple(source_freshness),
+        evidence_status=evidence_status,
         source_timestamps=source_timestamps,
         **features,
     )

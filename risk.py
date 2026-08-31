@@ -296,59 +296,71 @@ class RiskGate:
         self.limits = limits or RiskLimits()
 
     def evaluate(self, intent: TradeIntent, context: RiskContext) -> RiskDecision:
-        if context.halted:
+        entry = intent.action == "OPEN"
+        if context.halted and entry:
             return self._halt(intent, "trading is halted")
         if os.environ.get("BIAN_KILL_SWITCH", "false").strip().lower() in {"1", "true", "yes", "on"}:
-            if intent.action == "OPEN":
+            if entry:
                 return self._deny(intent, "kill switch blocks new opens")
-        if context.evidence_conflict:
+        if context.evidence_conflict and entry:
             return self._deny(intent, "positioning evidence is conflicted")
         risk_driven_reduction = False
-        if intent.action in {"REDUCE", "CLOSE"} and intent.positioning_state in {
-            "UNKNOWN", "CONFLICTED",
-        }:
-            if intent.action != "REDUCE" or context.position_notional < self.limits.max_position_usdt:
-                return self._deny(intent, "positioning state does not permit position reduction")
-            risk_driven_reduction = True
-        if context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK":
+        if entry and (
+            context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK"
+        ):
             return self._deny(intent, "meme symbol is blocked")
-        if context.meme_risk_tier == "OBSERVE" or intent.meme_risk_tier == "OBSERVE":
+        if entry and (
+            context.meme_risk_tier == "OBSERVE"
+            or intent.meme_risk_tier == "OBSERVE"
+        ):
             return self._deny(intent, "meme symbol is observe-only")
         if (
+            entry
+            and
             context.data_quality_score is not None
             and context.data_quality_score < self.limits.min_data_quality_score
         ):
             return self._deny(intent, "positioning data quality is below threshold")
         if (
+            entry
+            and
             context.liquidity_score is not None
             and context.liquidity_score < self.limits.min_liquidity_score
         ):
             return self._deny(intent, "positioning liquidity is below threshold")
         if (
+            entry
+            and
             context.positioning_confidence is not None
             and context.positioning_confidence < self.limits.min_positioning_confidence
         ):
             return self._deny(intent, "positioning confidence is below threshold")
         if (
+            entry
+            and
             self.limits.max_daily_loss_usdt > 0
             and context.daily_pnl_usdt <= -self.limits.max_daily_loss_usdt
         ):
             return self._halt(intent, "maximum daily loss reached")
         if (
+            entry
+            and
             self.limits.max_drawdown_percent > 0
             and context.drawdown_percent >= self.limits.max_drawdown_percent
         ):
             return self._halt(intent, "maximum drawdown reached")
-        if intent.client_order_id in context.existing_client_order_ids:
+        if entry and intent.client_order_id in context.existing_client_order_ids:
             return self._deny(intent, "duplicate client_order_id")
-        if context.open_orders >= self.limits.max_open_orders:
+        if entry and context.open_orders >= self.limits.max_open_orders:
             return self._deny(intent, "maximum open orders reached")
         if (
+            entry
+            and
             intent.symbol not in context.active_symbols
             and len(context.active_symbols) >= self.limits.max_concurrent_symbols
         ):
             return self._deny(intent, "maximum concurrent symbols reached")
-        if self._in_cooldown(intent, context):
+        if entry and self._in_cooldown(intent, context):
             return self._deny(intent, "symbol cooldown is active")
 
         if context.margin_type.upper() != "ISOLATED" or intent.margin_type != "ISOLATED":
@@ -364,10 +376,26 @@ class RiskGate:
         if rules is not None:
             if rules.symbol.upper() != intent.symbol:
                 return self._deny(intent, "exchange rules symbol mismatch")
-            if rules.status != "TRADING":
+            if entry and rules.status != "TRADING":
                 return self._deny(intent, "symbol is not trading")
 
         mark_price = context.mark_price
+        action_decision = self._position_action(intent, context)
+        if action_decision is not None:
+            return action_decision
+        if mark_price is None and not entry:
+            normalized = self._normalize(intent, rules)
+            if normalized is None:
+                return self._deny(intent, "exchange quantity rules failed")
+            if normalized != intent:
+                return RiskDecision(
+                    decision="REDUCE",
+                    reason="exit quantity normalized to exchange rules",
+                    intent=intent,
+                    adjusted_intent=normalized,
+                    violations=("normalized_order",),
+                )
+            return RiskDecision(decision="ALLOW", reason="exit safety path", intent=intent)
         notional = self._notional(intent, mark_price)
         if notional is None:
             return self._deny(intent, "mark price is required to value the order")
@@ -382,10 +410,6 @@ class RiskGate:
             deviation = abs(intent.price - mark_price) / mark_price * 100
             if deviation > self.limits.max_price_deviation_percent:
                 return self._deny(intent, "price deviation limit exceeded")
-
-        action_decision = self._position_action(intent, context)
-        if action_decision is not None:
-            return action_decision
 
         normalized = self._normalize(intent, rules)
         if normalized is None:

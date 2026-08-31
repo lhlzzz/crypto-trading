@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 71 total  |  0 done  |  63 verified  |  0 skipped  |  2 blocked  |  6 remaining
- Drift: 6  |  Last reconcile: T71 |  Tier: structural
+ 73 total  |  0 done  |  65 verified  |  0 skipped  |  2 blocked  |  6 remaining
+ Drift: 7  |  Last reconcile: T73 |  Tier: structural
 
 ## Task Ledger
 
@@ -82,6 +82,8 @@
 | T69 | Final static validation, commit, and push | verified | 246 tests; compile; diff; pushed | D16,D17,V47,C:203f2b3 | Never upgrade unverified gates |
 | T70 | Unify Futures transport runtime metadata | verified | 248 tests; retry metadata proven | D18,V48 | Shared REST opener; no order retry |
 | T71 | Fail-close OrderBook GAP evidence | verified | 248 tests; GAP clears depth | D18,V48 | GAP persists UNSAFE until resync |
+| T72 | Add explicit Evidence Sufficiency | verified | 252 tests; status classes persisted | D19,V49 | OPEN requires complete critical evidence |
+| T73 | Preserve exit safety under uncertainty | verified | 252 tests; halted CLOSE fills | D19,V49 | REDUCE/CLOSE bypass entry-only blocks |
 
 ## Decision Log
 
@@ -105,6 +107,7 @@
 | D16 | T63-T69 | Continue existing readiness ledger | User supplied final validation pack; preserve external gates |
 | D17 | T65 | Persist resync GAP before fresh book coalescing | Real WS reset exposed overwritten fault evidence |
 | D18 | T70-T71 | Targeted P0 repair in existing owners | User supplied transport/GAP requirements; no new owner |
+| D19 | T72-T73 | Entry and exit safety are separate paths | Critical evidence gates OPEN; exits remain possible |
 
 ## Reconciliation History
 

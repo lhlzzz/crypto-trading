@@ -161,6 +161,43 @@ def test_one_stale_required_source_fails_closed_even_when_others_are_fresh() -> 
     assert decision.direction == "FLAT"
 
 
+def test_evidence_sufficiency_reports_stale_and_unsafe_critical_inputs() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    frame = _positioning_frame(
+        oi_change=Decimal("0.03"),
+        evidence_status={"orderbook": "UNSAFE"},
+        freshness=(
+            SourceFreshness(
+                "futures_open_interest",
+                captured.replace(hour=11),
+                captured.replace(hour=11),
+                1,
+                captured.replace(hour=13),
+            ),
+        ),
+    )
+
+    decision = StrategyEngine().positioning_decision(
+        frame, now=captured.replace(hour=13)
+    )
+
+    assert decision.evidence_sufficiency.sufficient is False
+    assert "oi" in decision.evidence_sufficiency.stale
+    assert "orderbook" in decision.evidence_sufficiency.unsafe
+    assert decision.direction == "FLAT"
+    assert "POSITIONING_EVIDENCE_INSUFFICIENT" in decision.reason_codes
+
+
+def test_unsafe_orderbook_cannot_be_entry_evidence_when_other_inputs_are_fresh() -> None:
+    decision = StrategyEngine().positioning_decision(
+        _positioning_frame(evidence_status={"orderbook": "UNSAFE"})
+    )
+
+    assert decision.state == "UNKNOWN"
+    assert decision.direction == "FLAT"
+    assert decision.evidence_sufficiency.sufficient is False
+
+
 def test_missing_timestamp_provenance_fails_closed() -> None:
     decision = StrategyEngine().positioning_decision(
         _positioning_frame(source_timestamps={})

@@ -257,7 +257,7 @@ class PaperExecutor(_BaseExecutor):
             raise ValueError("paper execution requires a positive market snapshot")
         if market.mark_price is None or market.mark_price <= 0:
             raise ValueError("paper execution requires a positive mark_price")
-        if self.store.is_halted():
+        if self.store.is_halted() and intent.action == "OPEN":
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
         requested_quantity = approved.quantity
@@ -1102,7 +1102,7 @@ class BinanceExecutor(_BaseExecutor):
         *,
         market: MarketSnapshot | None = None,
     ) -> ExecutionResult:
-        if self.store.is_halted():
+        if self.store.is_halted() and intent.action == "OPEN":
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
         order_id = self._create_order(approved, status="CREATED")

@@ -361,3 +361,29 @@ def test_kill_switch_blocks_open_but_allows_close(monkeypatch) -> None:
     assert open_decision.decision == "DENY"
     assert "kill switch" in open_decision.reason
     assert close_decision.decision == "ALLOW"
+
+
+def test_exit_safety_survives_halt_and_untrusted_entry_evidence() -> None:
+    decision = RiskGate().evaluate(
+        _intent(
+            action="CLOSE",
+            reduce_only=True,
+            price=None,
+            positioning_state="UNKNOWN",
+            meme_risk_tier="BLOCK",
+        ),
+        _context(
+            halted=True,
+            evidence_conflict=True,
+            meme_risk_tier="BLOCK",
+            data_quality_score=Decimal("0"),
+            liquidity_score=Decimal("0"),
+            positioning_confidence=Decimal("0"),
+            mark_price=None,
+            position_direction="LONG",
+            position_quantity=Decimal("0.1"),
+        ),
+    )
+
+    assert decision.decision == "ALLOW"
+    assert decision.reason == "exit safety path"
