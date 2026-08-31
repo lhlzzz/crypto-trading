@@ -511,6 +511,23 @@ def _create_trading_tables(cursor: Any) -> None:
     )
     cursor.execute(
         """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'trade_intents_evidence_snapshot_id_fkey'
+            ) THEN
+                ALTER TABLE trade_intents
+                ADD CONSTRAINT trade_intents_evidence_snapshot_id_fkey
+                FOREIGN KEY (evidence_snapshot_id)
+                REFERENCES evidence_snapshots(snapshot_id);
+            END IF;
+        END $$
+        """
+    )
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS liquidation_events (
             event_id UUID PRIMARY KEY,
             symbol TEXT NOT NULL,

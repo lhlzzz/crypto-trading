@@ -150,7 +150,7 @@ def test_futures_account_snapshot_uses_exchange_truth() -> None:
         },
     ), patch.object(
         client,
-        "get_positions",
+        "get_position_risk",
         return_value=[{
             "symbol": "DOGEUSDT",
             "positionAmt": "10",
@@ -171,6 +171,7 @@ def test_futures_account_snapshot_uses_exchange_truth() -> None:
     assert snapshot.used_margin == Decimal("20")
     assert snapshot.realized_pnl == Decimal("7")
     assert snapshot.leverage["DOGEUSDT"] == Decimal("3")
+    assert snapshot.symbol_leverage["DOGEUSDT"] == Decimal("3")
     assert snapshot.position_mode == "ONE_WAY"
     assert snapshot.fresh is True
 

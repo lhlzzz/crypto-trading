@@ -5,7 +5,7 @@ events, calculate strategy signals, or submit orders.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Literal, Mapping
@@ -186,10 +186,21 @@ class FuturesAccountSnapshot:
     captured_at: datetime
     source: str
     freshness: str = "FRESH"
+    symbol_leverage: Mapping[str, Decimal] = field(default_factory=dict)
 
     @property
     def fresh(self) -> bool:
         return self.freshness == "FRESH"
+
+    def is_fresh(self, *, now: datetime, max_age_sec: int) -> bool:
+        captured_at = self.captured_at
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+        return (
+            self.fresh
+            and captured_at <= now
+            and (now - captured_at).total_seconds() <= max(1, max_age_sec)
+        )
 
     @classmethod
     def from_binance(
@@ -201,6 +212,7 @@ class FuturesAccountSnapshot:
         open_orders: list[Mapping[str, Any]],
         position_mode: Mapping[str, Any],
         captured_at: datetime,
+        symbol_leverage: Mapping[str, Decimal] | None = None,
     ) -> "FuturesAccountSnapshot":
         assets = account.get("assets") or account.get("balances") or ()
         usdt = next(
@@ -210,7 +222,7 @@ class FuturesAccountSnapshot:
             ),
             {},
         )
-        leverages = {
+        position_leverage = {
             str(row.get("symbol")).upper(): Decimal(str(row.get("leverage")))
             for row in positions
             if row.get("symbol") and row.get("leverage") is not None
@@ -223,6 +235,12 @@ class FuturesAccountSnapshot:
         realized_pnl = account.get("totalRealizedProfit")
         if realized_pnl is None:
             realized_pnl = account.get("realizedPnl", usdt.get("realizedProfit", "0"))
+        if not margin_modes:
+            margin_mode = "UNKNOWN"
+        elif len(margin_modes) == 1:
+            margin_mode = tuple(margin_modes)[0]
+        else:
+            margin_mode = "MIXED"
         return cls(
             mode=mode,
             wallet_balance=Decimal(str(
@@ -243,8 +261,8 @@ class FuturesAccountSnapshot:
             realized_pnl=Decimal(str(realized_pnl)),
             positions=tuple(positions),
             open_orders=tuple(open_orders),
-            leverage=leverages,
-            margin_mode=next(iter(margin_modes), "UNKNOWN"),
+            leverage=position_leverage,
+            margin_mode=margin_mode,
             position_mode=(
                 "HEDGE"
                 if str(position_mode.get("dualSidePosition", "false")).lower() == "true"
@@ -252,6 +270,51 @@ class FuturesAccountSnapshot:
             ),
             captured_at=captured_at,
             source="binance_futures_rest",
+            symbol_leverage=dict(symbol_leverage or {}),
+        )
+
+    @classmethod
+    def from_paper(
+        cls,
+        *,
+        account: Mapping[str, Decimal],
+        positions: list[Mapping[str, Any]],
+        open_orders: list[Mapping[str, Any]],
+        captured_at: datetime,
+    ) -> "FuturesAccountSnapshot":
+        leverages = {
+            str(row.get("symbol")).upper(): Decimal(str(row["leverage"]))
+            for row in positions
+            if row.get("symbol") and row.get("leverage") is not None
+        }
+        margin_modes = {
+            str(row.get("margin_type", "ISOLATED")).upper()
+            for row in positions
+            if Decimal(str(row.get("quantity", "0"))) != 0
+        }
+        margin_mode = (
+            "ISOLATED"
+            if not margin_modes
+            else tuple(margin_modes)[0]
+            if len(margin_modes) == 1
+            else "MIXED"
+        )
+        return cls(
+            mode="paper",
+            wallet_balance=account["wallet_balance"],
+            available_balance=account["available_balance"],
+            total_margin=account["margin_balance"],
+            used_margin=account["used_margin"],
+            unrealized_pnl=account["unrealized_pnl"],
+            realized_pnl=account["realized_pnl"],
+            positions=tuple(positions),
+            open_orders=tuple(open_orders),
+            leverage=leverages,
+            margin_mode=margin_mode,
+            position_mode="ONE_WAY",
+            captured_at=captured_at,
+            source="paper_executor",
+            symbol_leverage=leverages,
         )
 
 
@@ -298,6 +361,7 @@ class RiskContext:
     is_meme: bool | None = None
     meme_require_classification: bool = True
     account_snapshot: FuturesAccountSnapshot | None = None
+    account_state_error: str | None = None
     symbol_meme_notional: Decimal = Decimal("0")
     total_meme_notional: Decimal = Decimal("0")
     directional_meme_exposure: Decimal = Decimal("0")
@@ -384,12 +448,19 @@ class RiskGate:
 
     def evaluate(self, intent: TradeIntent, context: RiskContext) -> RiskDecision:
         entry = intent.action == "OPEN"
-        if entry and (
-            context.account_snapshot is None
-            or not context.account_snapshot.fresh
-            or context.account_snapshot.mode != context.mode
+        if context.account_snapshot is None:
+            return self._halt(intent, "ACCOUNT_UNAVAILABLE")
+        if context.account_snapshot.mode != context.mode:
+            return self._halt(intent, "INVALID_ACCOUNT_STATE: snapshot mode mismatch")
+        if context.account_state_error is not None:
+            return self._halt(
+                intent, f"INVALID_ACCOUNT_STATE: {context.account_state_error}"
+            )
+        if entry and not context.account_snapshot.is_fresh(
+            now=datetime.now(timezone.utc),
+            max_age_sec=_int_env("ACCOUNT_SNAPSHOT_MAX_AGE_SEC", 30),
         ):
-            return self._halt(intent, "fresh canonical account snapshot is required")
+            return self._halt(intent, "ACCOUNT_SNAPSHOT_STALE")
         if context.halted and entry:
             return self._halt(intent, "trading is halted")
         if os.environ.get("BIAN_KILL_SWITCH", "false").strip().lower() in {"1", "true", "yes", "on"}:
@@ -462,7 +533,12 @@ class RiskGate:
             context.margin_type.upper() != "ISOLATED"
             or intent.margin_type != "ISOLATED"
         ):
-            return self._halt(intent, "margin type mismatch")
+            reason = (
+                "mixed margin modes cannot be traded"
+                if context.margin_type.upper() == "MIXED"
+                else "margin type mismatch"
+            )
+            return self._halt(intent, reason)
         if entry and (
             context.position_mode.upper() != "ONE_WAY"
             or intent.position_mode != "ONE_WAY"

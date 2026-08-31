@@ -688,7 +688,11 @@ class FuturesPrivateClient:
     def account_snapshot(self) -> FuturesAccountSnapshot:
         captured_at = datetime.now(timezone.utc)
         account = self.get_account()
-        positions = self.get_positions()
+        position_risk = self.get_position_risk()
+        positions = [
+            row for row in position_risk
+            if Decimal(str(row.get("positionAmt") or "0")) != 0
+        ]
         open_orders = self.get_open_orders()
         position_mode = self.get_position_mode()
         return FuturesAccountSnapshot.from_binance(
@@ -698,6 +702,11 @@ class FuturesPrivateClient:
             open_orders=open_orders,
             position_mode=position_mode,
             captured_at=captured_at,
+            symbol_leverage={
+                str(row["symbol"]).upper(): Decimal(str(row["leverage"]))
+                for row in position_risk
+                if row.get("symbol") and row.get("leverage") is not None
+            },
         )
 
     def get_server_time(self) -> dict[str, Any]:

@@ -448,23 +448,11 @@ class PaperExecutor(_BaseExecutor):
     def account_snapshot(self) -> FuturesAccountSnapshot:
         account = self.account_state()
         positions = getattr(self.store, "list_positions", lambda: [])()
-        return FuturesAccountSnapshot(
-            mode="paper",
-            wallet_balance=account["wallet_balance"],
-            available_balance=account["available_balance"],
-            total_margin=account["margin_balance"],
-            used_margin=account["used_margin"],
-            unrealized_pnl=account["unrealized_pnl"],
-            realized_pnl=account["realized_pnl"],
-            positions=tuple(positions),
-            open_orders=tuple(
-                getattr(self.store, "list_open_local_orders", lambda: [])()
-            ),
-            leverage={},
-            margin_mode="ISOLATED",
-            position_mode="ONE_WAY",
+        return FuturesAccountSnapshot.from_paper(
+            account=account,
+            positions=positions,
+            open_orders=getattr(self.store, "list_open_local_orders", lambda: [])(),
             captured_at=datetime.now(timezone.utc),
-            source="paper_executor",
         )
 
     def liquidation_price_for(

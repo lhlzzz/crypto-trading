@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -325,6 +326,75 @@ def test_evidence_conflict_is_denied() -> None:
 def test_margin_type_mismatch_halts() -> None:
     decision = RiskGate().evaluate(_intent(), _context(margin_type="CROSSED"))
     assert decision.decision == "HALT"
+
+
+def test_mixed_margin_mode_halts_new_opens() -> None:
+    decision = RiskGate().evaluate(_intent(), _context(margin_type="MIXED"))
+
+    assert decision.decision == "HALT"
+    assert "mixed margin" in decision.reason
+
+
+def test_account_snapshot_mode_mismatch_halts() -> None:
+    snapshot = _context().account_snapshot
+    assert snapshot is not None
+    mismatched_snapshot = replace(snapshot, mode="testnet")
+    decision = RiskGate().evaluate(
+        _intent(),
+        replace(_context(), account_snapshot=mismatched_snapshot),
+    )
+
+    assert decision.decision == "HALT"
+    assert "INVALID_ACCOUNT_STATE" in decision.reason
+
+
+def test_stale_account_snapshot_blocks_open_but_not_reduce_only_exit() -> None:
+    stale = FuturesAccountSnapshot(
+        mode="paper",
+        wallet_balance=Decimal("1000"),
+        available_balance=Decimal("1000"),
+        total_margin=Decimal("1000"),
+        used_margin=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        positions=(),
+        open_orders=(),
+        leverage={},
+        margin_mode="ISOLATED",
+        position_mode="ONE_WAY",
+        captured_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+        source="test",
+    )
+    open_decision = RiskGate().evaluate(_intent(), _context(account_snapshot=stale))
+    close = _intent(action="CLOSE", reduce_only=True)
+    close_decision = RiskGate().evaluate(
+        close,
+        _context(
+            account_snapshot=stale,
+            position_direction="LONG",
+            position_quantity=Decimal("0.1"),
+            position_notional=Decimal("10"),
+        ),
+    )
+
+    assert open_decision.decision == "HALT"
+    assert "ACCOUNT_SNAPSHOT_STALE" in open_decision.reason
+    assert close_decision.decision == "ALLOW"
+
+
+def test_unknown_position_mark_halts_new_open() -> None:
+    decision = RiskGate().evaluate(
+        _intent(),
+        _context(
+            position_direction="LONG",
+            position_quantity=Decimal("1"),
+            position_notional=None,
+            mark_price=None,
+        ),
+    )
+
+    assert decision.decision == "HALT"
+    assert "position mark price" in decision.reason
 
 
 def test_blocked_meme_tier_is_denied() -> None:

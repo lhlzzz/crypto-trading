@@ -352,7 +352,7 @@ def _current_position(
     elif side in {"BOTH", ""}:
         side = "LONG" if raw_quantity > 0 else "SHORT" if raw_quantity < 0 else "FLAT"
     elif side not in {"LONG", "SHORT"}:
-        raise RuntimeError(f"unrecognized futures position side: {side}")
+        raise ValueError(f"unrecognized futures position side: {side}")
     leverage = Decimal(str(position.get("leverage") or "1"))
     entry = position.get("entry_price") or position.get("average_price")
     return CurrentPosition(
@@ -372,11 +372,14 @@ def _risk_context(
     public_client: FuturesPublicClient | None = None,
     paper_executor: PaperExecutor | None = None,
 ) -> RiskContext:
-    if not isinstance(account_snapshot, FuturesAccountSnapshot) or not account_snapshot.fresh:
-        raise RuntimeError("fresh account snapshot is required")
-    if account_snapshot.mode != mode:
-        raise RuntimeError("account snapshot mode does not match runtime mode")
-    current = _current_position(account_snapshot, intent.symbol)
+    if not isinstance(account_snapshot, FuturesAccountSnapshot):
+        raise RuntimeError("canonical account snapshot is required")
+    account_state_error: str | None = None
+    try:
+        current = _current_position(account_snapshot, intent.symbol)
+    except ValueError as exc:
+        current = CurrentPosition()
+        account_state_error = str(exc)
     position = next(
         (
             dict(row)
@@ -456,8 +459,8 @@ def _risk_context(
         funding_pnl=Decimal("0"),
         leverage=Decimal(str(position.get("leverage") or intent.leverage)),
         account_leverage=(
-            Decimal(str(position["leverage"]))
-            if position.get("leverage") is not None
+            Decimal(str(account_snapshot.symbol_leverage[intent.symbol.upper()]))
+            if intent.symbol.upper() in account_snapshot.symbol_leverage
             else None
         ),
         margin_type=account_snapshot.margin_mode,
@@ -482,6 +485,7 @@ def _risk_context(
             "MEME_REQUIRE_CLASSIFICATION", "true"
         ).strip().lower() in {"1", "true", "yes", "on"},
         account_snapshot=account_snapshot,
+        account_state_error=account_state_error,
     )
 
 
@@ -526,12 +530,27 @@ def run_cycle(
                 reason=f"positioning evidence persistence failed: {type(exc).__name__}",
                 source="paper_runner",
             )
-        except Exception:
-            pass
+        except Exception as halt_exc:
+            raise RuntimeError(
+                "positioning evidence persistence failed and halt recording failed"
+            ) from halt_exc
         raise RuntimeError("positioning evidence persistence failed; trading halted") from exc
     injected_intent = _test_only_signal_injection(frame, mode=mode)
-    account_snapshot = executor.account_snapshot()
-    current = _current_position(account_snapshot, symbol)
+    if injected_intent is not None:
+        injected_intent = injected_intent.model_copy(
+            update={"evidence_snapshot_id": positioning.evidence_snapshot_id}
+        )
+    try:
+        account_snapshot = executor.account_snapshot()
+        current = _current_position(account_snapshot, symbol)
+    except ValueError as exc:
+        reason = f"INVALID_ACCOUNT_STATE: {exc}"
+        store.set_halt(True, reason=reason, source="paper_runner")
+        return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
+    except Exception as exc:
+        reason = f"ACCOUNT_UNAVAILABLE: {type(exc).__name__}"
+        store.set_halt(True, reason=reason, source="paper_runner")
+        return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
     intent = injected_intent or engine._intent_from_positioning(
         positioning,
         frame,

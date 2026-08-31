@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from engine import CurrentPosition, MarketDataEnvelope, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine, _map_position_action
+from engine import (
+    CurrentPosition,
+    EvidenceSufficiency,
+    MarketDataEnvelope,
+    MarketFrame,
+    SourceFreshness,
+    StrategyConfig,
+    StrategyEngine,
+    _map_position_action,
+)
 
 
 def _frame(closes: list[str]) -> MarketFrame:
@@ -124,6 +133,31 @@ def test_market_data_envelope_calculates_latency() -> None:
     )
     assert envelope.symbol == "BTCUSDT"
     assert envelope.latency_ms == 1000
+
+
+def test_evidence_sufficiency_derives_missing_required_inputs() -> None:
+    sufficiency = EvidenceSufficiency(
+        required=("A", "B", "C"),
+        available=("A", "B"),
+        missing=(),
+    )
+
+    assert sufficiency.sufficient is False
+    assert sufficiency.missing == ("C",)
+
+
+def test_source_freshness_rejects_mismatched_latency() -> None:
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    freshness = SourceFreshness(
+        "futures_trade_flow",
+        captured,
+        captured.replace(second=1),
+        60,
+        captured.replace(second=1),
+        latency_ms=0,
+    )
+
+    assert freshness.fresh is False
 
 
 def test_positioning_building_is_explainable_but_shadow_only_by_default() -> None:

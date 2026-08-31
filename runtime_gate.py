@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 import os
 
 from binance_client import ClientConfig
+from engine import validate_source_timestamps
 from risk import FuturesAccountSnapshot, RiskLimits
 
 
@@ -122,7 +123,7 @@ def _data_health_report(
     max_age_sec: int,
     symbols: Iterable[str],
 ) -> tuple[bool, tuple[str, ...]]:
-    """Evaluate source health and preserve the first blocker per source."""
+    """Consume canonical normalized source health for every active symbol."""
     if store is None or not hasattr(store, "market_data_freshness"):
         return False, ("DATA_HEALTH_NOT_AVAILABLE",)
     try:
@@ -136,85 +137,65 @@ def _data_health_report(
         for symbol in symbols
         if str(symbol).strip()
     }
+    max_latency_ms = int(os.environ.get("MAX_DATA_LATENCY_MS", "2000"))
     for source in sorted(REQUIRED_FUTURES_SOURCES):
         source_rows = [
             row for row in rows
             if str(row.get("source") or row.get("event_type") or "").upper() == source
         ]
-        for symbol in sorted(expected_symbols):
-            matching_rows = [
+        target_rows = (
+            [
                 row
-                for row in source_rows
-                if str(row.get("symbol") or "").strip().upper() == symbol
+                for symbol in sorted(expected_symbols)
+                for row in [
+                    next(
+                        (
+                            candidate for candidate in source_rows
+                            if str(candidate.get("symbol") or "").strip().upper() == symbol
+                        ),
+                        None,
+                    )
+                ]
+                if row is not None
             ]
-            if not matching_rows:
+            if expected_symbols
+            else source_rows
+        )
+        if expected_symbols:
+            present_symbols = {
+                str(row.get("symbol") or "").strip().upper() for row in target_rows
+            }
+            for symbol in sorted(expected_symbols - present_symbols):
+                reasons.append(f"{source}_MISSING")
+        for row in target_rows:
+            if not str(row.get("symbol", "")).strip():
                 reasons.append(f"{source}_MISSING")
                 continue
-            for row in matching_rows:
-                if not str(row.get("symbol", "")).strip():
-                    reasons.append(f"{source}_MISSING")
-                    continue
-                status = str(row.get("status", "MISSING")).upper()
-                if status != "FRESH":
-                    reasons.append(f"{source}_{status}")
-                    continue
-                if row.get("latency_ms") is None:
-                    reasons.append(f"{source}_ERROR")
-                    continue
-                try:
-                    source_at = datetime.fromisoformat(str(row["source_timestamp"]))
-                    received_at = datetime.fromisoformat(str(row["received_timestamp"]))
-                    if source_at.tzinfo is None:
-                        source_at = source_at.replace(tzinfo=timezone.utc)
-                    if received_at.tzinfo is None:
-                        received_at = received_at.replace(tzinfo=timezone.utc)
-                    if source_at > now or received_at > now:
-                        reasons.append(f"{source}_FUTURE_TIMESTAMP")
-                    elif received_at < source_at:
-                        reasons.append(f"{source}_TIMESTAMP_INVALID")
-                    elif int(row["latency_ms"]) != int(
-                        (received_at - source_at).total_seconds() * 1000
-                    ):
-                        reasons.append(f"{source}_LATENCY_INVALID")
-                    elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
-                        os.environ.get("MAX_DATA_LATENCY_MS", "2000")
-                    ):
-                        reasons.append(f"{source}_LATENCY_EXCEEDED")
-                except (KeyError, TypeError, ValueError):
-                    reasons.append(f"{source}_ERROR")
-        if not expected_symbols:
-            for row in source_rows:
-                if not str(row.get("symbol", "")).strip():
-                    reasons.append(f"{source}_MISSING")
-                    continue
-                status = str(row.get("status", "MISSING")).upper()
-                if status != "FRESH":
-                    reasons.append(f"{source}_{status}")
-                    continue
-                if row.get("latency_ms") is None:
-                    reasons.append(f"{source}_ERROR")
-                    continue
-                try:
-                    source_at = datetime.fromisoformat(str(row["source_timestamp"]))
-                    received_at = datetime.fromisoformat(str(row["received_timestamp"]))
-                    if source_at.tzinfo is None:
-                        source_at = source_at.replace(tzinfo=timezone.utc)
-                    if received_at.tzinfo is None:
-                        received_at = received_at.replace(tzinfo=timezone.utc)
-                    if source_at > now or received_at > now:
-                        reasons.append(f"{source}_FUTURE_TIMESTAMP")
-                    elif received_at < source_at:
-                        reasons.append(f"{source}_TIMESTAMP_INVALID")
-                    elif int(row["latency_ms"]) != int(
-                        (received_at - source_at).total_seconds() * 1000
-                    ):
-                        reasons.append(f"{source}_LATENCY_INVALID")
-                    elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
-                        os.environ.get("MAX_DATA_LATENCY_MS", "2000")
-                    ):
-                        reasons.append(f"{source}_LATENCY_EXCEEDED")
-                except (KeyError, TypeError, ValueError):
-                    reasons.append(f"{source}_ERROR")
+            status = str(row.get("status", "MISSING")).upper()
+            if status != "FRESH":
+                reasons.append(f"{source}_{status}")
+                continue
+            validation = validate_source_timestamps(
+                {
+                    source.lower(): {
+                        "source_timestamp": row.get("source_timestamp"),
+                        "received_timestamp": row.get("received_timestamp"),
+                        "latency_ms": row.get("latency_ms"),
+                        "max_age_sec": max_age_sec,
+                    }
+                },
+                now,
+                required_core_sources=frozenset(),
+            )
+            if validation.status_for(source) != "AVAILABLE":
+                issue = validation.issues.get(source.lower(), "ERROR")
+                reasons.append(f"{source}_{issue}")
+                continue
+            if (
+                source in _REALTIME_FUTURES_SOURCES
+                and int(row["latency_ms"]) > max_latency_ms
+            ):
+                reasons.append(f"{source}_LATENCY_EXCEEDED")
     unique = tuple(dict.fromkeys(reasons))
     return not unique, unique
 
@@ -494,7 +475,10 @@ def evaluate_runtime_gate(
             snapshot = snapshot_getter()
             if not isinstance(snapshot, FuturesAccountSnapshot):
                 raise RuntimeError("invalid FuturesAccountSnapshot")
-            account_reachable = snapshot.fresh and snapshot.mode == resolved_mode
+            account_reachable = snapshot.is_fresh(
+                now=datetime.now(timezone.utc),
+                max_age_sec=int(os.environ.get("ACCOUNT_SNAPSHOT_MAX_AGE_SEC", "30")),
+            ) and snapshot.mode == resolved_mode
             wallet_balance_ok = account_reachable and snapshot.wallet_balance >= 0
             available_balance_ok = (
                 account_reachable
@@ -518,7 +502,8 @@ def evaluate_runtime_gate(
                     and snapshot_margin != _expected_margin_mode()
                 ):
                     margin_mode_ok = False
-                symbol_leverage[symbol] = str(snapshot.leverage.get(symbol, ""))
+                configured = snapshot.symbol_leverage or snapshot.leverage
+                symbol_leverage[symbol] = str(configured.get(symbol, ""))
             expected_leverage = os.environ.get("DEFAULT_LEVERAGE", "1")
             leverage_ok = bool(symbol_leverage) and all(
                 value == expected_leverage for value in symbol_leverage.values()

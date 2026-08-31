@@ -87,6 +87,17 @@ CORE_FUTURES_SOURCES = frozenset(
         "futures_force_order",
     }
 )
+REQUIRED_CORE_FUTURES_SOURCES = frozenset(
+    {
+        "futures_open_interest",
+        "futures_funding",
+        "futures_trade_flow",
+        "futures_taker_ratio",
+    }
+)
+_SOURCE_ALIASES = {
+    "futures_trade_flow": frozenset({"futures_trade_flow", "futures_trade"}),
+}
 AUXILIARY_SPOT_SOURCES = frozenset(
     {
         "spot_trade",
@@ -124,39 +135,93 @@ def _negative(value: int | None) -> bool:
     return value is not None and value < 0
 
 
-def _timestamps_consistent(
-    source_timestamps: Mapping[str, Mapping[str, Any]], now: datetime
-) -> tuple[bool, bool]:
-    """Return (core_ok, aux_ok) timestamp/latency provenance."""
-    if not source_timestamps:
-        return False, False
-    core_ok = True
-    aux_ok = True
-    saw_core = False
+@dataclass(frozen=True)
+class SourceTimestampValidation:
+    """Canonical normalized timestamp health for every observation source."""
+
+    statuses: Mapping[str, EvidenceStatus]
+    issues: Mapping[str, str]
+    required_core: frozenset[str]
+
+    def status_for(self, source: str) -> EvidenceStatus:
+        normalized = source.lower()
+        if normalized in self.statuses:
+            return self.statuses[normalized]
+        for canonical, aliases in _SOURCE_ALIASES.items():
+            if normalized == canonical and any(
+                self.statuses.get(alias) == "AVAILABLE" for alias in aliases
+            ):
+                return "AVAILABLE"
+        return "MISSING"
+
+    @property
+    def core_ok(self) -> bool:
+        return all(
+            self.status_for(source) == "AVAILABLE" for source in self.required_core
+        )
+
+    @property
+    def aux_ok(self) -> bool:
+        return all(
+            status == "AVAILABLE"
+            for source, status in self.statuses.items()
+            if not _is_core_futures_source(source)
+        )
+
+
+def validate_source_timestamps(
+    source_timestamps: Mapping[str, Mapping[str, Any]],
+    now: datetime,
+    *,
+    required_core_sources: frozenset[str] = REQUIRED_CORE_FUTURES_SOURCES,
+) -> SourceTimestampValidation:
+    """Validate normalized clocks once for engine, runners, and runtime gates."""
+    evaluation_time = _aware(now)
+    statuses: dict[str, EvidenceStatus] = {}
+    issues: dict[str, str] = {}
     for source_name, timestamps in source_timestamps.items():
+        source = str(source_name).lower()
         try:
-            source_ts = _aware(datetime.fromisoformat(str(timestamps["source_timestamp"])))
-            received = _aware(datetime.fromisoformat(str(timestamps["received_timestamp"])))
+            source_ts = _aware(
+                datetime.fromisoformat(str(timestamps["source_timestamp"]))
+            )
+            received = _aware(
+                datetime.fromisoformat(str(timestamps["received_timestamp"]))
+            )
             declared_latency = int(timestamps["latency_ms"])
+            max_age = timestamps.get("max_age_sec")
+            max_age_sec = int(max_age) if max_age is not None else None
         except (KeyError, TypeError, ValueError):
-            if _is_core_futures_source(str(source_name)):
-                core_ok = False
-            else:
-                aux_ok = False
+            statuses[source] = "UNSAFE"
+            issues[source] = "TIMESTAMP_INVALID"
             continue
         actual_latency = int((received - source_ts).total_seconds() * 1000)
-        consistent = not (
-            actual_latency < 0
-            or declared_latency != actual_latency
-            or source_ts > _aware(now)
-            or received > _aware(now)
-        )
-        if _is_core_futures_source(str(source_name)):
-            saw_core = True
-            core_ok = core_ok and consistent
-        elif not consistent:
-            aux_ok = False
-    return (core_ok and saw_core), aux_ok
+        if source_ts > evaluation_time or received > evaluation_time:
+            statuses[source] = "UNSAFE"
+            issues[source] = "FUTURE_TIMESTAMP"
+        elif declared_latency < 0 or actual_latency < 0:
+            statuses[source] = "UNSAFE"
+            issues[source] = "NEGATIVE_LATENCY"
+        elif declared_latency != actual_latency:
+            statuses[source] = "UNSAFE"
+            issues[source] = "LATENCY_INVALID"
+        elif max_age_sec is not None and (
+            evaluation_time - source_ts
+        ).total_seconds() > max(1, max_age_sec):
+            statuses[source] = "STALE"
+            issues[source] = "STALE"
+        else:
+            statuses[source] = "AVAILABLE"
+    for required in required_core_sources:
+        aliases = _SOURCE_ALIASES.get(required, frozenset({required}))
+        if not any(alias in statuses for alias in aliases):
+            statuses[required] = "MISSING"
+            issues[required] = "MISSING"
+    return SourceTimestampValidation(
+        statuses=statuses,
+        issues=issues,
+        required_core=required_core_sources,
+    )
 
 
 @dataclass(frozen=True)
@@ -175,11 +240,26 @@ class MarketDataEnvelope:
     def __post_init__(self) -> None:
         source = _aware(self.source_timestamp)
         received = _aware(self.received_timestamp)
-        latency = int((received - source).total_seconds() * 1000)
-        if latency < 0:
-            raise ValueError("received_timestamp cannot precede source_timestamp")
-        if self.latency_ms != latency:
-            raise ValueError("latency_ms must equal timestamp delta")
+        validation = validate_source_timestamps(
+            {
+                self.source: {
+                    "source_timestamp": source.isoformat(),
+                    "received_timestamp": received.isoformat(),
+                    "latency_ms": self.latency_ms,
+                }
+            },
+            max(source, received),
+            required_core_sources=frozenset(),
+        )
+        if validation.status_for(self.source) != "AVAILABLE":
+            issue = validation.issues.get(self.source.lower(), "invalid timestamps")
+            if issue == "NEGATIVE_LATENCY":
+                issue = "received_timestamp cannot precede source_timestamp"
+            elif issue == "LATENCY_INVALID":
+                issue = "latency_ms must equal timestamp delta"
+            raise ValueError(
+                issue
+            )
         if not self.symbol.strip():
             raise ValueError("symbol is required")
         object.__setattr__(self, "source_timestamp", source)
@@ -203,6 +283,17 @@ class SourceFreshness:
     received_timestamp: datetime
     max_age_sec: int
     now: datetime
+    latency_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        source = _aware(self.source_timestamp)
+        received = _aware(self.received_timestamp)
+        latency = int((received - source).total_seconds() * 1000)
+        object.__setattr__(self, "source_timestamp", source)
+        object.__setattr__(self, "received_timestamp", received)
+        object.__setattr__(
+            self, "latency_ms", latency if self.latency_ms is None else self.latency_ms
+        )
 
     @property
     def age_sec(self) -> int:
@@ -210,11 +301,19 @@ class SourceFreshness:
 
     @property
     def fresh(self) -> bool:
-        return (
-            _aware(self.received_timestamp) <= _aware(self.now)
-            and _aware(self.source_timestamp) <= _aware(self.now)
-            and self.age_sec <= max(1, self.max_age_sec)
+        validation = validate_source_timestamps(
+            {
+                self.source: {
+                    "source_timestamp": self.source_timestamp.isoformat(),
+                    "received_timestamp": self.received_timestamp.isoformat(),
+                    "latency_ms": self.latency_ms,
+                    "max_age_sec": self.max_age_sec,
+                }
+            },
+            self.now,
+            required_core_sources=frozenset(),
         )
+        return validation.status_for(self.source) == "AVAILABLE"
 
 
 @dataclass(frozen=True)
@@ -245,9 +344,32 @@ class EvidenceSufficiency:
     missing: tuple[str, ...] = ()
     conflicting: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        required = tuple(dict.fromkeys(self.required))
+        available = tuple(dict.fromkeys(self.available))
+        missing = tuple(
+            dict.fromkeys(
+                (*self.missing, *(name for name in required if name not in available))
+            )
+        )
+        object.__setattr__(self, "required", required)
+        object.__setattr__(self, "available", available)
+        object.__setattr__(self, "stale", tuple(dict.fromkeys(self.stale)))
+        object.__setattr__(self, "unsafe", tuple(dict.fromkeys(self.unsafe)))
+        object.__setattr__(self, "missing", missing)
+        object.__setattr__(
+            self, "conflicting", tuple(dict.fromkeys(self.conflicting))
+        )
+
     @property
     def sufficient(self) -> bool:
-        return not (self.stale or self.unsafe or self.missing or self.conflicting)
+        return (
+            not (set(self.required) - set(self.available))
+            and not self.stale
+            and not self.unsafe
+            and not self.missing
+            and not self.conflicting
+        )
 
     def as_dict(self) -> dict[str, list[str] | bool]:
         return {
@@ -537,6 +659,7 @@ class MarketFrame:
                     )),
                     max_age_sec=max(1, source_ttl_sec),
                     now=captured_at,
+                    latency_ms=int(timestamps["latency_ms"]),
                 )
             )
         market_regime = str(inputs.get("market_regime", "NEUTRAL"))
@@ -1051,21 +1174,14 @@ class StrategyEngine:
                 self._evidence_sufficiency(frame, now),
             )
 
-        def _item_fresh(item: SourceFreshness) -> bool:
-            return (
-                _aware(item.received_timestamp) <= now
-                and _aware(item.source_timestamp) <= now
-                and (now - _aware(item.source_timestamp)).total_seconds() <= max(1, item.max_age_sec)
-            )
-
         core_freshness_items = [
             item for item in frame.freshness if _is_core_futures_source(item.source)
         ]
         aux_freshness_items = [
             item for item in frame.freshness if _is_auxiliary_spot_source(item.source)
         ]
-        core_fresh_flags = [_item_fresh(item) for item in core_freshness_items]
-        aux_fresh_flags = [_item_fresh(item) for item in aux_freshness_items]
+        core_fresh_flags = [item.fresh for item in core_freshness_items]
+        aux_fresh_flags = [item.fresh for item in aux_freshness_items]
         if core_fresh_flags:
             freshness = Decimal(sum(core_fresh_flags)) / Decimal(len(core_fresh_flags))
             if not all(core_fresh_flags):
@@ -1074,10 +1190,12 @@ class StrategyEngine:
             freshness = Decimal("1")
         if aux_fresh_flags and not all(aux_fresh_flags):
             reasons.append("AUXILIARY_SPOT_STALE")
-        core_ok, aux_ok = _timestamps_consistent(frame.source_timestamps, now)
-        if not core_ok:
+        timestamp_validation = validate_source_timestamps(
+            frame.source_timestamps, now
+        )
+        if not timestamp_validation.core_ok:
             reasons.append("TIMESTAMP_INCONSISTENT")
-        elif not aux_ok:
+        elif not timestamp_validation.aux_ok:
             reasons.append("AUXILIARY_SPOT_TIMESTAMP_INCONSISTENT")
         core_features = (
             frame.futures_trade_flow,
@@ -1093,18 +1211,7 @@ class StrategyEngine:
         )
         if any(value is None for value in auxiliary_features):
             reasons.append("AUXILIARY_SPOT_MISSING")
-        timestamp_provenance_complete = all(
-            source in frame.source_timestamps
-            for source in (
-                "futures_open_interest",
-                "futures_funding",
-                "futures_taker_ratio",
-            )
-        ) and bool(
-            {"futures_trade", "futures_trade_flow"}.intersection(
-                frame.source_timestamps
-            )
-        )
+        timestamp_provenance_complete = timestamp_validation.core_ok
         if not timestamp_provenance_complete:
             reasons.append("MISSING_TIMESTAMP_PROVENANCE")
         supplied = sum(value is not None for value in core_features)
@@ -1122,7 +1229,7 @@ class StrategyEngine:
             reasons.append("PRICE_CVD_DIVERGENCE")
         if core_fresh_flags and not all(core_fresh_flags):
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
-        if not core_ok:
+        if not timestamp_validation.core_ok:
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
         if any(value is None for value in core_features):
             quality = min(quality, self.config.minimum_data_quality - Decimal("0.01"))
@@ -1240,11 +1347,7 @@ class StrategyEngine:
                 missing.append(name)
                 continue
             item = freshness.get(source.lower())
-            if item is not None and not (
-                _aware(item.received_timestamp) <= _aware(now)
-                and _aware(item.source_timestamp) <= _aware(now)
-                and item.age_sec <= max(1, item.max_age_sec)
-            ):
+            if item is not None and not item.fresh:
                 stale.append(name)
                 continue
             available.append(name)

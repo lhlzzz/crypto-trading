@@ -86,6 +86,8 @@ class TradingStore:
     def record_intent(self, intent: TradeIntent, *, status: str = "CREATED") -> None:
         import psycopg2
 
+        if intent.evidence_snapshot_id is None:
+            raise ValueError("production TradeIntent requires an evidence snapshot")
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -281,17 +283,18 @@ class TradingStore:
                     UPDATE positioning_episodes
                     SET state = %s,
                         status = %s,
-                        last_observed_at = GREATEST(last_observed_at, %s),
+                        last_observed_at = %s,
                         metadata = metadata || CAST(%s AS JSONB)
                     WHERE episode_id = %s
                       AND status IN ('OPEN', 'UNRESOLVED')
+                      AND last_observed_at <= %s
                     RETURNING episode_id, symbol, market, direction, started_at,
                               ended_at, state, status, last_observed_at,
                               strategy_version, config_hash, metadata
                     """,
                     (
                         state, status, _as_utc(observed_at), _json(metadata),
-                        str(episode_id),
+                        str(episode_id), _as_utc(observed_at),
                     ),
                 )
                 row = cursor.fetchone()
@@ -325,17 +328,18 @@ class TradingStore:
                     SET state = %s,
                         status = 'CLOSED',
                         ended_at = %s,
-                        last_observed_at = GREATEST(last_observed_at, %s),
+                        last_observed_at = %s,
                         metadata = metadata || CAST(%s AS JSONB)
                     WHERE episode_id = %s
                       AND status IN ('OPEN', 'UNRESOLVED')
+                      AND last_observed_at <= %s
                     RETURNING episode_id, symbol, market, direction, started_at,
                               ended_at, state, status, last_observed_at,
                               strategy_version, config_hash, metadata
                     """,
                     (
                         state, observed_at, observed_at, _json(metadata),
-                        str(episode_id),
+                        str(episode_id), observed_at,
                     ),
                 )
                 row = cursor.fetchone()
@@ -673,6 +677,7 @@ class TradingStore:
                 received_timestamp=_as_utc(timestamps["received_timestamp"]),
                 max_age_sec=max(1, source_ttl_sec),
                 now=captured_at,
+                latency_ms=int(timestamps["latency_ms"]),
             )
             for source, timestamps in source_timestamps.items()
         )
