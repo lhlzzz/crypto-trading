@@ -1143,24 +1143,31 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             quote_asset = str(row.get("quoteAsset", "USDT")).upper()
             trading = str(row.get("status", "TRADING")).upper() == "TRADING"
             reason_codes: list[str] = []
-            if (
-                symbol in blocklist
-                or (allowlist and symbol not in allowlist)
-                or not trading
-                or contract_type != "PERPETUAL"
-                or quote_asset != "USDT"
+            if symbol in blocklist:
+                is_meme: bool | None = False
+                meme_source = "MEME_BLOCKLIST"
+                reason_codes.append("BLOCKLIST")
+            elif allowlist:
+                is_meme = symbol in allowlist
+                meme_source = "MEME_ALLOWLIST"
+                if not is_meme:
+                    reason_codes.append("NOT_ALLOWLISTED")
+            else:
+                is_meme = None
+                meme_source = "MEME_CLASSIFICATION_UNAVAILABLE"
+                reason_codes.append("CLASSIFICATION_UNAVAILABLE")
+            if is_meme is False or (
+                not trading or contract_type != "PERPETUAL" or quote_asset != "USDT"
             ):
                 tier = "BLOCK"
-                if symbol in blocklist:
-                    reason_codes.append("BLOCKLIST")
-                if allowlist and symbol not in allowlist:
-                    reason_codes.append("NOT_ALLOWLISTED")
                 if not trading:
                     reason_codes.append("NOT_TRADING")
                 if contract_type != "PERPETUAL":
                     reason_codes.append("NOT_PERPETUAL")
                 if quote_asset != "USDT":
                     reason_codes.append("NOT_USDT_QUOTE")
+            elif is_meme is None:
+                tier = "OBSERVE"
             else:
                 from risk import classify_meme_risk_tier
                 liquidity_score = (
@@ -1194,13 +1201,21 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             row["last_price"] = _decimal(row.get("lastPrice"))
             row["open_interest"] = _decimal(row.get("openInterest"))
             row["meme_risk_tier"] = tier
-            row["classification_source"] = "binance_futures_exchange_info_and_24h_ticker"
-            row["classification_version"] = os.environ.get(
+            classified_at = datetime.now(timezone.utc).isoformat()
+            version = os.environ.get(
                 "MEME_CLASSIFICATION_VERSION", "meme-universe-v1"
             )
-            row["classified_at"] = datetime.now(timezone.utc).isoformat()
+            row["is_meme"] = is_meme
+            row["meme_classification_source"] = meme_source
+            row["meme_classification_version"] = version
+            row["meme_classified_at"] = classified_at
+            row["meme_reason_codes"] = reason_codes
+            # Retain the old names as read-only output aliases for API
+            # consumers; membership uses only the canonical meme_* fields.
+            row["classification_source"] = meme_source
+            row["classification_version"] = version
+            row["classified_at"] = classified_at
             row["reason_codes"] = reason_codes
-            row["meme_risk_tier"] = tier
             normalized.append((row, price_change, quote_volume))
     advancers = sum(change > 0 for _, change, _ in normalized)
     decliners = sum(change < 0 for _, change, _ in normalized)
@@ -1241,7 +1256,9 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         for tier in ("BLOCK", "OBSERVE", "REDUCED", "TRADEABLE")
     }
     tradeable_candidates = [
-        row for row, _, _ in candidates if row.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
+        row for row, _, _ in candidates
+        if row.get("is_meme") is True
+        and row.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
     ][: max(1, candidate_limit)]
     return {
         "market": "FUTURES",
@@ -1259,7 +1276,12 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         ),
         "breadth_score": str(breadth_score),
         "market_regime": regime,
-            "candidate_symbols": [str(row["symbol"]).upper() for row in tradeable_candidates],
+        "candidate_symbols": [
+            str(row["symbol"]).upper() for row, _, _ in candidates
+        ],
+        "meme_candidate_symbols": [
+            str(row["symbol"]).upper() for row in tradeable_candidates
+        ],
         "tiers": tier_rows,
         "symbols": [row for row, _, _ in normalized],
     }

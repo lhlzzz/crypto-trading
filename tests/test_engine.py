@@ -53,6 +53,18 @@ def test_engine_does_not_create_intent_without_tradeable_meme_evidence() -> None
     ).evaluate(frame) is None
 
 
+def test_positioning_open_requires_positive_meme_membership() -> None:
+    frame = _positioning_frame()
+    engine = StrategyEngine(
+        StrategyConfig(positioning_decision_enabled=True)
+    )
+
+    assert engine.evaluate(frame) is None
+    assert engine.evaluate(
+        MarketFrame(**{**frame.__dict__, "is_meme": True})
+    ) is not None
+
+
 def test_engine_does_not_call_broker_or_risk() -> None:
     source = open("engine.py", encoding="utf-8").read()
 

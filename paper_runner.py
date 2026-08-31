@@ -152,8 +152,17 @@ def _market_frame(
             "relative_strength", "relative_strength_1m", "relative_strength_5m",
             "relative_strength_15m", "relative_strength_1h", "breadth_score",
             "advance_decline_ratio", "market_regime", "meme_risk_tier",
+            "is_meme", "meme_classification_source",
+            "meme_classification_version", "meme_classified_at",
+            "meme_reason_codes",
         }
     })
+    if features.get("meme_classified_at") is not None:
+        features["meme_classified_at"] = datetime.fromisoformat(
+            str(features["meme_classified_at"])
+        )
+    if features.get("meme_reason_codes") is not None:
+        features["meme_reason_codes"] = tuple(features["meme_reason_codes"])
     evidence_status: dict[str, str] = {}
     for event in positioning_events or []:
         if str(event.get("event_type", "")).upper() != "ORDERBOOK":
@@ -486,6 +495,7 @@ def _risk_context(
         # An intent without an explicit, persisted Futures universe
         # classification is observe-only; it must not default to tradeable.
         meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
+        is_meme=intent.is_meme,
     )
 
 

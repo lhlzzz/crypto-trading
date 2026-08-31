@@ -81,6 +81,7 @@ class TradeIntent(BaseModel):
     evidence_snapshot_id: UUID | None = None
     market_regime: str | None = Field(default=None, max_length=32)
     meme_risk_tier: MemeRiskTier | None = None
+    is_meme: bool | None = None
 
     def exchange_side(self) -> ExchangeSide:
         return exchange_side(self.direction, self.action)

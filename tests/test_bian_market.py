@@ -95,6 +95,12 @@ class BianMarketTests(unittest.TestCase):
         self.assertEqual(features["new_lows"], 1)
         self.assertEqual(features["market_regime"], "RISK_ON")
         self.assertEqual(features["candidate_symbols"], ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(features["meme_candidate_symbols"], [])
+        self.assertIsNone(features["symbols"][0]["is_meme"])
+        self.assertEqual(
+            features["symbols"][0]["meme_classification_source"],
+            "MEME_CLASSIFICATION_UNAVAILABLE",
+        )
 
     def test_candidate_stream_symbols_keep_benchmarks_and_deduplicate_tier_two(self):
         candidates = bian_market._candidate_stream_symbols(
@@ -1115,6 +1121,17 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
         self.assertIn("DOGEUSDT", features["tiers"]["TRADEABLE"])
         self.assertIn("SHIBUSDT", features["tiers"]["BLOCK"])
+        doge = next(
+            row for row in features["symbols"] if row["symbol"] == "DOGEUSDT"
+        )
+        shib = next(
+            row for row in features["symbols"] if row["symbol"] == "SHIBUSDT"
+        )
+        self.assertIs(doge["is_meme"], True)
+        self.assertIs(shib["is_meme"], False)
+        self.assertEqual(
+            doge["meme_classification_source"], "MEME_ALLOWLIST"
+        )
 
     def test_feed_handler_shutdown_uses_async_api_on_the_running_loop(self):
         class Handler:

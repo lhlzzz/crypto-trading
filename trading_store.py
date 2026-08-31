@@ -732,6 +732,23 @@ class TradingStore:
             if scanner.get("advance_decline_ratio") is not None else None,
             "market_regime": str(scanner.get("market_regime", "NEUTRAL")),
             "meme_risk_tier": str(symbol_row.get("meme_risk_tier", "OBSERVE")),
+            "is_meme": symbol_row.get("is_meme"),
+            "meme_classification_source": symbol_row.get(
+                "meme_classification_source",
+                symbol_row.get("classification_source"),
+            ),
+            "meme_classification_version": symbol_row.get(
+                "meme_classification_version",
+                symbol_row.get("classification_version"),
+            ),
+            "meme_classified_at": symbol_row.get(
+                "meme_classified_at", symbol_row.get("classified_at")
+            ),
+            "meme_reason_codes": tuple(
+                symbol_row.get("meme_reason_codes")
+                or symbol_row.get("reason_codes")
+                or ()
+            ),
             "source_timestamps": {
                 "market_universe": {
                     "source_timestamp": _as_utc(source_at).isoformat(),

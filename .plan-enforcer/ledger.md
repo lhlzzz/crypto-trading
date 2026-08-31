@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 73 total  |  0 done  |  65 verified  |  0 skipped  |  2 blocked  |  6 remaining
- Drift: 7  |  Last reconcile: T73 |  Tier: structural
+ 74 total  |  0 done  |  66 verified  |  0 skipped  |  2 blocked  |  6 remaining
+ Drift: 8  |  Last reconcile: T74 |  Tier: structural
 
 ## Task Ledger
 
@@ -84,6 +84,7 @@
 | T71 | Fail-close OrderBook GAP evidence | verified | 248 tests; GAP clears depth | D18,V48 | GAP persists UNSAFE until resync |
 | T72 | Add explicit Evidence Sufficiency | verified | 252 tests; status classes persisted | D19,V49 | OPEN requires complete critical evidence |
 | T73 | Preserve exit safety under uncertainty | verified | 252 tests; halted CLOSE fills | D19,V49 | REDUCE/CLOSE bypass entry-only blocks |
+| T74 | Separate Meme membership from risk tier | verified | 253 tests; unavailable is OBSERVE | D20,V50 | `is_meme` and provenance gate OPEN |
 
 ## Decision Log
 
@@ -108,6 +109,7 @@
 | D17 | T65 | Persist resync GAP before fresh book coalescing | Real WS reset exposed overwritten fault evidence |
 | D18 | T70-T71 | Targeted P0 repair in existing owners | User supplied transport/GAP requirements; no new owner |
 | D19 | T72-T73 | Entry and exit safety are separate paths | Critical evidence gates OPEN; exits remain possible |
+| D20 | T74 | Meme membership is independent from risk tier | Classification unavailable cannot become tradeable |
 
 ## Reconciliation History
 

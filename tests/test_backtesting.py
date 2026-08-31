@@ -105,6 +105,7 @@ def _positioning_frame(timestamp: datetime, before: str, current: str) -> Market
         funding_settlement_timestamp=timestamp,
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
+        is_meme=True,
         freshness=(SourceFreshness("spot", timestamp, timestamp, 900, timestamp),),
         source_timestamps=source,
     )

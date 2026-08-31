@@ -211,6 +211,8 @@ class RiskContext:
     regime_risk: Decimal | None = None
     evidence_conflict: bool = False
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
+    is_meme: bool | None = True
+    meme_require_classification: bool = True
     symbol_meme_notional: Decimal = Decimal("0")
     total_meme_notional: Decimal = Decimal("0")
     directional_meme_exposure: Decimal = Decimal("0")
@@ -309,6 +311,8 @@ class RiskGate:
             context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK"
         ):
             return self._deny(intent, "meme symbol is blocked")
+        if entry and context.meme_require_classification and context.is_meme is not True:
+            return self._deny(intent, "meme classification is unavailable")
         if entry and (
             context.meme_risk_tier == "OBSERVE"
             or intent.meme_risk_tier == "OBSERVE"

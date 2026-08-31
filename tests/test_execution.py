@@ -638,6 +638,7 @@ def test_futures_observation_to_paper_position_path() -> None:
         depth_25bps=Decimal("100"),
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
+        is_meme=True,
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,
     )

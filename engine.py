@@ -297,6 +297,11 @@ class PositioningDecision:
     market_regime: MarketRegime
     source_timestamps: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     input_features: Mapping[str, Any] = field(default_factory=dict)
+    is_meme: bool | None = None
+    meme_classification_source: str | None = None
+    meme_classification_version: str | None = None
+    meme_classified_at: datetime | None = None
+    meme_reason_codes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -321,6 +326,15 @@ class PositioningDecision:
             "market_regime": self.market_regime,
             "source_timestamps": dict(self.source_timestamps),
             "input_features": dict(self.input_features),
+            "is_meme": self.is_meme,
+            "meme_classification_source": self.meme_classification_source,
+            "meme_classification_version": self.meme_classification_version,
+            "meme_classified_at": (
+                _aware(self.meme_classified_at).isoformat()
+                if self.meme_classified_at is not None
+                else None
+            ),
+            "meme_reason_codes": list(self.meme_reason_codes),
         }
 
 
@@ -420,6 +434,11 @@ class MarketFrame:
     market_regime: MarketRegime = "NEUTRAL"
     # Universe qualification is required before a frame can create an intent.
     meme_risk_tier: MemeRiskTier = "OBSERVE"
+    is_meme: bool | None = None
+    meme_classification_source: str | None = None
+    meme_classification_version: str | None = None
+    meme_classified_at: datetime | None = None
+    meme_reason_codes: tuple[str, ...] = ()
     freshness: tuple[SourceFreshness, ...] = ()
     data_quality_score: Decimal | None = None
     evidence_status: Mapping[str, EvidenceStatus] = field(default_factory=dict)
@@ -476,6 +495,11 @@ class MarketFrame:
         }
         if inputs.get("price_cvd_divergence") is not None:
             values["price_cvd_divergence"] = bool(inputs["price_cvd_divergence"])
+        meme_classified_at = (
+            _aware(datetime.fromisoformat(str(inputs["meme_classified_at"])))
+            if inputs.get("meme_classified_at") is not None
+            else None
+        )
         for name in ("funding_timestamp", "funding_settlement_timestamp"):
             if inputs.get(name) is not None:
                 values[name] = _aware(datetime.fromisoformat(str(inputs[name])))
@@ -510,6 +534,11 @@ class MarketFrame:
             captured_at=captured_at,
             market_regime=market_regime,  # type: ignore[arg-type]
             meme_risk_tier=str(inputs.get("meme_risk_tier", "OBSERVE")),  # type: ignore[arg-type]
+            is_meme=inputs.get("is_meme"),
+            meme_classification_source=inputs.get("meme_classification_source"),
+            meme_classification_version=inputs.get("meme_classification_version"),
+            meme_classified_at=meme_classified_at,
+            meme_reason_codes=tuple(inputs.get("meme_reason_codes") or ()),
             freshness=tuple(freshness),
             evidence_status=evidence_status,  # type: ignore[arg-type]
             source_timestamps=source_timestamps,
@@ -533,6 +562,8 @@ class StrategyConfig:
     minimum_data_quality: Decimal = Decimal("0.8")
     maximum_crowding: Decimal = Decimal("0.9")
     minimum_liquidity_score: Decimal = Decimal("0.4")
+    meme_require_classification: bool = True
+    legacy_execution_enabled: bool = True
     source_ttl_sec: int = 900
     positioning_weights: PositioningWeights = field(default_factory=PositioningWeights)
 
@@ -552,6 +583,12 @@ class StrategyConfig:
             default_leverage=decimal("DEFAULT_LEVERAGE", Decimal("1")),
             positioning_decision_enabled=os.environ.get(
                 "POSITIONING_DECISION_ENABLED", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            meme_require_classification=os.environ.get(
+                "MEME_REQUIRE_CLASSIFICATION", "true"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            legacy_execution_enabled=os.environ.get(
+                "LEGACY_EXECUTION_ENABLED", "false"
             ).strip().lower() in {"1", "true", "yes", "on"},
             minimum_positioning_confidence=decimal(
                 "MIN_POSITIONING_CONFIDENCE", Decimal("0.6")
@@ -624,6 +661,8 @@ class StrategyEngine:
         ):
             return None
         if not self.config.positioning_decision_enabled:
+            if not self.config.legacy_execution_enabled:
+                return None
             return self._legacy_intent(frame, current_position=current)
         return self._intent_from_positioning(
             self.positioning_decision(frame),
@@ -772,6 +811,11 @@ class StrategyEngine:
             market_regime=frame.market_regime,
             source_timestamps=frame.source_timestamps,
             input_features=self._input_features(frame),
+            is_meme=frame.is_meme,
+            meme_classification_source=frame.meme_classification_source,
+            meme_classification_version=frame.meme_classification_version,
+            meme_classified_at=frame.meme_classified_at,
+            meme_reason_codes=frame.meme_reason_codes,
         )
 
     def _unknown_decision(
@@ -800,6 +844,11 @@ class StrategyEngine:
             market_regime=frame.market_regime,
             source_timestamps=frame.source_timestamps,
             input_features=self._input_features(frame),
+            is_meme=frame.is_meme,
+            meme_classification_source=frame.meme_classification_source,
+            meme_classification_version=frame.meme_classification_version,
+            meme_classified_at=frame.meme_classified_at,
+            meme_reason_codes=frame.meme_reason_codes,
         )
 
     def _snapshot_id(
@@ -855,6 +904,9 @@ class StrategyEngine:
             "advance_decline_ratio",
             "market_regime", "meme_risk_tier", "data_quality_score",
             "evidence_status",
+            "is_meme", "meme_classification_source",
+            "meme_classification_version", "meme_classified_at",
+            "meme_reason_codes",
         )
         return {name: getattr(frame, name) for name in names}
 
@@ -869,6 +921,8 @@ class StrategyEngine:
             current.meme_risk_tier in {"BLOCK", "OBSERVE"}
             or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
         ):
+            return None
+        if self.config.meme_require_classification and frame.is_meme is not True:
             return None
         return self._intent_for_action(
             symbol=decision.symbol,
@@ -928,6 +982,7 @@ class StrategyEngine:
             "strategy_version": strategy_version,
             "created_at": created_at,
             "meme_risk_tier": frame.meme_risk_tier,
+            "is_meme": frame.is_meme,
         }
         if positioning is not None:
             values.update(
