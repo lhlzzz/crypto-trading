@@ -31,11 +31,6 @@ class FuturesRiskRules:
         if not Decimal("0") < self.maintenance_margin_rate < Decimal("1"):
             raise ValueError("maintenance margin rate must be between 0 and 1")
 
-    @classmethod
-    def conservative(cls, symbol: str) -> "FuturesRiskRules":
-        return cls(symbol=symbol.upper().strip())
-
-
 def _zero(value: Decimal | None) -> Decimal:
     return value if value is not None else Decimal("0")
 
@@ -165,11 +160,11 @@ class RiskLimits:
 class ExchangeRules:
     symbol: str
     status: str = "TRADING"
-    min_qty: Decimal = Decimal("0")
+    min_qty: Decimal = Decimal("0.001")
     max_qty: Decimal | None = None
-    step_size: Decimal = Decimal("0")
-    tick_size: Decimal = Decimal("0")
-    min_notional: Decimal = Decimal("0")
+    step_size: Decimal = Decimal("0.001")
+    tick_size: Decimal = Decimal("0.01")
+    min_notional: Decimal = Decimal("5")
 
 
 @dataclass(frozen=True)
@@ -272,7 +267,7 @@ class RiskContext:
     maintenance_margin: Decimal = Decimal("0")
     position_direction: PositionDirection = "FLAT"
     position_quantity: Decimal = Decimal("0")
-    position_notional: Decimal = Decimal("0")
+    position_notional: Decimal | None = None
     entry_price: Decimal | None = None
     mark_price: Decimal | None = None
     index_price: Decimal | None = None
@@ -281,8 +276,8 @@ class RiskContext:
     funding_pnl: Decimal = Decimal("0")
     leverage: Decimal = Decimal("1")
     account_leverage: Decimal | None = None
-    margin_type: str = "ISOLATED"
-    position_mode: str = "ONE_WAY"
+    margin_type: str = "UNKNOWN"
+    position_mode: str = "UNKNOWN"
     liquidation_price: Decimal | None = None
     liquidation_distance_percent: Decimal | None = None
     open_orders: int = 0
@@ -300,7 +295,7 @@ class RiskContext:
     regime_risk: Decimal | None = None
     evidence_conflict: bool = False
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
-    is_meme: bool | None = True
+    is_meme: bool | None = None
     meme_require_classification: bool = True
     account_snapshot: FuturesAccountSnapshot | None = None
     symbol_meme_notional: Decimal = Decimal("0")
@@ -389,6 +384,12 @@ class RiskGate:
 
     def evaluate(self, intent: TradeIntent, context: RiskContext) -> RiskDecision:
         entry = intent.action == "OPEN"
+        if entry and (
+            context.account_snapshot is None
+            or not context.account_snapshot.fresh
+            or context.account_snapshot.mode != context.mode
+        ):
+            return self._halt(intent, "fresh canonical account snapshot is required")
         if context.halted and entry:
             return self._halt(intent, "trading is halted")
         if os.environ.get("BIAN_KILL_SWITCH", "false").strip().lower() in {"1", "true", "yes", "on"}:
@@ -457,25 +458,46 @@ class RiskGate:
         if entry and self._in_cooldown(intent, context):
             return self._deny(intent, "symbol cooldown is active")
 
-        if context.margin_type.upper() != "ISOLATED" or intent.margin_type != "ISOLATED":
+        if entry and (
+            context.margin_type.upper() != "ISOLATED"
+            or intent.margin_type != "ISOLATED"
+        ):
             return self._halt(intent, "margin type mismatch")
-        if context.position_mode.upper() != "ONE_WAY" or intent.position_mode != "ONE_WAY":
+        if entry and (
+            context.position_mode.upper() != "ONE_WAY"
+            or intent.position_mode != "ONE_WAY"
+        ):
             return self._halt(intent, "position mode mismatch")
-        if intent.leverage > self.limits.max_leverage or context.leverage > self.limits.max_leverage:
+        if entry and (
+            intent.leverage > self.limits.max_leverage
+            or context.leverage > self.limits.max_leverage
+        ):
             return self._deny(intent, "maximum leverage exceeded")
-        if context.account_leverage is not None and intent.leverage != context.account_leverage:
+        if entry and (
+            context.account_leverage is not None
+            and intent.leverage != context.account_leverage
+        ):
             return self._halt(intent, "intent leverage does not match validated account leverage")
 
         rules = context.exchange_rules
-        if context.mode in {"testnet", "live"} and rules is None:
+        if entry and rules is None:
             return self._halt(intent, "Futures exchange rules are unavailable")
         if rules is not None:
             if rules.symbol.upper() != intent.symbol:
                 return self._deny(intent, "exchange rules symbol mismatch")
+            if entry and (
+                rules.min_qty <= 0
+                or rules.step_size <= 0
+                or rules.tick_size <= 0
+                or rules.min_notional <= 0
+            ):
+                return self._halt(intent, "Futures exchange rules are incomplete")
             if entry and rules.status != "TRADING":
                 return self._deny(intent, "symbol is not trading")
 
         mark_price = context.mark_price
+        if entry and context.position_quantity > 0 and mark_price is None:
+            return self._halt(intent, "position mark price is unavailable")
         action_decision = self._position_action(intent, context)
         if action_decision is not None:
             return action_decision

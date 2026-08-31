@@ -25,6 +25,7 @@ REQUIRED_TABLES = frozenset(
         "risk_events",
         "system_events",
         "market_flow_events",
+        "positioning_episodes",
         "positioning_snapshots",
         "evidence_snapshots",
         "liquidation_events",
@@ -416,6 +417,37 @@ def _create_trading_tables(cursor: Any) -> None:
     )
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS positioning_episodes (
+            episode_id UUID PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            market TEXT NOT NULL CHECK (market = 'FUTURES'),
+            direction TEXT NOT NULL CHECK (direction IN ('LONG', 'SHORT')),
+            started_at TIMESTAMPTZ NOT NULL,
+            ended_at TIMESTAMPTZ,
+            state TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'UNRESOLVED')),
+            last_observed_at TIMESTAMPTZ NOT NULL,
+            strategy_version TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            metadata JSONB NOT NULL DEFAULT '{}'::JSONB
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positioning_episodes_active_symbol_idx
+        ON positioning_episodes(symbol, market)
+        WHERE status IN ('OPEN', 'UNRESOLVED')
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS positioning_episodes_symbol_time_idx
+        ON positioning_episodes(symbol, started_at DESC)
+        """
+    )
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS positioning_snapshots (
             snapshot_id UUID PRIMARY KEY,
             symbol TEXT NOT NULL,
@@ -520,6 +552,8 @@ def _create_trading_tables(cursor: Any) -> None:
         """
         ALTER TABLE positioning_snapshots
             ADD COLUMN IF NOT EXISTS episode_id UUID,
+            ADD COLUMN IF NOT EXISTS episode_direction TEXT,
+            ADD COLUMN IF NOT EXISTS episode_status TEXT,
             ADD COLUMN IF NOT EXISTS episode_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS episode_ended_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS episode_state TEXT NOT NULL DEFAULT 'FLAT',
@@ -537,6 +571,8 @@ def _create_trading_tables(cursor: Any) -> None:
         ALTER TABLE evidence_snapshots
             ADD COLUMN IF NOT EXISTS data_quality JSONB NOT NULL DEFAULT '{}'::JSONB,
             ADD COLUMN IF NOT EXISTS episode_id UUID,
+            ADD COLUMN IF NOT EXISTS episode_direction TEXT,
+            ADD COLUMN IF NOT EXISTS episode_status TEXT,
             ADD COLUMN IF NOT EXISTS episode_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS episode_ended_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS episode_state TEXT NOT NULL DEFAULT 'FLAT',

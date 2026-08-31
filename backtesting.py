@@ -674,7 +674,13 @@ def run_backtest(
                 active_mfe = max(active_mfe, excursion)
                 active_mae = min(active_mae, excursion)
         if intent is not None and not store.is_halted():
-            context = _risk_context(store, intent, market, executor=executor)
+            context = _risk_context(
+                intent,
+                market,
+                account_snapshot=executor.account_snapshot(),
+                mode="paper",
+                paper_executor=executor,
+            )
             risk_decision = risk_gate.evaluate(intent, context)
             if risk_decision.executable_intent is not None:
                 executor.submit(intent, risk_decision, market=market)

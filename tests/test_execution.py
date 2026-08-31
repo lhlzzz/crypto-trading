@@ -14,7 +14,7 @@ from execution import (
     PaperExecutor,
 )
 from binance_client import BinanceConnectionError, ClientConfig, FuturesRiskRules
-from risk import RiskContext, RiskGate
+from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate
 from trade_intent import TradeIntent
 
 
@@ -172,11 +172,37 @@ def _risk(intent: TradeIntent, **updates: object):
         "equity": Decimal("1000"),
         "mark_price": Decimal("100"),
         "leverage": intent.leverage,
+        "margin_type": "ISOLATED",
+        "position_mode": "ONE_WAY",
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
         "positioning_confidence": Decimal("1"),
+        "is_meme": True,
+        "exchange_rules": ExchangeRules(
+            symbol=intent.symbol,
+            min_qty=Decimal("0.001"),
+            step_size=Decimal("0.001"),
+            tick_size=Decimal("0.01"),
+            min_notional=Decimal("5"),
+        ),
         "liquidation_price": Decimal("50"),
         "liquidation_distance_percent": Decimal("50"),
+        "account_snapshot": FuturesAccountSnapshot(
+            mode="paper",
+            wallet_balance=Decimal("1000"),
+            available_balance=Decimal("1000"),
+            total_margin=Decimal("1000"),
+            used_margin=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=Decimal("0"),
+            positions=(),
+            open_orders=(),
+            leverage={},
+            margin_mode="ISOLATED",
+            position_mode="ONE_WAY",
+            captured_at=datetime.now(timezone.utc),
+            source="test",
+        ),
     }
     if intent.action != "OPEN":
         values["position_direction"] = intent.direction
@@ -379,7 +405,7 @@ def test_paper_low_liquidity_cannot_fully_fill() -> None:
 def test_paper_executor_rejects_denied_risk_decision() -> None:
     store = MemoryStore()
     intent = _intent()
-    denied = RiskGate().evaluate(intent, RiskContext(halted=True, mark_price=Decimal("100")))
+    denied = _risk(intent, halted=True)
 
     with pytest.raises(ExecutionRejected, match="halted"):
         PaperExecutor(store=store).submit(intent, denied, market=_market())

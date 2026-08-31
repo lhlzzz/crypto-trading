@@ -144,7 +144,8 @@ def test_positioning_snapshot_persists_complete_episode_and_evidence_contract():
 
     statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "episode_id" in statements
-    assert "episode_transition" in statements
+    assert "episode_direction" in statements
+    assert "episode_status" in statements
     assert "evidence_sufficiency" in statements
     assert "data_quality" in statements
     evidence_args = cursor.execute.call_args_list[1].args[1]

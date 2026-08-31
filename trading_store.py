@@ -11,7 +11,7 @@ from scripts.database import configured_dsn, ensure_schema
 from trade_intent import TradeIntent
 
 
-def _json(value: dict[str, Any] | None) -> str:
+def _json(value: Any) -> str:
     return json.dumps(value or {}, default=str)
 
 
@@ -132,44 +132,6 @@ class TradingStore:
                     ),
                 )
 
-    def record_signal(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        confidence: Decimal,
-        reason: str,
-        strategy_version: str,
-        observed_at: datetime,
-        payload: dict[str, Any] | None = None,
-    ) -> UUID:
-        import psycopg2
-
-        signal_id = uuid4()
-        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO signals(
-                        signal_id, symbol, side, confidence, reason,
-                        strategy_version, observed_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
-                    RETURNING signal_id
-                    """,
-                    (
-                        str(signal_id),
-                        symbol,
-                        side,
-                        confidence,
-                        reason,
-                        strategy_version,
-                        observed_at,
-                        _json(payload),
-                    ),
-                )
-                row = cursor.fetchone()
-                return UUID(str(row[0]))
-
     def record_market_flow_event(
         self,
         *,
@@ -209,6 +171,185 @@ class TradingStore:
                 )
         return event_id
 
+    def get_active_episode(
+        self, symbol: str, *, market: str = "FUTURES"
+    ) -> dict[str, Any] | None:
+        """Return the single persisted directional lifecycle for a symbol."""
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT episode_id, symbol, market, direction, started_at, ended_at,
+                           state, status, last_observed_at, strategy_version,
+                           config_hash, metadata
+                    FROM positioning_episodes
+                    WHERE symbol = %s
+                      AND market = %s
+                      AND status IN ('OPEN', 'UNRESOLVED')
+                    ORDER BY started_at DESC, episode_id DESC
+                    LIMIT 1
+                    """,
+                    (symbol.upper(), market.upper()),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return _row_dict(
+            (
+                "episode_id", "symbol", "market", "direction", "started_at",
+                "ended_at", "state", "status", "last_observed_at",
+                "strategy_version", "config_hash", "metadata",
+            ),
+            row,
+        )
+
+    def start_episode(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        state: str,
+        observed_at: datetime,
+        strategy_version: str,
+        config_hash: str,
+        metadata: dict[str, Any] | None = None,
+        market: str = "FUTURES",
+    ) -> dict[str, Any]:
+        """Create one active lifecycle, or atomically return the concurrent one."""
+        import psycopg2
+
+        if direction not in {"LONG", "SHORT"}:
+            raise ValueError("episodes require a directional regime")
+        episode_id = uuid4()
+        observed_at = _as_utc(observed_at)
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO positioning_episodes(
+                        episode_id, symbol, market, direction, started_at, state,
+                        status, last_observed_at, strategy_version, config_hash,
+                        metadata
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s,
+                              CAST(%s AS JSONB))
+                    ON CONFLICT (symbol, market)
+                    WHERE status IN ('OPEN', 'UNRESOLVED')
+                    DO UPDATE SET
+                        last_observed_at = GREATEST(
+                            positioning_episodes.last_observed_at,
+                            EXCLUDED.last_observed_at
+                        )
+                    RETURNING episode_id, symbol, market, direction, started_at,
+                              ended_at, state, status, last_observed_at,
+                              strategy_version, config_hash, metadata
+                    """,
+                    (
+                        str(episode_id), symbol.upper(), market.upper(), direction,
+                        observed_at, state, observed_at, strategy_version, config_hash,
+                        _json(metadata),
+                    ),
+                )
+                row = cursor.fetchone()
+        return _row_dict(
+            (
+                "episode_id", "symbol", "market", "direction", "started_at",
+                "ended_at", "state", "status", "last_observed_at",
+                "strategy_version", "config_hash", "metadata",
+            ),
+            row,
+        )
+
+    def update_episode(
+        self,
+        episode_id: UUID | str,
+        *,
+        state: str,
+        status: str,
+        observed_at: datetime,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        import psycopg2
+
+        if status not in {"OPEN", "UNRESOLVED"}:
+            raise ValueError("use close_episode for terminal episode status")
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE positioning_episodes
+                    SET state = %s,
+                        status = %s,
+                        last_observed_at = GREATEST(last_observed_at, %s),
+                        metadata = metadata || CAST(%s AS JSONB)
+                    WHERE episode_id = %s
+                      AND status IN ('OPEN', 'UNRESOLVED')
+                    RETURNING episode_id, symbol, market, direction, started_at,
+                              ended_at, state, status, last_observed_at,
+                              strategy_version, config_hash, metadata
+                    """,
+                    (
+                        state, status, _as_utc(observed_at), _json(metadata),
+                        str(episode_id),
+                    ),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("active positioning episode disappeared")
+        return _row_dict(
+            (
+                "episode_id", "symbol", "market", "direction", "started_at",
+                "ended_at", "state", "status", "last_observed_at",
+                "strategy_version", "config_hash", "metadata",
+            ),
+            row,
+        )
+
+    def close_episode(
+        self,
+        episode_id: UUID | str,
+        *,
+        state: str,
+        observed_at: datetime,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        import psycopg2
+
+        observed_at = _as_utc(observed_at)
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE positioning_episodes
+                    SET state = %s,
+                        status = 'CLOSED',
+                        ended_at = %s,
+                        last_observed_at = GREATEST(last_observed_at, %s),
+                        metadata = metadata || CAST(%s AS JSONB)
+                    WHERE episode_id = %s
+                      AND status IN ('OPEN', 'UNRESOLVED')
+                    RETURNING episode_id, symbol, market, direction, started_at,
+                              ended_at, state, status, last_observed_at,
+                              strategy_version, config_hash, metadata
+                    """,
+                    (
+                        state, observed_at, observed_at, _json(metadata),
+                        str(episode_id),
+                    ),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("active positioning episode disappeared")
+        return _row_dict(
+            (
+                "episode_id", "symbol", "market", "direction", "started_at",
+                "ended_at", "state", "status", "last_observed_at",
+                "strategy_version", "config_hash", "metadata",
+            ),
+            row,
+        )
+
     def record_positioning_snapshot(
         self, decision: Any, *, strategy_version: str
     ) -> UUID:
@@ -225,8 +366,8 @@ class TradingStore:
                         direction, confidence, long_score, short_score,
                         crowding_score, liquidity_score, data_quality_score,
                         strategy_version, reason_codes, episode_id,
-                        episode_started_at, episode_ended_at, episode_state,
-                        episode_transition, evidence_sufficiency, is_meme,
+                        episode_direction, episode_status, episode_started_at,
+                        episode_ended_at, evidence_sufficiency, is_meme,
                         meme_classification_source, meme_classification_version,
                         meme_classified_at, meme_reason_codes, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
@@ -235,10 +376,10 @@ class TradingStore:
                               CAST(%s AS JSONB), CAST(%s AS JSONB))
                     ON CONFLICT (snapshot_id) DO UPDATE SET
                         episode_id = EXCLUDED.episode_id,
+                        episode_direction = EXCLUDED.episode_direction,
+                        episode_status = EXCLUDED.episode_status,
                         episode_started_at = EXCLUDED.episode_started_at,
                         episode_ended_at = EXCLUDED.episode_ended_at,
-                        episode_state = EXCLUDED.episode_state,
-                        episode_transition = EXCLUDED.episode_transition,
                         evidence_sufficiency = EXCLUDED.evidence_sufficiency,
                         is_meme = EXCLUDED.is_meme,
                         meme_classification_source = EXCLUDED.meme_classification_source,
@@ -255,8 +396,8 @@ class TradingStore:
                         decision.data_quality_score, strategy_version,
                         _json(list(decision.reason_codes)),
                         str(decision.episode_id) if decision.episode_id else None,
+                        decision.episode_direction, decision.episode_status,
                         decision.episode_started_at, decision.episode_ended_at,
-                        decision.episode_state, decision.episode_transition,
                         _json(decision.evidence_sufficiency.as_dict()),
                         decision.is_meme, decision.meme_classification_source,
                         decision.meme_classification_version,
@@ -269,7 +410,7 @@ class TradingStore:
                     INSERT INTO evidence_snapshots(
                         snapshot_id, symbol, observed_at, source_timestamps,
                         evidence, data_quality, episode_id, episode_started_at,
-                        episode_ended_at, episode_state, episode_transition,
+                        episode_ended_at, episode_direction, episode_status,
                         universe_classification, payload
                     ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
                               CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
@@ -281,8 +422,8 @@ class TradingStore:
                         episode_id = EXCLUDED.episode_id,
                         episode_started_at = EXCLUDED.episode_started_at,
                         episode_ended_at = EXCLUDED.episode_ended_at,
-                        episode_state = EXCLUDED.episode_state,
-                        episode_transition = EXCLUDED.episode_transition,
+                        episode_direction = EXCLUDED.episode_direction,
+                        episode_status = EXCLUDED.episode_status,
                         universe_classification = EXCLUDED.universe_classification,
                         payload = EXCLUDED.payload
                     """,
@@ -297,7 +438,7 @@ class TradingStore:
                         }),
                         str(decision.episode_id) if decision.episode_id else None,
                         decision.episode_started_at, decision.episode_ended_at,
-                        decision.episode_state, decision.episode_transition,
+                        decision.episode_direction, decision.episode_status,
                         _json({
                             "is_meme": decision.is_meme,
                             "source": decision.meme_classification_source,
@@ -306,36 +447,6 @@ class TradingStore:
                             "reason_codes": list(decision.meme_reason_codes),
                         }),
                         _json(payload),
-                    ),
-                )
-        return snapshot_id
-
-    def record_evidence_snapshot(
-        self,
-        *,
-        snapshot_id: UUID,
-        symbol: str,
-        observed_at: datetime,
-        evidence: dict[str, Any],
-        source_timestamps: dict[str, Any] | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> UUID:
-        import psycopg2
-
-        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO evidence_snapshots(
-                        snapshot_id, symbol, observed_at, source_timestamps,
-                        evidence, payload
-                    ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
-                              CAST(%s AS JSONB))
-                    ON CONFLICT (snapshot_id) DO UPDATE SET payload = EXCLUDED.payload
-                    """,
-                    (
-                        str(snapshot_id), symbol.upper(), observed_at,
-                        _json(source_timestamps), _json(evidence), _json(payload),
                     ),
                 )
         return snapshot_id
@@ -488,6 +599,116 @@ class TradingStore:
             "notional", "direction", "metadata",
         )
         return [_row_dict(columns, row) for row in rows]
+
+    def latest_market_observation(
+        self,
+        symbol: str,
+        *,
+        source_ttl_sec: int = 900,
+        lookback_seconds: int = 86_400,
+    ) -> Any:
+        """Build one MarketFrame from persisted public observations only."""
+        import psycopg2
+        from engine import MarketFrame, SourceFreshness
+        from scripts.bian_market import positioning_feature_values
+
+        normalized_symbol = symbol.upper()
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT captured_at, last_price, quote_volume
+                    FROM bian_market_snapshots
+                    WHERE symbol = %s
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 100
+                    """,
+                    (normalized_symbol,),
+                )
+                rows = list(reversed(cursor.fetchall()))
+        if not rows:
+            raise RuntimeError(
+                f"canonical market observation is unavailable for {normalized_symbol}"
+            )
+        captured_at = _as_utc(rows[-1][0])
+        closes = tuple(Decimal(str(row[1])) for row in rows if row[1] is not None)
+        if not closes:
+            raise RuntimeError(
+                f"canonical market observation has no price for {normalized_symbol}"
+            )
+        events = self.positioning_events(
+            normalized_symbol,
+            as_of=captured_at,
+            lookback_seconds=lookback_seconds,
+        )
+        features = positioning_feature_values(events, as_of=captured_at)
+        universe = self.market_universe_context(normalized_symbol, as_of=captured_at)
+        universe_timestamps = dict(universe.pop("source_timestamps", {}))
+        features.update({
+            name: value
+            for name, value in universe.items()
+            if name in {
+                "relative_strength", "relative_strength_1m",
+                "relative_strength_5m", "relative_strength_15m",
+                "relative_strength_1h", "breadth_score",
+                "advance_decline_ratio", "market_regime", "meme_risk_tier",
+                "is_meme", "meme_classification_source",
+                "meme_classification_version", "meme_classified_at",
+                "meme_reason_codes",
+            }
+        })
+        source_timestamps = {
+            "futures_snapshot": {
+                "source_timestamp": captured_at.isoformat(),
+                "received_timestamp": captured_at.isoformat(),
+                "latency_ms": 0,
+            },
+            **dict(features.pop("source_timestamps", {})),
+            **universe_timestamps,
+        }
+        freshness = tuple(
+            SourceFreshness(
+                source=source,
+                source_timestamp=_as_utc(timestamps["source_timestamp"]),
+                received_timestamp=_as_utc(timestamps["received_timestamp"]),
+                max_age_sec=max(1, source_ttl_sec),
+                now=captured_at,
+            )
+            for source, timestamps in source_timestamps.items()
+        )
+        health = self.market_data_freshness(
+            max_age_sec=source_ttl_sec,
+            symbols=[normalized_symbol],
+        )
+        evidence_status: dict[str, str] = {}
+        for row in health:
+            if row["source"] == "FUTURES_DEPTH":
+                status = str(row["status"]).upper()
+                if status in {"GAP", "UNSAFE", "ERROR"}:
+                    evidence_status["orderbook"] = "UNSAFE"
+                elif status == "FRESH":
+                    evidence_status["orderbook"] = "AVAILABLE"
+        allowed = set(MarketFrame.__dataclass_fields__) - {
+            "symbol", "closes", "captured_at", "quote_volume", "freshness",
+            "source_timestamps", "evidence_status",
+        }
+        values = {name: value for name, value in features.items() if name in allowed}
+        if values.get("meme_classified_at") is not None:
+            values["meme_classified_at"] = _as_utc(values["meme_classified_at"])
+        if values.get("meme_reason_codes") is not None:
+            values["meme_reason_codes"] = tuple(values["meme_reason_codes"])
+        return MarketFrame(
+            symbol=normalized_symbol,
+            closes=closes,
+            captured_at=captured_at,
+            quote_volume=(
+                Decimal(str(rows[-1][2])) if rows[-1][2] is not None else None
+            ),
+            freshness=freshness,
+            evidence_status=evidence_status,
+            source_timestamps=source_timestamps,
+            **values,
+        )
 
     def market_data_freshness(
         self,

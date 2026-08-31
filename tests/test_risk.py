@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from risk import ExchangeRules, RiskContext, RiskGate, RiskLimits, classify_meme_risk_tier
+from risk import (
+    ExchangeRules,
+    FuturesAccountSnapshot,
+    RiskContext,
+    RiskGate,
+    RiskLimits,
+    classify_meme_risk_tier,
+)
 from trade_intent import TradeIntent
 
 
@@ -29,6 +36,7 @@ def _context(**updates: object) -> RiskContext:
         "wallet_balance": Decimal("1000"),
         "available_balance": Decimal("1000"),
         "equity": Decimal("1000"),
+        "mode": "paper",
         "mark_price": Decimal("100"),
         "leverage": Decimal("2"),
         "margin_type": "ISOLATED",
@@ -38,6 +46,23 @@ def _context(**updates: object) -> RiskContext:
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
         "positioning_confidence": Decimal("1"),
+        "is_meme": True,
+        "account_snapshot": FuturesAccountSnapshot(
+            mode="paper",
+            wallet_balance=Decimal("1000"),
+            available_balance=Decimal("1000"),
+            total_margin=Decimal("1000"),
+            used_margin=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=Decimal("0"),
+            positions=(),
+            open_orders=(),
+            leverage={},
+            margin_mode="ISOLATED",
+            position_mode="ONE_WAY",
+            captured_at=datetime.now(timezone.utc),
+            source="test",
+        ),
         "exchange_rules": ExchangeRules(
             symbol="BTCUSDT",
             min_qty=Decimal("0.001"),
@@ -47,6 +72,24 @@ def _context(**updates: object) -> RiskContext:
         ),
     }
     values.update(updates)
+    snapshot = values.get("account_snapshot")
+    if isinstance(snapshot, FuturesAccountSnapshot) and snapshot.mode != values["mode"]:
+        values["account_snapshot"] = FuturesAccountSnapshot(
+            mode=values["mode"],  # type: ignore[arg-type]
+            wallet_balance=snapshot.wallet_balance,
+            available_balance=snapshot.available_balance,
+            total_margin=snapshot.total_margin,
+            used_margin=snapshot.used_margin,
+            unrealized_pnl=snapshot.unrealized_pnl,
+            realized_pnl=snapshot.realized_pnl,
+            positions=snapshot.positions,
+            open_orders=snapshot.open_orders,
+            leverage=snapshot.leverage,
+            margin_mode=snapshot.margin_mode,
+            position_mode=snapshot.position_mode,
+            captured_at=snapshot.captured_at,
+            source=snapshot.source,
+        )
     return RiskContext(**values)
 
 

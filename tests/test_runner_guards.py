@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
@@ -94,10 +95,11 @@ def test_paper_risk_context_uses_symbol_aware_model_liquidation_price() -> None:
         strategy_version="test",
     )
     context = _risk_context(
-        store,
         intent,
         MarketSnapshot(last_price=Decimal("100"), mark_price=Decimal("100")),
-        executor=executor,
+        account_snapshot=executor.account_snapshot(),
+        mode="paper",
+        paper_executor=executor,
     )
 
     assert context.liquidation_price is not None
@@ -161,63 +163,150 @@ def test_test_only_signal_injection_is_hard_blocked_in_production(monkeypatch) -
         _test_only_signal_injection(_frame(), mode="paper")
 
 
-def test_no_signal_is_recorded_without_lowering_strategy_threshold(monkeypatch) -> None:
+def test_no_signal_is_recorded_without_lowering_strategy_threshold() -> None:
     from datetime import datetime, timezone
+    from risk import FuturesAccountSnapshot
+    from engine import StrategyConfig, StrategyEngine
 
     class NoSignalStore:
         def __init__(self):
             self.events = []
 
+        def latest_market_observation(self, *args, **kwargs):
+            return _frame()
+
+        def latest_positioning_state(self, *args, **kwargs):
+            return None
+
+        def get_active_episode(self, *args, **kwargs):
+            return None
+
+        def record_positioning_snapshot(self, *args, **kwargs):
+            return None
+
         def record_system_event(self, **fields):
             self.events.append(fields)
 
-    class NoSignalEngine:
-        class Config:
-            strategy_version = "test-no-signal"
-
-        config = Config()
-
-        def evaluate(self, frame):
-            return None
-
     class UnusedExecutor:
+        def account_snapshot(self):
+            return FuturesAccountSnapshot(
+                mode="paper",
+                wallet_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                total_margin=Decimal("1000"),
+                used_margin=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                positions=(),
+                open_orders=(),
+                leverage={},
+                margin_mode="ISOLATED",
+                position_mode="ONE_WAY",
+                captured_at=datetime.now(timezone.utc),
+                source="test",
+            )
+
         def submit(self, *args, **kwargs):
             raise AssertionError("no signal must not submit")
 
-    monkeypatch.setattr(
-        "paper_runner.bian_market.get_klines",
-        lambda symbol, interval, limit: {
-            "symbol": symbol,
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "klines": [[0, 0, 0, 0, "100", 0, 0, "1000"]],
-        },
-    )
     store = NoSignalStore()
     result = run_cycle(
         "BTCUSDT",
         store=store,
-        engine=NoSignalEngine(),
+        engine=StrategyEngine(
+            StrategyConfig(
+                positioning_decision_enabled=False,
+                legacy_execution_enabled=False,
+            )
+        ),
         executor=UnusedExecutor(),
         mode="paper",
     )
 
     assert result["status"] == "no_signal"
-    assert store.events[0]["event_type"] == "NO_SIGNAL"
+    assert store.events[-1]["event_type"] == "NO_SIGNAL"
 
 
-def test_shadow_cycle_records_decision_without_risk_or_execution(monkeypatch) -> None:
+def test_persisted_episode_survives_restart_and_unresolved_states() -> None:
+    from dataclasses import replace
     from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from engine import StrategyEngine
+    from paper_runner import _with_persisted_episode
+
+    episode_id = uuid4()
+    started_at = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+    class EpisodeStore:
+        def __init__(self) -> None:
+            self.episode = {
+                "episode_id": episode_id,
+                "symbol": "BTCUSDT",
+                "market": "FUTURES",
+                "direction": "LONG",
+                "started_at": started_at,
+                "ended_at": None,
+                "state": "LONG_BUILDING",
+                "status": "OPEN",
+                "last_observed_at": started_at,
+                "strategy_version": "positioning-v1",
+                "config_hash": "hash",
+                "metadata": {},
+            }
+
+        def get_active_episode(self, *args, **kwargs):
+            return self.episode
+
+        def update_episode(self, *args, state, status, observed_at, metadata, **kwargs):
+            self.episode.update(
+                state=state,
+                status=status,
+                last_observed_at=observed_at,
+                metadata=metadata,
+            )
+            return self.episode
+
+    engine = StrategyEngine()
+    decision = engine.positioning_decision(_frame())
+    store = EpisodeStore()
+
+    directional = replace(decision, state="LONG_BUILDING")
+    restarted = _with_persisted_episode(directional, store=store, engine=engine)
+    unknown = _with_persisted_episode(
+        replace(decision, state="UNKNOWN"),
+        store=store,
+        engine=engine,
+    )
+    conflicted = _with_persisted_episode(
+        replace(decision, state="CONFLICTED"),
+        store=store,
+        engine=engine,
+    )
+
+    assert restarted.episode_id == episode_id
+    assert restarted.episode_status == "OPEN"
+    assert unknown.episode_id == episode_id
+    assert unknown.episode_status == "UNRESOLVED"
+    assert conflicted.episode_id == episode_id
+    assert conflicted.episode_status == "UNRESOLVED"
+
+
+def test_shadow_cycle_records_decision_without_risk_or_execution() -> None:
 
     class ShadowStore:
         def __init__(self):
             self.snapshots = []
             self.events = []
 
-        def positioning_events(self, *args, **kwargs):
-            return []
+        def latest_market_observation(self, *args, **kwargs):
+            return _frame()
 
-        def market_universe_context(self, *args, **kwargs):
-            return {}
+        def latest_positioning_state(self, *args, **kwargs):
+            return None
+
+        def get_active_episode(self, *args, **kwargs):
+            return None
 
         def record_positioning_snapshot(self, decision, **kwargs):
             self.snapshots.append((decision, kwargs))
@@ -225,17 +314,6 @@ def test_shadow_cycle_records_decision_without_risk_or_execution(monkeypatch) ->
         def record_system_event(self, **fields):
             self.events.append(fields)
 
-    captured_at = datetime(2026, 8, 26, 20, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(
-        "paper_runner.bian_market.get_klines",
-        lambda symbol, interval, limit: {
-            "symbol": symbol,
-            "captured_at": captured_at.isoformat(),
-            "source_timestamp": captured_at.isoformat(),
-            "received_timestamp": captured_at.isoformat(),
-            "klines": [[0, 0, 0, 0, "100", 0, 0, "1000"]],
-        },
-    )
     store = ShadowStore()
 
     result = run_shadow_cycle("BTCUSDT", store=store)
@@ -246,7 +324,7 @@ def test_shadow_cycle_records_decision_without_risk_or_execution(monkeypatch) ->
     assert store.events[0]["event_type"] == "POSITIONING_SHADOW_DECISION"
 
 
-def test_shadow_cycle_recovers_the_persisted_predecessor_state(monkeypatch) -> None:
+def test_shadow_cycle_recovers_the_persisted_predecessor_state() -> None:
     from datetime import datetime, timezone
 
     class ShadowStore:
@@ -254,16 +332,16 @@ def test_shadow_cycle_recovers_the_persisted_predecessor_state(monkeypatch) -> N
             self.snapshots = []
             self.events = []
 
-        def positioning_events(self, *args, **kwargs):
-            return []
-
-        def market_universe_context(self, *args, **kwargs):
-            return {}
+        def latest_market_observation(self, *args, **kwargs):
+            return frame
 
         def latest_positioning_state(self, symbol, *, before):
             assert symbol == "BTCUSDT"
-            assert before == captured_at
+            assert before == frame.captured_at
             return "SHORT_COVERING"
+
+        def get_active_episode(self, *args, **kwargs):
+            return None
 
         def record_positioning_snapshot(self, decision, **kwargs):
             self.snapshots.append((decision, kwargs))
@@ -271,17 +349,7 @@ def test_shadow_cycle_recovers_the_persisted_predecessor_state(monkeypatch) -> N
         def record_system_event(self, **fields):
             self.events.append(fields)
 
-    captured_at = datetime(2026, 8, 26, 20, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(
-        "paper_runner.bian_market.get_klines",
-        lambda symbol, interval, limit: {
-            "symbol": symbol,
-            "captured_at": captured_at.isoformat(),
-            "source_timestamp": captured_at.isoformat(),
-            "received_timestamp": captured_at.isoformat(),
-            "klines": [[0, 0, 0, 0, "100", 0, 0, "1000"]],
-        },
-    )
+    frame = _frame()
     store = ShadowStore()
 
     run_shadow_cycle("BTCUSDT", store=store)

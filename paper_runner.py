@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
+import hashlib
+import json
 import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from uuid import UUID
 
 from backtesting import replay_positioning_frames
-from engine import CurrentPosition, MarketFrame, SourceFreshness, StrategyConfig, StrategyEngine
+from engine import CurrentPosition, MarketFrame, PositioningDecision, StrategyConfig, StrategyEngine
 from binance_client import ClientConfig, FuturesPublicClient
 from execution import (
     BinanceExecutor,
@@ -22,21 +25,11 @@ from execution import (
     executor_from_env,
 )
 from reconciliation import Reconciler, apply_user_stream_event
-from risk import ExchangeRules, RiskContext, RiskGate, RiskLimits
+from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate, RiskLimits
 from runtime_gate import GateResult, evaluate_runtime_gate, max_data_age_sec
 from scripts import bian_market
 from trade_intent import TradeIntent
 from trading_store import TradingStore
-
-
-def _decimal(value: Any) -> Decimal:
-    try:
-        result = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid market numeric value: {value}") from exc
-    if not result.is_finite() or result <= 0:
-        raise ValueError(f"market numeric value must be positive: {value}")
-    return result
 
 
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -116,103 +109,6 @@ def _test_only_signal_injection(
     )
 
 
-def _market_frame(
-    report: dict[str, Any],
-    *,
-    positioning_events: list[dict[str, Any]] | None = None,
-    universe_context: dict[str, Any] | None = None,
-) -> MarketFrame:
-    raw_klines = report.get("klines") or []
-    closes = tuple(_decimal(row[4]) for row in raw_klines if len(row) > 4)
-    if not closes:
-        raise ValueError("Binance kline response contained no closes")
-    captured_at = datetime.fromisoformat(str(report["captured_at"]))
-    source_timestamp = datetime.fromisoformat(
-        str(report.get("source_timestamp", report["captured_at"]))
-    )
-    received_timestamp = datetime.fromisoformat(
-        str(report.get("received_timestamp", report["captured_at"]))
-    )
-    freshness = SourceFreshness(
-        source="binance_futures_klines",
-        source_timestamp=source_timestamp,
-        received_timestamp=received_timestamp,
-        max_age_sec=max_data_age_sec(),
-        now=received_timestamp,
-    )
-    features = bian_market.positioning_feature_values(
-        positioning_events or [], as_of=captured_at
-    )
-    universe_context = dict(universe_context or {})
-    universe_source_timestamps = universe_context.pop("source_timestamps", {})
-    features.update({
-        name: value
-        for name, value in universe_context.items()
-        if name in {
-            "relative_strength", "relative_strength_1m", "relative_strength_5m",
-            "relative_strength_15m", "relative_strength_1h", "breadth_score",
-            "advance_decline_ratio", "market_regime", "meme_risk_tier",
-            "is_meme", "meme_classification_source",
-            "meme_classification_version", "meme_classified_at",
-            "meme_reason_codes",
-        }
-    })
-    if features.get("meme_classified_at") is not None:
-        features["meme_classified_at"] = datetime.fromisoformat(
-            str(features["meme_classified_at"])
-        )
-    if features.get("meme_reason_codes") is not None:
-        features["meme_reason_codes"] = tuple(features["meme_reason_codes"])
-    evidence_status: dict[str, str] = {}
-    for event in positioning_events or []:
-        if str(event.get("event_type", "")).upper() != "ORDERBOOK":
-            continue
-        metadata = event.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        state = str(
-            metadata.get("health_status") or metadata.get("state") or ""
-        ).upper()
-        if state in {"GAP", "UNSAFE", "ERROR"}:
-            evidence_status["orderbook"] = "UNSAFE"
-        elif state == "VALID":
-            evidence_status["orderbook"] = "AVAILABLE"
-    source_timestamps = {
-        "futures_klines": {
-            "source_timestamp": source_timestamp.isoformat(),
-            "received_timestamp": received_timestamp.isoformat(),
-            "latency_ms": int((received_timestamp - source_timestamp).total_seconds() * 1000),
-        },
-        **features.pop("source_timestamps"),
-        **universe_source_timestamps,
-    }
-    source_freshness = [freshness]
-    for source, timestamps in source_timestamps.items():
-        if source == "futures_klines":
-            continue
-        source_at = datetime.fromisoformat(str(timestamps["source_timestamp"]))
-        received_at = datetime.fromisoformat(str(timestamps["received_timestamp"]))
-        source_freshness.append(
-            SourceFreshness(
-                source=source,
-                source_timestamp=source_at,
-                received_timestamp=received_at,
-                max_age_sec=max_data_age_sec(),
-                now=captured_at,
-            )
-        )
-    return MarketFrame(
-        symbol=str(report["symbol"]),
-        closes=closes,
-        captured_at=captured_at,
-        quote_volume=_decimal(raw_klines[-1][7]) if len(raw_klines[-1]) > 7 else None,
-        freshness=tuple(source_freshness),
-        evidence_status=evidence_status,
-        source_timestamps=source_timestamps,
-        **features,
-    )
-
-
 def _market_snapshot(frame: MarketFrame) -> MarketSnapshot:
     last_price = frame.last_price or frame.closes[-1]
     mark_price = frame.mark_price
@@ -234,92 +130,149 @@ def _market_snapshot(frame: MarketFrame) -> MarketSnapshot:
     )
 
 
-def _positioning_frame_for_symbol(
-    symbol: str,
-    store: TradingStore,
-    *,
-    strict: bool,
-) -> MarketFrame:
-    """Build one timestamp-bounded decision frame from public observations."""
-    report = bian_market.get_klines(
-        symbol,
-        interval=os.environ.get("BIAN_PAPER_INTERVAL", "1m"),
-        limit=_int_env("BIAN_PAPER_KLINE_LIMIT", 100, minimum=1),
-    )
-    captured_at = datetime.fromisoformat(str(report["captured_at"]))
-    positioning_events: list[dict[str, Any]] = []
-    universe_context: dict[str, Any] = {}
-    if hasattr(store, "positioning_events"):
-        try:
-            positioning_events = store.positioning_events(
-                symbol,
-                as_of=captured_at,
-                lookback_seconds=_int_env(
-                    "POSITIONING_EVENT_LOOKBACK_SEC", 86_400, minimum=300
-                ),
-            )
-        except Exception:
-            if strict:
-                raise
-    if hasattr(store, "market_universe_context"):
-        try:
-            universe_context = store.market_universe_context(symbol, as_of=captured_at)
-        except Exception:
-            if strict:
-                raise
-    return _market_frame(
-        report,
-        positioning_events=positioning_events,
-        universe_context=universe_context,
-    )
-
-
 def _record_shadow(
     frame: MarketFrame,
     *,
     store: TradingStore,
     engine: StrategyEngine,
-    strict: bool,
-) -> tuple[Any | None, dict[str, Any] | None]:
-    """Persist one legacy-versus-positioning comparison without execution."""
-    if not hasattr(engine, "positioning_decision"):
-        return None, None
-    previous_state = None
-    if hasattr(store, "latest_positioning_state"):
-        previous_state = store.latest_positioning_state(
-            frame.symbol, before=frame.captured_at
-        )
+ ) -> tuple[PositioningDecision, dict[str, Any]]:
+    """Persist the positioning decision before any intent can exist."""
+    previous_state = store.latest_positioning_state(
+        frame.symbol, before=frame.captured_at
+    )
     positioning = engine.positioning_decision(
         frame,
         now=frame.captured_at,
         previous_state=previous_state,
     )
-    try:
-        store.record_positioning_snapshot(
-            positioning,
-            strategy_version=getattr(
-                engine.config, "positioning_strategy_version", "positioning-v1"
-            ),
+    positioning = _with_persisted_episode(positioning, store=store, engine=engine)
+    store.record_positioning_snapshot(
+        positioning,
+        strategy_version=engine.config.positioning_strategy_version,
+    )
+    shadow = engine.evaluate_shadow(frame, positioning=positioning)
+    store.record_system_event(
+        event_type="POSITIONING_SHADOW_DECISION",
+        severity="INFO",
+        message="legacy and positioning decisions compared",
+        payload={
+            "symbol": frame.symbol,
+            "legacy_decision": shadow["legacy_decision"],
+            "positioning_decision": positioning.as_dict(),
+            "agreement": shadow["agreement"],
+            "why_different": shadow["why_different"],
+        },
+    )
+    return positioning, shadow
+
+
+def _episode_config_hash(engine: StrategyEngine) -> str:
+    payload = json.dumps(asdict(engine.config), default=str, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _episode_uuid(row: dict[str, Any]) -> UUID:
+    return UUID(str(row["episode_id"]))
+
+
+def _episode_timestamp(row: dict[str, Any], field: str) -> datetime:
+    value = row[field]
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _with_persisted_episode(
+    decision: PositioningDecision,
+    *,
+    store: TradingStore,
+    engine: StrategyEngine,
+) -> PositioningDecision:
+    """Attach the Store-owned lifecycle to a pure positioning decision."""
+    active = store.get_active_episode(decision.symbol)
+    direction = engine.episode_direction(decision.state)
+    metadata = {
+        "positioning_state": decision.state,
+        "reason_codes": list(decision.reason_codes),
+    }
+    if decision.state in {"UNKNOWN", "CONFLICTED"}:
+        if active is None:
+            return decision
+        episode = store.update_episode(
+            _episode_uuid(active),
+            state=decision.state,
+            status="UNRESOLVED",
+            observed_at=decision.timestamp,
+            metadata=metadata,
         )
-        shadow = engine.evaluate_shadow(frame, positioning=positioning)
-        store.record_system_event(
-            event_type="POSITIONING_SHADOW_DECISION",
-            severity="INFO",
-            message="legacy and positioning decisions compared",
-            payload={
-                "symbol": frame.symbol,
-                "legacy_decision": shadow["legacy_decision"],
-                "positioning_decision": positioning.as_dict(),
-                "agreement": shadow["agreement"],
-                "why_different": shadow["why_different"],
-            },
+        return replace(
+            decision,
+            episode_id=_episode_uuid(episode),
+            episode_direction=episode["direction"],
+            episode_status="UNRESOLVED",
+            episode_started_at=_episode_timestamp(episode, "started_at"),
         )
-        return positioning, shadow
-    except Exception:
-        if strict:
-            raise
-        # Shadow persistence must never turn a valid legacy paper cycle into an order.
-        return positioning, None
+    if decision.state in {"LONG_UNWIND", "SHORT_COVERING", "FORCED_DELEVERAGING"}:
+        if active is None:
+            return decision
+        episode = store.close_episode(
+            _episode_uuid(active),
+            state=decision.state,
+            observed_at=decision.timestamp,
+            metadata=metadata,
+        )
+        return replace(
+            decision,
+            episode_id=_episode_uuid(episode),
+            episode_direction=episode["direction"],
+            episode_status="CLOSED",
+            episode_started_at=_episode_timestamp(episode, "started_at"),
+            episode_ended_at=_episode_timestamp(episode, "ended_at"),
+        )
+    if direction == "FLAT":
+        if active is None:
+            return decision
+        return replace(
+            decision,
+            episode_id=_episode_uuid(active),
+            episode_direction=active["direction"],
+            episode_status=active["status"],
+            episode_started_at=_episode_timestamp(active, "started_at"),
+        )
+    if active is not None and active["direction"] != direction:
+        store.close_episode(
+            _episode_uuid(active),
+            state="CONFIRMED_REVERSAL",
+            observed_at=decision.timestamp,
+            metadata=metadata,
+        )
+        active = None
+    if active is None:
+        episode = store.start_episode(
+            symbol=decision.symbol,
+            direction=direction,
+            state=decision.state,
+            observed_at=decision.timestamp,
+            strategy_version=engine.config.positioning_strategy_version,
+            config_hash=_episode_config_hash(engine),
+            metadata=metadata,
+        )
+    else:
+        episode = store.update_episode(
+            _episode_uuid(active),
+            state=decision.state,
+            status="OPEN",
+            observed_at=decision.timestamp,
+            metadata=metadata,
+        )
+    return replace(
+        decision,
+        episode_id=_episode_uuid(episode),
+        episode_direction=episode["direction"],
+        episode_status=episode["status"],
+        episode_started_at=_episode_timestamp(episode, "started_at"),
+    )
 
 
 def run_shadow_cycle(
@@ -331,15 +284,15 @@ def run_shadow_cycle(
     """Persist a positioning shadow decision without Risk or execution calls."""
     store = store or TradingStore()
     engine = engine or StrategyEngine(StrategyConfig.from_env())
-    frame = _positioning_frame_for_symbol(symbol, store, strict=True)
+    frame = store.latest_market_observation(
+        symbol,
+        source_ttl_sec=engine.config.source_ttl_sec,
+    )
     positioning, shadow = _record_shadow(
         frame,
         store=store,
         engine=engine,
-        strict=True,
     )
-    if positioning is None or shadow is None:
-        raise RuntimeError("positioning shadow engine is unavailable")
     return {
         "status": "shadow_recorded",
         "symbol": frame.symbol,
@@ -373,16 +326,33 @@ def paper_shadow_attribution(
     return {"symbol": symbol.upper(), **payload}
 
 
-def _current_position(store: TradingStore, symbol: str) -> CurrentPosition:
-    position = store.get_position(symbol) if hasattr(store, "get_position") else None
-    if not position:
+def _current_position(
+    snapshot: FuturesAccountSnapshot,
+    symbol: str,
+) -> CurrentPosition:
+    position = next(
+        (
+            dict(row)
+            for row in snapshot.positions
+            if str(row.get("symbol", "")).upper() == symbol.upper()
+        ),
+        None,
+    )
+    if position is None:
         return CurrentPosition()
-    quantity = Decimal(str(position.get("quantity") or "0"))
-    side = str(position.get("position_side") or "FLAT")
+    raw_quantity = Decimal(str(
+        position.get("quantity", position.get("positionAmt", "0"))
+    ))
+    quantity = abs(raw_quantity)
+    side = str(
+        position.get("position_side", position.get("positionSide", ""))
+    ).upper()
     if quantity == 0:
         side = "FLAT"
+    elif side in {"BOTH", ""}:
+        side = "LONG" if raw_quantity > 0 else "SHORT" if raw_quantity < 0 else "FLAT"
     elif side not in {"LONG", "SHORT"}:
-        side = "LONG"
+        raise RuntimeError(f"unrecognized futures position side: {side}")
     leverage = Decimal(str(position.get("leverage") or "1"))
     entry = position.get("entry_price") or position.get("average_price")
     return CurrentPosition(
@@ -394,51 +364,33 @@ def _current_position(store: TradingStore, symbol: str) -> CurrentPosition:
 
 
 def _risk_context(
-    store: TradingStore,
     intent: TradeIntent,
     market: MarketSnapshot,
     *,
+    account_snapshot: FuturesAccountSnapshot,
+    mode: str,
     public_client: FuturesPublicClient | None = None,
-    executor: Executor | None = None,
+    paper_executor: PaperExecutor | None = None,
 ) -> RiskContext:
-    account_snapshot = None
-    if executor is not None and hasattr(executor, "account_snapshot"):
-        account_snapshot = executor.account_snapshot()
-        if not account_snapshot.fresh:
-            raise RuntimeError("account snapshot is stale or unavailable")
-        account = {
-            "wallet_balance": account_snapshot.wallet_balance,
-            "available_balance": account_snapshot.available_balance,
-            "used_margin": account_snapshot.used_margin,
-            "equity": account_snapshot.total_margin,
-            "unrealized_pnl": account_snapshot.unrealized_pnl,
-            "realized_pnl": account_snapshot.realized_pnl,
-            "funding_pnl": Decimal("0"),
-        }
-    elif executor is not None and hasattr(executor, "account_state"):
-        account = executor.account_state()
-    else:
-        quote = store.get_balance("USDT") or {}
-        wallet = Decimal(str(quote.get("wallet_balance") or quote.get("free") or "0"))
-        used = Decimal(str(quote.get("used_margin") or quote.get("locked") or "0"))
-        account = {
-            "wallet_balance": wallet,
-            "available_balance": Decimal(str(quote.get("available_balance") or quote.get("free") or "0")),
-            "used_margin": used,
-            "equity": wallet,
-            "unrealized_pnl": Decimal(str(quote.get("unrealized_pnl") or "0")),
-            "realized_pnl": Decimal("0"),
-            "funding_pnl": Decimal(str(quote.get("funding_pnl") or "0")),
-        }
-    position = store.get_position(intent.symbol) if hasattr(store, "get_position") else None
-    position = position or {}
-    quantity = Decimal(str(position.get("quantity") or "0"))
-    direction = str(position.get("position_side") or "FLAT")
-    if quantity == 0:
-        direction = "FLAT"
+    if not isinstance(account_snapshot, FuturesAccountSnapshot) or not account_snapshot.fresh:
+        raise RuntimeError("fresh account snapshot is required")
+    if account_snapshot.mode != mode:
+        raise RuntimeError("account snapshot mode does not match runtime mode")
+    current = _current_position(account_snapshot, intent.symbol)
+    position = next(
+        (
+            dict(row)
+            for row in account_snapshot.positions
+            if str(row.get("symbol", "")).upper() == intent.symbol.upper()
+        ),
+        {},
+    )
+    quantity = current.quantity
+    direction = current.direction
     mark = market.mark_price
-    rules = ExchangeRules(symbol=intent.symbol)
-    if public_client is not None:
+    if mode in {"testnet", "live"}:
+        if public_client is None:
+            raise RuntimeError("Binance Futures exchange rules are required")
         raw_rules = public_client.get_symbol_rules(intent.symbol)
         max_qty = Decimal(raw_rules["max_qty"])
         rules = ExchangeRules(
@@ -450,6 +402,19 @@ def _risk_context(
             tick_size=Decimal(raw_rules["tick_size"]),
             min_notional=Decimal(raw_rules["min_notional"]),
         )
+        if rules.min_qty <= 0 or rules.step_size <= 0 or rules.tick_size <= 0:
+            raise RuntimeError("Binance Futures exchange rules are incomplete")
+    else:
+        rules = ExchangeRules(
+            symbol=intent.symbol,
+            status="TRADING",
+            min_qty=_decimal_env("PAPER_MIN_QTY", "0.001"),
+            step_size=_decimal_env("PAPER_STEP_SIZE", "0.001"),
+            tick_size=_decimal_env("PAPER_TICK_SIZE", "0.01"),
+            min_notional=_decimal_env("PAPER_MIN_NOTIONAL", "5"),
+        )
+        if rules.min_qty <= 0 or rules.step_size <= 0 or rules.tick_size <= 0:
+            raise RuntimeError("paper exchange rules must be explicit and positive")
     liquidation_price = (
         Decimal(str(position["liquidation_price"]))
         if position.get("liquidation_price") is not None
@@ -459,27 +424,26 @@ def _risk_context(
         liquidation_price is None
         and intent.action == "OPEN"
         and direction == "FLAT"
-        and isinstance(executor, PaperExecutor)
+        and mode == "paper"
         and mark is not None
     ):
-        liquidation_price = executor.liquidation_price_for(
+        if paper_executor is None:
+            raise RuntimeError("paper liquidation model is unavailable")
+        liquidation_price = paper_executor.liquidation_price_for(
             intent.symbol,
             intent.direction,
             mark,
             intent.leverage,
         )
     return RiskContext(
-        mode=(
-            getattr(getattr(executor, "config", None), "mode", None)
-            or os.environ.get("BIAN_MODE", "paper")
-        ),
-        wallet_balance=Decimal(str(account.get("wallet_balance") or "0")),
-        available_balance=Decimal(str(account.get("available_balance") or "0")),
-        equity=Decimal(str(account.get("equity") or "0")),
-        used_margin=Decimal(str(account.get("used_margin") or "0")),
+        mode=mode,  # type: ignore[arg-type]
+        wallet_balance=account_snapshot.wallet_balance,
+        available_balance=account_snapshot.available_balance,
+        equity=account_snapshot.total_margin,
+        used_margin=account_snapshot.used_margin,
         position_direction=direction,  # type: ignore[arg-type]
         position_quantity=quantity,
-        position_notional=abs(quantity * mark) if mark is not None else Decimal("0"),
+        position_notional=abs(quantity * mark) if mark is not None else None,
         entry_price=(
             Decimal(str(position["entry_price"]))
             if position.get("entry_price") is not None
@@ -487,17 +451,17 @@ def _risk_context(
         ),
         mark_price=mark,
         index_price=market.index_price,
-        unrealized_pnl=Decimal(str(account.get("unrealized_pnl") or position.get("unrealized_pnl") or "0")),
-        realized_pnl=Decimal(str(account.get("realized_pnl") or position.get("realized_pnl") or "0")),
-        funding_pnl=Decimal(str(account.get("funding_pnl") or position.get("funding_pnl") or "0")),
+        unrealized_pnl=account_snapshot.unrealized_pnl,
+        realized_pnl=account_snapshot.realized_pnl,
+        funding_pnl=Decimal("0"),
         leverage=Decimal(str(position.get("leverage") or intent.leverage)),
         account_leverage=(
             Decimal(str(position["leverage"]))
             if position.get("leverage") is not None
             else None
         ),
-        margin_type="ISOLATED",
-        position_mode="ONE_WAY",
+        margin_type=account_snapshot.margin_mode,
+        position_mode=account_snapshot.position_mode,
         liquidation_price=liquidation_price,
         liquidation_distance_percent=(
             abs(mark - liquidation_price) / mark * Decimal("100")
@@ -514,6 +478,9 @@ def _risk_context(
         # classification is observe-only; it must not default to tradeable.
         meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
         is_meme=intent.is_meme,
+        meme_require_classification=os.environ.get(
+            "MEME_REQUIRE_CLASSIFICATION", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"},
         account_snapshot=account_snapshot,
     )
 
@@ -545,21 +512,31 @@ def run_cycle(
         store=store,
         config=ExecutionConfig.from_env(mode=mode),
     )
-    frame = _positioning_frame_for_symbol(symbol, store, strict=False)
-    market = _market_snapshot(frame)
-    positioning, shadow = _record_shadow(
-        frame,
-        store=store,
-        engine=engine,
-        strict=False,
+    frame = store.latest_market_observation(
+        symbol,
+        source_ttl_sec=engine.config.source_ttl_sec,
     )
-    injected_intent = _test_only_signal_injection(frame, mode=mode)
-    current = _current_position(store, symbol)
-    evaluate = getattr(engine, "evaluate")
+    market = _market_snapshot(frame)
     try:
-        intent = injected_intent or evaluate(frame, current_position=current)
-    except TypeError:
-        intent = injected_intent or evaluate(frame)
+        positioning, shadow = _record_shadow(frame, store=store, engine=engine)
+    except Exception as exc:
+        try:
+            store.set_halt(
+                True,
+                reason=f"positioning evidence persistence failed: {type(exc).__name__}",
+                source="paper_runner",
+            )
+        except Exception:
+            pass
+        raise RuntimeError("positioning evidence persistence failed; trading halted") from exc
+    injected_intent = _test_only_signal_injection(frame, mode=mode)
+    account_snapshot = executor.account_snapshot()
+    current = _current_position(account_snapshot, symbol)
+    intent = injected_intent or engine._intent_from_positioning(
+        positioning,
+        frame,
+        current_position=current,
+    )
     if intent is None:
         if isinstance(executor, PaperExecutor):
             if market.settlement_timestamp is not None:
@@ -574,7 +551,7 @@ def run_cycle(
                 "symbol": symbol,
                 "captured_at": frame.captured_at.isoformat(),
                 "strategy_version": engine.config.strategy_version,
-                "shadow": positioning.as_dict() if positioning is not None else None,
+                "shadow": positioning.as_dict(),
             },
         )
         return {
@@ -582,38 +559,16 @@ def run_cycle(
             "symbol": symbol,
             "captured_at": frame.captured_at.isoformat(),
         }
-    positioning_intent = intent.direction is not None
-    signal = None if injected_intent is not None or positioning_intent else engine.signal(frame)
-    if signal is None and injected_intent is None and not positioning_intent:
-        raise RuntimeError("engine returned intent without signal")
-    store.record_signal(
-        symbol=intent.symbol,
-        side=intent.exchange_side(),
-        confidence=(
-            intent.confidence if injected_intent is not None or positioning_intent else signal.confidence
-        ),
-        reason=(
-            intent.reason if injected_intent is not None or positioning_intent else signal.reason
-        ),
-        strategy_version=intent.strategy_version,
-        observed_at=intent.created_at,
-        payload={
-            "price": str(
-                intent.price
-                or (signal.price if signal is not None else frame.closes[-1])
-            ),
-            "test_only": injected_intent is not None,
-        },
-    )
     store.record_intent(intent, status="CREATED")
     decision = risk_gate.evaluate(
         intent,
         _risk_context(
-            store,
             intent,
             market,
+            account_snapshot=account_snapshot,
+            mode=mode,
             public_client=public_client,
-            executor=executor,
+            paper_executor=executor if isinstance(executor, PaperExecutor) else None,
         ),
     )
     result = executor.submit(intent, decision, market=market)
@@ -632,7 +587,7 @@ def run_cycle(
         "executed_quantity": str(result.executed_quantity),
         "executed_price": str(result.executed_price),
         "risk_decision": decision.decision,
-        "shadow": positioning.as_dict() if positioning is not None else None,
+        "shadow": positioning.as_dict(),
     }
 
 

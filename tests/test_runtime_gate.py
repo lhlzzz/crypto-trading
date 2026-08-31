@@ -39,6 +39,11 @@ class RequiredFreshStore:
         ]
 
 
+class TestnetHealthStore:
+    def user_stream_health(self) -> str:
+        return "OK"
+
+
 def _client() -> MagicMock:
     client = MagicMock()
     client.get_account.return_value = {
@@ -136,13 +141,14 @@ def test_future_source_timestamp_blocks_data_health() -> None:
     assert any(reason.endswith("_FUTURE_TIMESTAMP") for reason in gate.reasons)
 
 
-def test_gate_verification_timestamp() -> None:
+def test_gate_evaluation_and_evidence_timestamps_are_distinct() -> None:
     gate = evaluate_runtime_gate(
         mode="paper",
         store=RequiredFreshStore(),
         reconciliation_ok=True,
     )
-    assert gate.verified_at is not None
+    assert gate.evaluated_at is not None
+    assert gate.evidence_verified_at is None
     assert gate.verification_age_sec == 0
     assert gate.verification_source == "runtime_gate"
 
@@ -154,6 +160,7 @@ def test_testnet_gate_checks_real_account_state_and_leverage(monkeypatch) -> Non
         mode="testnet",
         client=_client(),
         symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
         data_health_ok=True,
         reconciliation_ok=True,
         probe_account=True,
@@ -173,6 +180,7 @@ def test_testnet_gate_accepts_mode_specific_credentials_and_records_state(monkey
         mode="testnet",
         client=_client(),
         symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
         data_health_ok=True,
         reconciliation_ok=True,
         probe_account=True,
@@ -218,6 +226,7 @@ def test_runtime_gate_uses_verified_evidence_dynamically(monkeypatch) -> None:
     monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
     pending = evaluate_runtime_gate(
         mode="testnet",
+        store=TestnetHealthStore(),
         client=_client(),
         symbols=["BTCUSDT"],
         data_health_ok=True,
@@ -226,6 +235,7 @@ def test_runtime_gate_uses_verified_evidence_dynamically(monkeypatch) -> None:
     )
     passed = evaluate_runtime_gate(
         mode="testnet",
+        store=TestnetHealthStore(),
         client=_client(),
         symbols=["BTCUSDT"],
         data_health_ok=True,
@@ -236,6 +246,32 @@ def test_runtime_gate_uses_verified_evidence_dynamically(monkeypatch) -> None:
 
     assert pending.testnet_ready is False
     assert passed.testnet_ready is True
+
+
+def test_required_sources_must_be_fresh_for_every_symbol() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        symbols=["BTCUSDT", "ETHUSDT"],
+        reconciliation_ok=True,
+    )
+
+    assert gate.data_health_ok is False
+    assert "FUTURES_DEPTH_MISSING" in gate.reasons
+
+
+def test_runtime_gate_exposes_current_health() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+    )
+
+    assert gate.current_data_health == "OK"
+    assert gate.current_account_health == "NOT_APPLICABLE"
+    assert gate.current_reconciliation == "OK"
+    assert gate.current_orderbook == "OK"
+    assert gate.current_user_stream == "NOT_APPLICABLE"
 
 
 def test_runtime_gate_rejects_stale_persisted_gate_evidence(monkeypatch) -> None:

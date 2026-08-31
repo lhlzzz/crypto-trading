@@ -64,11 +64,6 @@ def test_normalizes_account_update() -> None:
     assert event.source == "USER_STREAM"
 
 
-def test_spot_events_are_malformed_not_accepted() -> None:
-    event = normalize_user_event({"e": "executionReport", "s": "BTCUSDT"})
-    assert event.event_type == "malformed"
-
-
 def test_unknown_user_events_are_malformed_not_accepted() -> None:
     event = normalize_user_event({"e": "unknownAccountEvent", "s": "BTCUSDT"})
     assert event.event_type == "malformed"

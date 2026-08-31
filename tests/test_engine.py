@@ -317,7 +317,7 @@ def test_directional_and_transition_strength_are_split() -> None:
     assert decision.directional_strength != decision.transition_strength
 
 
-def test_positioning_episode_reuses_id_and_confirms_continuous_state() -> None:
+def test_positioning_decision_has_no_process_local_episode_state() -> None:
     from dataclasses import replace
 
     engine = StrategyEngine()
@@ -330,14 +330,13 @@ def test_positioning_episode_reuses_id_and_confirms_continuous_state() -> None:
         )
     )
 
-    assert first.episode_state == "LONG_BUILDING"
-    assert second.episode_state == "LONG_CONFIRMED"
-    assert second.episode_id == first.episode_id
-    assert second.episode_started_at == first.episode_started_at
-    assert second.episode_transition == "LONG_BUILDING->LONG_CONFIRMED"
+    assert first.episode_id is None
+    assert second.episode_id is None
+    assert StrategyEngine.episode_direction(first.state) == "LONG"
+    assert "_episodes" not in engine.__dict__
 
 
-def test_positioning_episode_changes_id_when_directional_episode_changes() -> None:
+def test_positioning_episode_direction_follows_market_interpretation() -> None:
     from dataclasses import replace
 
     engine = StrategyEngine()
@@ -358,11 +357,8 @@ def test_positioning_episode_changes_id_when_directional_episode_changes() -> No
         )
     )
 
-    assert first.episode_id is not None
-    assert second.episode_state == "SHORT_BUILDING"
-    assert second.episode_id is not None
-    assert second.episode_id != first.episode_id
-    assert second.episode_transition == "LONG_BUILDING->SHORT_BUILDING"
+    assert StrategyEngine.episode_direction(first.state) == "LONG"
+    assert StrategyEngine.episode_direction(second.state) == "SHORT"
 
 
 def test_transition_strength_reflects_state_delta() -> None:

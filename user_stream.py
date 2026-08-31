@@ -82,8 +82,6 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
     if not raw:
         return UserStreamEvent(event_type="malformed", raw={"raw": str(event)})
     event_type = str(raw.get("e") or raw.get("eventType") or "unknown")
-    if event_type in {"executionReport", "outboundAccountPosition"}:
-        return UserStreamEvent(event_type="malformed", raw=raw)
     if event_type == "listenKeyExpired":
         return UserStreamEvent(
             event_type=event_type,

@@ -21,17 +21,6 @@ PositioningState = Literal[
     "EXHAUSTION_LONG", "EXHAUSTION_SHORT", "FORCED_DELEVERAGING",
     "CONFLICTED", "UNKNOWN",
 ]
-EpisodeState = Literal[
-    "FLAT",
-    "LONG_BUILDING",
-    "LONG_CONFIRMED",
-    "LONG_EXHAUSTION",
-    "LONG_UNWIND",
-    "SHORT_BUILDING",
-    "SHORT_CONFIRMED",
-    "SHORT_EXHAUSTION",
-    "SHORT_UNWIND",
-]
 Direction = Literal["LONG", "SHORT", "FLAT"]
 Action = Literal["OPEN", "REDUCE", "CLOSE"]
 MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
@@ -314,10 +303,10 @@ class PositioningDecision:
     meme_classified_at: datetime | None = None
     meme_reason_codes: tuple[str, ...] = ()
     episode_id: UUID | None = None
+    episode_direction: Direction = "FLAT"
+    episode_status: str = "NONE"
     episode_started_at: datetime | None = None
     episode_ended_at: datetime | None = None
-    episode_state: EpisodeState = "FLAT"
-    episode_transition: str = "NONE"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -352,6 +341,8 @@ class PositioningDecision:
             ),
             "meme_reason_codes": list(self.meme_reason_codes),
             "episode_id": str(self.episode_id) if self.episode_id else None,
+            "episode_direction": self.episode_direction,
+            "episode_status": self.episode_status,
             "episode_started_at": (
                 _aware(self.episode_started_at).isoformat()
                 if self.episode_started_at is not None
@@ -362,8 +353,6 @@ class PositioningDecision:
                 if self.episode_ended_at is not None
                 else None
             ),
-            "episode_state": self.episode_state,
-            "episode_transition": self.episode_transition,
         }
 
 
@@ -676,7 +665,6 @@ class StrategyEngine:
     def __init__(self, config: StrategyConfig | None = None) -> None:
         self.config = config or StrategyConfig()
         self._previous_states: dict[str, PositioningState] = {}
-        self._episodes: dict[str, tuple[UUID, datetime, EpisodeState]] = {}
 
     def evaluate(
         self,
@@ -764,14 +752,6 @@ class StrategyEngine:
         state = self._state(frame, evidence, crowding, quality)
         prior = previous_state or self._previous_states.get(frame.symbol.upper())
         transition = f"{prior}->{state}" if prior and prior != state else "NONE"
-        episode_id, episode_started_at, episode_ended_at, episode_state, episode_transition = (
-            self._episode_metadata(
-                frame.symbol,
-                timestamp,
-                state,
-                prior,
-            )
-        )
         edge = long_score - short_score
         directional_strength = min(Decimal("1"), abs(edge) * quality)
         transition_strength = self._transition_strength(
@@ -854,11 +834,6 @@ class StrategyEngine:
             meme_classification_version=frame.meme_classification_version,
             meme_classified_at=frame.meme_classified_at,
             meme_reason_codes=frame.meme_reason_codes,
-            episode_id=episode_id,
-            episode_started_at=episode_started_at,
-            episode_ended_at=episode_ended_at,
-            episode_state=episode_state,
-            episode_transition=episode_transition,
         )
 
     def _unknown_decision(
@@ -866,14 +841,6 @@ class StrategyEngine:
     ) -> PositioningDecision:
         snapshot_id = self._snapshot_id(frame, timestamp, EvidenceVector())
         prior = self._previous_states.get(frame.symbol.upper())
-        episode_id, episode_started_at, episode_ended_at, episode_state, episode_transition = (
-            self._episode_metadata(
-                frame.symbol,
-                timestamp,
-                "UNKNOWN",
-                prior,
-            )
-        )
         return PositioningDecision(
             symbol=frame.symbol.upper(), timestamp=timestamp, direction="FLAT",
             state="UNKNOWN",
@@ -903,11 +870,6 @@ class StrategyEngine:
             meme_classification_version=frame.meme_classification_version,
             meme_classified_at=frame.meme_classified_at,
             meme_reason_codes=frame.meme_reason_codes,
-            episode_id=episode_id,
-            episode_started_at=episode_started_at,
-            episode_ended_at=episode_ended_at,
-            episode_state=episode_state,
-            episode_transition=episode_transition,
         )
 
     def _snapshot_id(
@@ -970,7 +932,8 @@ class StrategyEngine:
         return {name: getattr(frame, name) for name in names}
 
     @staticmethod
-    def _episode_class(state: PositioningState) -> str:
+    def episode_direction(state: PositioningState) -> Direction:
+        """Map market interpretation to a directional regime without state."""
         if state in {
             "LONG_BUILDING", "ABSORPTION_LONG", "EXHAUSTION_LONG",
             "LONG_UNWIND",
@@ -982,83 +945,6 @@ class StrategyEngine:
         }:
             return "SHORT"
         return "FLAT"
-
-    @classmethod
-    def _episode_state(
-        cls,
-        state: PositioningState,
-        *,
-        prior_episode_state: EpisodeState | None,
-    ) -> EpisodeState:
-        if state in {"LONG_BUILDING", "ABSORPTION_LONG"}:
-            return (
-                "LONG_CONFIRMED"
-                if prior_episode_state in {"LONG_BUILDING", "LONG_CONFIRMED"}
-                else "LONG_BUILDING"
-            )
-        if state == "EXHAUSTION_LONG":
-            return "LONG_EXHAUSTION"
-        if state == "LONG_UNWIND":
-            return "LONG_UNWIND"
-        if state in {"SHORT_BUILDING", "ABSORPTION_SHORT"}:
-            return (
-                "SHORT_CONFIRMED"
-                if prior_episode_state in {"SHORT_BUILDING", "SHORT_CONFIRMED"}
-                else "SHORT_BUILDING"
-            )
-        if state == "EXHAUSTION_SHORT":
-            return "SHORT_EXHAUSTION"
-        if state == "SHORT_COVERING":
-            return "SHORT_UNWIND"
-        return "FLAT"
-
-    def _episode_metadata(
-        self,
-        symbol: str,
-        timestamp: datetime,
-        state: PositioningState,
-        previous_state: PositioningState | None,
-    ) -> tuple[UUID | None, datetime | None, datetime | None, EpisodeState, str]:
-        key = symbol.upper()
-        context = self._episodes.get(key)
-        prior_episode_state = context[2] if context else None
-        episode_state = self._episode_state(
-            state, prior_episode_state=prior_episode_state
-        )
-        current_class = self._episode_class(state)
-        previous_class = self._episode_class(previous_state) if previous_state else (
-            "LONG" if context and context[2].startswith("LONG_")
-            else "SHORT" if context and context[2].startswith("SHORT_")
-            else "FLAT"
-        )
-        if current_class == "FLAT":
-            ended = timestamp if context is not None else None
-            self._episodes.pop(key, None)
-            return None, None, ended, "FLAT", (
-                f"{prior_episode_state}->FLAT"
-                if prior_episode_state and prior_episode_state != "FLAT"
-                else "NONE"
-            )
-        ended = None
-        if context is not None and previous_class not in {"FLAT", current_class}:
-            ended = timestamp
-            self._episodes.pop(key, None)
-            context = None
-        if context is None or previous_class != current_class:
-            episode_id = uuid5(
-                NAMESPACE_URL,
-                f"bian:episode:{key}:{timestamp.isoformat()}:{episode_state}",
-            )
-            started = timestamp
-        else:
-            episode_id, started, _ = context
-        episode_transition = (
-            f"{prior_episode_state}->{episode_state}"
-            if prior_episode_state and prior_episode_state != episode_state
-            else "NONE"
-        )
-        self._episodes[key] = (episode_id, started, episode_state)
-        return episode_id, started, ended, episode_state, episode_transition
 
     def _intent_from_positioning(
         self,

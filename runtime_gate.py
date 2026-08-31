@@ -131,46 +131,90 @@ def _data_health_report(
         return False, (f"DATA_HEALTH_ERROR:{type(exc).__name__}",)
     now = datetime.now(timezone.utc)
     reasons: list[str] = []
+    expected_symbols = {
+        str(symbol).strip().upper()
+        for symbol in symbols
+        if str(symbol).strip()
+    }
     for source in sorted(REQUIRED_FUTURES_SOURCES):
         source_rows = [
             row for row in rows
             if str(row.get("source") or row.get("event_type") or "").upper() == source
         ]
-        if not source_rows:
-            reasons.append(f"{source}_MISSING")
-            continue
-        for row in source_rows:
-            if not str(row.get("symbol", "")).strip():
+        for symbol in sorted(expected_symbols):
+            matching_rows = [
+                row
+                for row in source_rows
+                if str(row.get("symbol") or "").strip().upper() == symbol
+            ]
+            if not matching_rows:
                 reasons.append(f"{source}_MISSING")
                 continue
-            status = str(row.get("status", "MISSING")).upper()
-            if status != "FRESH":
-                reasons.append(f"{source}_{status}")
-                continue
-            if row.get("latency_ms") is None:
-                reasons.append(f"{source}_ERROR")
-                continue
-            try:
-                source_at = datetime.fromisoformat(str(row["source_timestamp"]))
-                received_at = datetime.fromisoformat(str(row["received_timestamp"]))
-                if source_at.tzinfo is None:
-                    source_at = source_at.replace(tzinfo=timezone.utc)
-                if received_at.tzinfo is None:
-                    received_at = received_at.replace(tzinfo=timezone.utc)
-                if source_at > now or received_at > now:
-                    reasons.append(f"{source}_FUTURE_TIMESTAMP")
-                elif received_at < source_at:
-                    reasons.append(f"{source}_TIMESTAMP_INVALID")
-                elif int(row["latency_ms"]) != int(
-                    (received_at - source_at).total_seconds() * 1000
-                ):
-                    reasons.append(f"{source}_LATENCY_INVALID")
-                elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
-                    os.environ.get("MAX_DATA_LATENCY_MS", "2000")
-                ):
-                    reasons.append(f"{source}_LATENCY_EXCEEDED")
-            except (KeyError, TypeError, ValueError):
-                reasons.append(f"{source}_ERROR")
+            for row in matching_rows:
+                if not str(row.get("symbol", "")).strip():
+                    reasons.append(f"{source}_MISSING")
+                    continue
+                status = str(row.get("status", "MISSING")).upper()
+                if status != "FRESH":
+                    reasons.append(f"{source}_{status}")
+                    continue
+                if row.get("latency_ms") is None:
+                    reasons.append(f"{source}_ERROR")
+                    continue
+                try:
+                    source_at = datetime.fromisoformat(str(row["source_timestamp"]))
+                    received_at = datetime.fromisoformat(str(row["received_timestamp"]))
+                    if source_at.tzinfo is None:
+                        source_at = source_at.replace(tzinfo=timezone.utc)
+                    if received_at.tzinfo is None:
+                        received_at = received_at.replace(tzinfo=timezone.utc)
+                    if source_at > now or received_at > now:
+                        reasons.append(f"{source}_FUTURE_TIMESTAMP")
+                    elif received_at < source_at:
+                        reasons.append(f"{source}_TIMESTAMP_INVALID")
+                    elif int(row["latency_ms"]) != int(
+                        (received_at - source_at).total_seconds() * 1000
+                    ):
+                        reasons.append(f"{source}_LATENCY_INVALID")
+                    elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
+                        os.environ.get("MAX_DATA_LATENCY_MS", "2000")
+                    ):
+                        reasons.append(f"{source}_LATENCY_EXCEEDED")
+                except (KeyError, TypeError, ValueError):
+                    reasons.append(f"{source}_ERROR")
+        if not expected_symbols:
+            for row in source_rows:
+                if not str(row.get("symbol", "")).strip():
+                    reasons.append(f"{source}_MISSING")
+                    continue
+                status = str(row.get("status", "MISSING")).upper()
+                if status != "FRESH":
+                    reasons.append(f"{source}_{status}")
+                    continue
+                if row.get("latency_ms") is None:
+                    reasons.append(f"{source}_ERROR")
+                    continue
+                try:
+                    source_at = datetime.fromisoformat(str(row["source_timestamp"]))
+                    received_at = datetime.fromisoformat(str(row["received_timestamp"]))
+                    if source_at.tzinfo is None:
+                        source_at = source_at.replace(tzinfo=timezone.utc)
+                    if received_at.tzinfo is None:
+                        received_at = received_at.replace(tzinfo=timezone.utc)
+                    if source_at > now or received_at > now:
+                        reasons.append(f"{source}_FUTURE_TIMESTAMP")
+                    elif received_at < source_at:
+                        reasons.append(f"{source}_TIMESTAMP_INVALID")
+                    elif int(row["latency_ms"]) != int(
+                        (received_at - source_at).total_seconds() * 1000
+                    ):
+                        reasons.append(f"{source}_LATENCY_INVALID")
+                    elif source in _REALTIME_FUTURES_SOURCES and int(row["latency_ms"]) > int(
+                        os.environ.get("MAX_DATA_LATENCY_MS", "2000")
+                    ):
+                        reasons.append(f"{source}_LATENCY_EXCEEDED")
+                except (KeyError, TypeError, ValueError):
+                    reasons.append(f"{source}_ERROR")
     unique = tuple(dict.fromkeys(reasons))
     return not unique, unique
 
@@ -212,9 +256,15 @@ class GateResult:
     paper_accounting_ok: bool = False
     alpha_gate_status: str = "INSUFFICIENT_SAMPLE"
     meme_universe_ready: bool = False
-    verified_at: str | None = None
+    evaluated_at: str | None = None
+    evidence_verified_at: str | None = None
     verification_age_sec: int | None = None
     verification_source: str = "runtime_gate"
+    current_data_health: str = "BLOCKED"
+    current_account_health: str = "UNKNOWN"
+    current_reconciliation: str = "BLOCKED"
+    current_orderbook: str = "UNKNOWN"
+    current_user_stream: str = "UNKNOWN"
 
     @property
     def trading_enabled(self) -> bool:
@@ -223,6 +273,11 @@ class GateResult:
         if self.mode == "testnet":
             return self.testnet_ready
         return self.live_allowed
+
+    @property
+    def verified_at(self) -> str | None:
+        """Compatibility read for consumers that only expose evidence time."""
+        return self.evidence_verified_at
 
     @property
     def _base_ready(self) -> bool:
@@ -308,9 +363,15 @@ class GateResult:
             "paper_accounting_ok": self.paper_accounting_ok,
             "alpha_gate_status": self.alpha_gate_status,
             "meme_universe_ready": self.meme_universe_ready,
-            "verified_at": self.verified_at,
+            "evaluated_at": self.evaluated_at,
+            "evidence_verified_at": self.evidence_verified_at,
             "verification_age_sec": self.verification_age_sec,
             "verification_source": self.verification_source,
+            "current_data_health": self.current_data_health,
+            "current_account_health": self.current_account_health,
+            "current_reconciliation": self.current_reconciliation,
+            "current_orderbook": self.current_orderbook,
+            "current_user_stream": self.current_user_stream,
             "live_allowed": self.live_allowed,
             "reasons": list(self.reasons),
         }
@@ -326,6 +387,24 @@ def _data_health(
         store, max_age_sec=max_age_sec, symbols=symbols
     )
     return ok
+
+
+def _current_user_stream_health(store: Any | None, *, mode: str) -> str:
+    if mode == "paper":
+        return "NOT_APPLICABLE"
+    for name in ("user_stream_health", "user_stream_status"):
+        getter = getattr(store, name, None) if store is not None else None
+        if getter is None:
+            continue
+        try:
+            value = getter()
+        except Exception:
+            return "ERROR"
+        if isinstance(value, Mapping):
+            value = value.get("status", value.get("health", "UNKNOWN"))
+        status = str(value).upper()
+        return status if status else "UNKNOWN"
+    return "UNKNOWN"
 
 
 def _risk_config_ok() -> bool:
@@ -472,11 +551,18 @@ def evaluate_runtime_gate(
     if resolved_mode != "paper" and not leverage_ok:
         reasons.append("LEVERAGE_PARITY_NOT_VERIFIED")
 
+    health_rows: list[Mapping[str, Any]] = []
     if data_health_ok is None:
         data_health_ok, health_reasons = _data_health_report(
             store, max_age_sec=max_data_age_sec(), symbols=selected_symbols
         )
         reasons.extend(health_reasons)
+        try:
+            health_rows = store.market_data_freshness(  # type: ignore[union-attr]
+                max_age_sec=max_data_age_sec(), symbols=selected_symbols
+            )
+        except Exception:
+            health_rows = []
     if not data_health_ok:
         reasons.append("DATA_HEALTH_NOT_VERIFIED")
 
@@ -500,6 +586,7 @@ def evaluate_runtime_gate(
 
     statuses = _persisted_gate_statuses(store, gate_evidence)
     evidence_ages: list[int] = []
+    evidence_verified_times: list[datetime] = []
     supplied_evidence: Mapping[str, Any] = gate_evidence or {}
     evidence_records: dict[str, Any] = dict(supplied_evidence)
     evidence_getter = getattr(store, "runtime_gate_evidence", None) if store is not None else None
@@ -525,6 +612,7 @@ def evaluate_runtime_gate(
                 verified_at_dt = verified_at_dt.replace(tzinfo=timezone.utc)
             age = max(0, int((now - verified_at_dt).total_seconds()))
             evidence_ages.append(age)
+            evidence_verified_times.append(verified_at_dt)
             if age > gate_evidence_max_age_sec() and statuses[gate_name] == "PASSED":
                 statuses[gate_name] = "FAILED"
                 reasons.append(f"{gate_name.upper()}_EVIDENCE_STALE")
@@ -553,12 +641,16 @@ def evaluate_runtime_gate(
         (paper_db_ok, paper_accounting_ok, bool(data_health_ok), bool(reconciliation_ok),
          risk_config_ok, kill_switch_ok, paper_gate_status == "PASSED")
     )
+    current_user_stream = _current_user_stream_health(store, mode=resolved_mode)
+    user_stream_ok = current_user_stream == "OK"
+    if resolved_mode != "paper" and not user_stream_ok:
+        reasons.append("USER_STREAM_NOT_VERIFIED")
     exchange_ready = all(
         (
             credentials_ok, account_reachable, account_mode_ok, margin_mode_ok,
             exchange_positions_ok, open_orders_ok, wallet_balance_ok,
             available_balance_ok, server_time_ok, leverage_ok, bool(data_health_ok),
-            bool(reconciliation_ok), risk_config_ok, kill_switch_ok,
+            bool(reconciliation_ok), risk_config_ok, kill_switch_ok, user_stream_ok,
         )
     )
     testnet_ready = exchange_ready and testnet_lifecycle_ok
@@ -585,7 +677,20 @@ def evaluate_runtime_gate(
     if resolved_mode == "live" and not live_ready:
         reasons.append("LIVE_RELEASE_GATES_PENDING")
     live_allowed = resolved_mode == "live" and live_ready
-    verified_at = datetime.now(timezone.utc).isoformat()
+    evaluated_at = datetime.now(timezone.utc).isoformat()
+    orderbook_rows = [
+        row
+        for row in health_rows
+        if str(row.get("source") or row.get("event_type") or "").upper()
+        == "FUTURES_DEPTH"
+    ]
+    current_orderbook = (
+        "UNKNOWN"
+        if not orderbook_rows
+        else "OK"
+        if all(str(row.get("status", "")).upper() == "FRESH" for row in orderbook_rows)
+        else str(orderbook_rows[0].get("status", "UNKNOWN")).upper()
+    )
     return GateResult(
         mode=resolved_mode,
         positioning_enabled=positioning_enabled,
@@ -620,9 +725,25 @@ def evaluate_runtime_gate(
         paper_accounting_ok=paper_accounting_ok,
         alpha_gate_status=alpha_status,
         meme_universe_ready=meme_ready,
-        verified_at=verified_at,
+        evaluated_at=evaluated_at,
+        evidence_verified_at=(
+            max(evidence_verified_times).isoformat()
+            if evidence_verified_times
+            else None
+        ),
         verification_age_sec=max(evidence_ages) if evidence_ages else 0,
         verification_source=(
             "persisted_gate_evidence" if evidence_ages else "runtime_gate"
         ),
+        current_data_health="OK" if data_health_ok else "BLOCKED",
+        current_account_health=(
+            "NOT_APPLICABLE"
+            if resolved_mode == "paper"
+            else "OK"
+            if account_reachable
+            else "BLOCKED"
+        ),
+        current_reconciliation="OK" if reconciliation_ok else "BLOCKED",
+        current_orderbook=current_orderbook,
+        current_user_stream=current_user_stream,
     )

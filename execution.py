@@ -34,6 +34,7 @@ OrderStatus = Literal[
     "UNKNOWN",
 ]
 PositionDirection = Literal["LONG", "SHORT", "FLAT"]
+PAPER_RISK_RULES = FuturesRiskRules(symbol="PAPER")
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ class ExecutionConfig:
     initial_usdt: Decimal = Decimal("1000")
     order_expiry_sec: int = 0
     default_leverage: Decimal = Decimal("1")
-    risk_rules: FuturesRiskRules | None = None
+    risk_rules: FuturesRiskRules | None = PAPER_RISK_RULES
 
     @classmethod
     def from_env(cls, mode: str | None = None) -> "ExecutionConfig":
@@ -83,6 +84,18 @@ class ExecutionConfig:
             initial_usdt=Decimal(os.environ.get("PAPER_INITIAL_USDT", "1000")),
             order_expiry_sec=max(0, int(os.environ.get("PAPER_ORDER_EXPIRY_SEC", "0"))),
             default_leverage=Decimal(os.environ.get("DEFAULT_LEVERAGE", "1")),
+            risk_rules=(
+                FuturesRiskRules(
+                    symbol="PAPER",
+                    maintenance_margin_rate=Decimal(
+                        os.environ.get(
+                            "PAPER_MAINTENANCE_MARGIN_RATE",
+                            str(PAPER_RISK_RULES.maintenance_margin_rate),
+                        )
+                    ),
+                )
+                if resolved_mode == "paper" else None
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -96,8 +109,8 @@ class ExecutionConfig:
             raise ValueError("latency and initial balance cannot be negative")
         if self.default_leverage <= 0:
             raise ValueError("default_leverage must be positive")
-        if self.risk_rules is None:
-            object.__setattr__(self, "risk_rules", FuturesRiskRules.conservative("*"))
+        if self.mode == "paper" and self.risk_rules is None:
+            raise ValueError("paper execution requires explicit FuturesRiskRules")
 
 
 @dataclass(frozen=True)
@@ -115,6 +128,10 @@ class ExecutionResult:
 
 class Executor(ABC):
     """Common interface shared by every broker implementation."""
+
+    @abstractmethod
+    def account_snapshot(self) -> FuturesAccountSnapshot:
+        raise NotImplementedError
 
     @abstractmethod
     def submit(
@@ -667,14 +684,13 @@ class PaperExecutor(_BaseExecutor):
 
     def _risk_rules(self, symbol: str) -> FuturesRiskRules:
         configured = self.config.risk_rules
-        if configured is not None and configured.symbol in {"*", symbol.upper()}:
-            if configured.symbol == symbol.upper():
-                return configured
-            return FuturesRiskRules(
-                symbol=symbol.upper(),
-                maintenance_margin_rate=configured.maintenance_margin_rate,
+        if configured is None:
+            raise ExecutionRejected("Futures risk rules are unavailable")
+        if configured.symbol not in {"PAPER", symbol.upper()}:
+            raise ExecutionRejected(
+                f"risk rules for {configured.symbol} cannot price {symbol.upper()}"
             )
-        return FuturesRiskRules.conservative(symbol)
+        return configured
 
     def _liquidation_price(
         self,
