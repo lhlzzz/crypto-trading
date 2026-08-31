@@ -4,7 +4,7 @@
 
 ## Scoreboard
 
- 69 total  |  0 done  |  60 verified  |  0 skipped  |  2 blocked  |  7 remaining
+ 69 total  |  0 done  |  61 verified  |  0 skipped  |  2 blocked  |  6 remaining
  Drift: 5  |  Last reconcile: T69 |  Tier: structural
 
 ## Task Ledger
@@ -79,7 +79,7 @@
 | T66 | Run 24-hour Futures paper validation | pending |  | D16 | Simulated execution on real market data |
 | T67 | Run seven-day shadow validation | pending |  | D16 | Decision persistence; no execution |
 | T68 | Run Testnet lifecycle validation | blocked | Separate credentials not present | D16 | BLOCKED_BY_EXTERNAL_CREDENTIALS |
-| T69 | Final static validation, commit, and push | pending | 246 tests; compile; diff; push pending | D16,D17,V47 | Commit/push follows final worktree review |
+| T69 | Final static validation, commit, and push | verified | 246 tests; compile; diff; pushed | D16,D17,V47,C:203f2b3 | Never upgrade unverified gates |
 
 ## Decision Log
 
