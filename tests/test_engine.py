@@ -317,6 +317,54 @@ def test_directional_and_transition_strength_are_split() -> None:
     assert decision.directional_strength != decision.transition_strength
 
 
+def test_positioning_episode_reuses_id_and_confirms_continuous_state() -> None:
+    from dataclasses import replace
+
+    engine = StrategyEngine()
+    first_frame = _positioning_frame()
+    first = engine.positioning_decision(first_frame)
+    second = engine.positioning_decision(
+        replace(
+            first_frame,
+            captured_at=first_frame.captured_at.replace(minute=1),
+        )
+    )
+
+    assert first.episode_state == "LONG_BUILDING"
+    assert second.episode_state == "LONG_CONFIRMED"
+    assert second.episode_id == first.episode_id
+    assert second.episode_started_at == first.episode_started_at
+    assert second.episode_transition == "LONG_BUILDING->LONG_CONFIRMED"
+
+
+def test_positioning_episode_changes_id_when_directional_episode_changes() -> None:
+    from dataclasses import replace
+
+    engine = StrategyEngine()
+    first_frame = _positioning_frame()
+    first = engine.positioning_decision(first_frame)
+    second = engine.positioning_decision(
+        replace(
+            first_frame,
+            captured_at=first_frame.captured_at.replace(minute=1),
+            closes=(Decimal("101"), Decimal("100")),
+            net_spot_flow=Decimal("-8"),
+            futures_trade_flow=Decimal("-8"),
+            cvd_change=Decimal("-8"),
+            taker_buy_volume=Decimal("3"),
+            taker_sell_volume=Decimal("10"),
+            oi_change=Decimal("0.03"),
+            market_regime="RISK_OFF",
+        )
+    )
+
+    assert first.episode_id is not None
+    assert second.episode_state == "SHORT_BUILDING"
+    assert second.episode_id is not None
+    assert second.episode_id != first.episode_id
+    assert second.episode_transition == "LONG_BUILDING->SHORT_BUILDING"
+
+
 def test_transition_strength_reflects_state_delta() -> None:
     from engine import StrategyEngine
 

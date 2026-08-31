@@ -6,12 +6,14 @@ from decimal import Decimal
 import os
 from typing import Any, Protocol
 
+from risk import FuturesAccountSnapshot
 from trading_store import TradingStore
 
 _TERMINAL_STATES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
 
 
 class ReconciliationClient(Protocol):
+    def account_snapshot(self) -> FuturesAccountSnapshot: ...
     def get_account(self) -> dict[str, Any]: ...
     def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
@@ -71,8 +73,13 @@ class Reconciler:
     def _recover_exchange(self) -> ReconciliationResult:
         assert self.client is not None
         differences: list[str] = []
-        account = self.client.get_account()
-        recovered_balances = self._reconcile_balances(account, differences)
+        snapshot_getter = getattr(self.client, "account_snapshot", None)
+        if snapshot_getter is None:
+            return self._fail("FuturesAccountSnapshot is unavailable")
+        snapshot = snapshot_getter()
+        if not isinstance(snapshot, FuturesAccountSnapshot) or not snapshot.fresh:
+            return self._fail("FuturesAccountSnapshot is unavailable or stale")
+        recovered_balances = self._reconcile_balances(snapshot, differences)
         recovered_positions = self._reconcile_positions(differences)
         recovered_orders = self._reconcile_orders(differences)
         if differences:
@@ -86,24 +93,24 @@ class Reconciler:
             recovered_positions=recovered_positions,
         )
 
-    def _reconcile_balances(self, account: dict[str, Any], differences: list[str]) -> int:
+    def _reconcile_balances(
+        self,
+        snapshot: FuturesAccountSnapshot,
+        differences: list[str],
+    ) -> int:
         broker_balances = {}
-        for row in account.get("assets") or account.get("balances") or []:
-            asset = str(row.get("asset") or "")
-            if not asset:
-                continue
-            broker_balances[asset] = {
-                "wallet_balance": Decimal(str(row.get("walletBalance") or row.get("free") or "0")),
-                "available_balance": Decimal(str(row.get("availableBalance") or row.get("free") or "0")),
-                "margin_balance": Decimal(str(row.get("marginBalance") or row.get("walletBalance") or "0")),
-                "unrealized_pnl": Decimal(str(row.get("unrealizedProfit") or "0")),
-            }
+        broker_balances["USDT"] = {
+            "wallet_balance": snapshot.wallet_balance,
+            "available_balance": snapshot.available_balance,
+            "margin_balance": snapshot.total_margin,
+            "unrealized_pnl": snapshot.unrealized_pnl,
+        }
         local_balances = {
             str(row["asset"]): row
             for row in self.store.list_balances()
             if row.get("mode") == self.mode
         }
-        if "USDT" not in broker_balances:
+        if snapshot.mode not in {"testnet", "live"}:
             differences.append("USDT futures balance is unavailable")
         if local_balances:
             for asset in set(broker_balances) | set(local_balances):

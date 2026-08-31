@@ -4,7 +4,7 @@
 
 ## Scoreboard
 
- 75 total  |  0 done  |  67 verified  |  0 skipped  |  2 blocked  |  6 remaining
+ 77 total  |  0 done  |  69 verified  |  0 skipped  |  2 blocked  |  6 remaining
  Drift: 9  |  Last reconcile: T75 |  Tier: structural
 
 ## Task Ledger
@@ -86,6 +86,8 @@
 | T73 | Preserve exit safety under uncertainty | verified | 252 tests; halted CLOSE fills | D19,V49 | REDUCE/CLOSE bypass entry-only blocks |
 | T74 | Separate Meme membership from risk tier | verified | 253 tests; unavailable is OBSERVE | D20,V50 | `is_meme` and provenance gate OPEN |
 | T75 | Unify account snapshots and exchange rules | verified | 257 tests; zero rules HALT | D21,V51 | Paper and Futures REST share contract |
+| T76 | Add Positioning Episode lifecycle and complete evidence persistence | verified | 260 tests; episode/schema checks | D22,V52 | Existing engine/store/database owners extended |
+| T77 | Enforce User Stream reconnect health and account truth consumption | verified | 260 tests; runtime/recon checks | D22,V52 | WS disconnect is unavailable during reconnect |
 
 ## Decision Log
 
@@ -112,6 +114,7 @@
 | D19 | T72-T73 | Entry and exit safety are separate paths | Critical evidence gates OPEN; exits remain possible |
 | D20 | T74 | Meme membership is independent from risk tier | Classification unavailable cannot become tradeable |
 | D21 | T75 | Account truth and exchange rules fail closed | No local stale balance or zero-filter Live fallback |
+| D22 | T76-T77 | Extend existing positioning, persistence, stream, and gate owners | Add episode auditability and one account-truth contract without new owners |
 
 ## Reconciliation History
 
@@ -134,6 +137,7 @@
 | R21 | T63-T65 | 0 | Real reset found lost GAP audit event; fixed and tested |
 | R22 | T63-T69 | 1 | T65 remains runtime-blocked; later gates not advanced |
 | R23 | T63-T69 | 2 | Fixed direct-script root import and Decimal JSON serialization; runtime gates remain |
+| R24 | T76-T77 | 0 | Episode/evidence persistence, WS health, and account snapshot contract verified |
 
 ## Reconciliation History
 

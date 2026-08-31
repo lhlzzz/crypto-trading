@@ -224,10 +224,28 @@ class TradingStore:
                         snapshot_id, symbol, observed_at, state, transition,
                         direction, confidence, long_score, short_score,
                         crowding_score, liquidity_score, data_quality_score,
-                        strategy_version, reason_codes, payload
+                        strategy_version, reason_codes, episode_id,
+                        episode_started_at, episode_ended_at, episode_state,
+                        episode_transition, evidence_sufficiency, is_meme,
+                        meme_classification_source, meme_classification_version,
+                        meme_classified_at, meme_reason_codes, payload
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB))
-                    ON CONFLICT (snapshot_id) DO UPDATE SET payload = EXCLUDED.payload
+                              %s, %s, %s, %s, %s, %s, %s,
+                              CAST(%s AS JSONB), %s, %s, %s, %s, %s,
+                              CAST(%s AS JSONB), CAST(%s AS JSONB))
+                    ON CONFLICT (snapshot_id) DO UPDATE SET
+                        episode_id = EXCLUDED.episode_id,
+                        episode_started_at = EXCLUDED.episode_started_at,
+                        episode_ended_at = EXCLUDED.episode_ended_at,
+                        episode_state = EXCLUDED.episode_state,
+                        episode_transition = EXCLUDED.episode_transition,
+                        evidence_sufficiency = EXCLUDED.evidence_sufficiency,
+                        is_meme = EXCLUDED.is_meme,
+                        meme_classification_source = EXCLUDED.meme_classification_source,
+                        meme_classification_version = EXCLUDED.meme_classification_version,
+                        meme_classified_at = EXCLUDED.meme_classified_at,
+                        meme_reason_codes = EXCLUDED.meme_reason_codes,
+                        payload = EXCLUDED.payload
                     """,
                     (
                         str(snapshot_id), decision.symbol, decision.timestamp,
@@ -235,25 +253,59 @@ class TradingStore:
                         decision.confidence, decision.long_score, decision.short_score,
                         decision.crowding_score, decision.liquidity_score,
                         decision.data_quality_score, strategy_version,
-                        _json(list(decision.reason_codes)), _json(payload),
+                        _json(list(decision.reason_codes)),
+                        str(decision.episode_id) if decision.episode_id else None,
+                        decision.episode_started_at, decision.episode_ended_at,
+                        decision.episode_state, decision.episode_transition,
+                        _json(decision.evidence_sufficiency.as_dict()),
+                        decision.is_meme, decision.meme_classification_source,
+                        decision.meme_classification_version,
+                        decision.meme_classified_at,
+                        _json(list(decision.meme_reason_codes)), _json(payload),
                     ),
                 )
                 cursor.execute(
                     """
                     INSERT INTO evidence_snapshots(
                         snapshot_id, symbol, observed_at, source_timestamps,
-                        evidence, payload
+                        evidence, data_quality, episode_id, episode_started_at,
+                        episode_ended_at, episode_state, episode_transition,
+                        universe_classification, payload
                     ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
-                              CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
+                              CAST(%s AS JSONB), CAST(%s AS JSONB))
                     ON CONFLICT (snapshot_id) DO UPDATE SET
                         source_timestamps = EXCLUDED.source_timestamps,
                         evidence = EXCLUDED.evidence,
+                        data_quality = EXCLUDED.data_quality,
+                        episode_id = EXCLUDED.episode_id,
+                        episode_started_at = EXCLUDED.episode_started_at,
+                        episode_ended_at = EXCLUDED.episode_ended_at,
+                        episode_state = EXCLUDED.episode_state,
+                        episode_transition = EXCLUDED.episode_transition,
+                        universe_classification = EXCLUDED.universe_classification,
                         payload = EXCLUDED.payload
                     """,
                     (
                         str(snapshot_id), decision.symbol, decision.timestamp,
                         _json(dict(decision.source_timestamps)),
-                        _json(decision.evidence.__dict__), _json(payload),
+                        _json(decision.input_features),
+                        _json({
+                            "quality": decision.data_quality_score,
+                            "freshness": decision.evidence.freshness,
+                            "sufficiency": decision.evidence_sufficiency.as_dict(),
+                        }),
+                        str(decision.episode_id) if decision.episode_id else None,
+                        decision.episode_started_at, decision.episode_ended_at,
+                        decision.episode_state, decision.episode_transition,
+                        _json({
+                            "is_meme": decision.is_meme,
+                            "source": decision.meme_classification_source,
+                            "version": decision.meme_classification_version,
+                            "classified_at": decision.meme_classified_at,
+                            "reason_codes": list(decision.meme_reason_codes),
+                        }),
+                        _json(payload),
                     ),
                 )
         return snapshot_id

@@ -125,3 +125,28 @@ def test_funding_settlement_persistence_is_mode_symbol_time_idempotent():
     statement = cursor.execute.call_args[0][0]
     assert "PRIMARY KEY" not in statement
     assert "ON CONFLICT (mode, symbol, settlement_timestamp) DO NOTHING" in statement
+
+
+def test_positioning_snapshot_persists_complete_episode_and_evidence_contract():
+    from engine import StrategyEngine
+    from tests.test_engine import _positioning_frame
+
+    decision = StrategyEngine().positioning_decision(_positioning_frame())
+    cursor = MagicMock()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    with patch("psycopg2.connect", return_value=connection):
+        TradingStore("postgresql://test").record_positioning_snapshot(
+            decision, strategy_version="positioning-v1"
+        )
+
+    statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "episode_id" in statements
+    assert "episode_transition" in statements
+    assert "evidence_sufficiency" in statements
+    assert "data_quality" in statements
+    evidence_args = cursor.execute.call_args_list[1].args[1]
+    assert '"futures_trade_flow"' in evidence_args[4]
+    assert '"is_meme"' in evidence_args[11]

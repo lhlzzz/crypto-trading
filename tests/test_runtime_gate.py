@@ -3,6 +3,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from datetime import datetime, timezone
+from decimal import Decimal
+from risk import FuturesAccountSnapshot
 
 from runtime_gate import REQUIRED_FUTURES_SOURCES, evaluate_runtime_gate
 
@@ -49,11 +51,23 @@ def _client() -> MagicMock:
         ]
     }
     client.get_server_time.return_value = {"serverTime": 1_700_000_000_000}
-    client.get_position_mode.return_value = {"dualSidePosition": "false"}
+    client.account_snapshot.return_value = FuturesAccountSnapshot(
+        mode="testnet",
+        wallet_balance=Decimal("1000"),
+        available_balance=Decimal("900"),
+        total_margin=Decimal("1000"),
+        used_margin=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        positions=(),
+        open_orders=(),
+        leverage={"BTCUSDT": Decimal("2")},
+        margin_mode="ISOLATED",
+        position_mode="ONE_WAY",
+        captured_at=datetime.now(timezone.utc),
+        source="binance_futures_rest",
+    )
     client.get_margin_type.return_value = {"marginType": "isolated"}
-    client.get_leverage.return_value = {"leverage": "2"}
-    client.get_positions.return_value = []
-    client.get_open_orders.return_value = []
     return client
 
 

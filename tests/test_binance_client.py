@@ -141,6 +141,7 @@ def test_futures_account_snapshot_uses_exchange_truth() -> None:
             "totalMarginBalance": "120",
             "totalInitialMargin": "20",
             "totalUnrealizedProfit": "3",
+            "totalRealizedProfit": "7",
             "assets": [{
                 "asset": "USDT",
                 "walletBalance": "100",
@@ -168,6 +169,7 @@ def test_futures_account_snapshot_uses_exchange_truth() -> None:
     assert snapshot.wallet_balance == Decimal("100")
     assert snapshot.available_balance == Decimal("80")
     assert snapshot.used_margin == Decimal("20")
+    assert snapshot.realized_pnl == Decimal("7")
     assert snapshot.leverage["DOGEUSDT"] == Decimal("3")
     assert snapshot.position_mode == "ONE_WAY"
     assert snapshot.fresh is True

@@ -225,6 +225,9 @@ class FuturesAccountSnapshot:
             for row in positions
             if row.get("marginType")
         }
+        realized_pnl = account.get("totalRealizedProfit")
+        if realized_pnl is None:
+            realized_pnl = account.get("realizedPnl", usdt.get("realizedProfit", "0"))
         return cls(
             mode=mode,
             wallet_balance=Decimal(str(
@@ -242,7 +245,7 @@ class FuturesAccountSnapshot:
             unrealized_pnl=Decimal(str(
                 account.get("totalUnrealizedProfit", usdt.get("unrealizedProfit", "0"))
             )),
-            realized_pnl=Decimal(str(account.get("totalCrossWalletBalance", "0"))),
+            realized_pnl=Decimal(str(realized_pnl)),
             positions=tuple(positions),
             open_orders=tuple(open_orders),
             leverage=leverages,

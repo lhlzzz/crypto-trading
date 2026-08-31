@@ -194,6 +194,10 @@ def test_unknown_and_disconnect_trigger_reconciliation() -> None:
     asyncio.run(scenario())
     assert reconciled
     assert halted
+    assert client.state == "FAILED"
+    assert client.last_disconnect_at is not None
+    assert "still down" in (client.last_error or "")
+    assert client.proxy_mode in {"DIRECT", "CONFIGURED"}
 
 
 def test_listen_key_expiry_reconnect() -> None:

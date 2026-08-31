@@ -431,6 +431,17 @@ def _create_trading_tables(cursor: Any) -> None:
             data_quality_score NUMERIC NOT NULL,
             strategy_version TEXT NOT NULL,
             reason_codes JSONB NOT NULL DEFAULT '[]'::JSONB,
+            episode_id UUID,
+            episode_started_at TIMESTAMPTZ,
+            episode_ended_at TIMESTAMPTZ,
+            episode_state TEXT NOT NULL DEFAULT 'FLAT',
+            episode_transition TEXT NOT NULL DEFAULT 'NONE',
+            evidence_sufficiency JSONB NOT NULL DEFAULT '{}'::JSONB,
+            is_meme BOOLEAN,
+            meme_classification_source TEXT,
+            meme_classification_version TEXT,
+            meme_classified_at TIMESTAMPTZ,
+            meme_reason_codes JSONB NOT NULL DEFAULT '[]'::JSONB,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
         """
@@ -449,6 +460,13 @@ def _create_trading_tables(cursor: Any) -> None:
             observed_at TIMESTAMPTZ NOT NULL,
             source_timestamps JSONB NOT NULL DEFAULT '{}'::JSONB,
             evidence JSONB NOT NULL DEFAULT '{}'::JSONB,
+            data_quality JSONB NOT NULL DEFAULT '{}'::JSONB,
+            episode_id UUID,
+            episode_started_at TIMESTAMPTZ,
+            episode_ended_at TIMESTAMPTZ,
+            episode_state TEXT NOT NULL DEFAULT 'FLAT',
+            episode_transition TEXT NOT NULL DEFAULT 'NONE',
+            universe_classification JSONB NOT NULL DEFAULT '{}'::JSONB,
             payload JSONB NOT NULL DEFAULT '{}'::JSONB
         )
         """
@@ -496,6 +514,34 @@ def _create_trading_tables(cursor: Any) -> None:
             payload JSONB NOT NULL DEFAULT '{}'::JSONB,
             PRIMARY KEY (mode, symbol, settlement_timestamp)
         )
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE positioning_snapshots
+            ADD COLUMN IF NOT EXISTS episode_id UUID,
+            ADD COLUMN IF NOT EXISTS episode_started_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS episode_ended_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS episode_state TEXT NOT NULL DEFAULT 'FLAT',
+            ADD COLUMN IF NOT EXISTS episode_transition TEXT NOT NULL DEFAULT 'NONE',
+            ADD COLUMN IF NOT EXISTS evidence_sufficiency JSONB NOT NULL DEFAULT '{}'::JSONB,
+            ADD COLUMN IF NOT EXISTS is_meme BOOLEAN,
+            ADD COLUMN IF NOT EXISTS meme_classification_source TEXT,
+            ADD COLUMN IF NOT EXISTS meme_classification_version TEXT,
+            ADD COLUMN IF NOT EXISTS meme_classified_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS meme_reason_codes JSONB NOT NULL DEFAULT '[]'::JSONB
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE evidence_snapshots
+            ADD COLUMN IF NOT EXISTS data_quality JSONB NOT NULL DEFAULT '{}'::JSONB,
+            ADD COLUMN IF NOT EXISTS episode_id UUID,
+            ADD COLUMN IF NOT EXISTS episode_started_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS episode_ended_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS episode_state TEXT NOT NULL DEFAULT 'FLAT',
+            ADD COLUMN IF NOT EXISTS episode_transition TEXT NOT NULL DEFAULT 'NONE',
+            ADD COLUMN IF NOT EXISTS universe_classification JSONB NOT NULL DEFAULT '{}'::JSONB
         """
     )
     cursor.execute(

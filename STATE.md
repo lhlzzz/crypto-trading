@@ -140,7 +140,7 @@ research baseline until positioning gates pass.
 
 ## Current verification (2026-08-31)
 
-- `246` tests pass; `compileall` and `git diff --check` pass.
+- `260` tests pass; `compileall` and `git diff --check` pass.
 - Futures order writes are single-attempt; transport uncertainty records
   `UNKNOWN` and reconciliation queries the exact client order ID.
 - listenKey create/keepalive/close use API-key-only transport.
@@ -172,6 +172,12 @@ research baseline until positioning gates pass.
   old combined `MAX_MEME_NOTIONAL_USDT` alias is removed.
 - Direct collector execution is covered, including root imports and Decimal
   JSON payload serialization.
+- Positioning decisions now carry episode identity, lifecycle state, start/end
+  timestamps, and episode transitions. Evidence persistence stores the full
+  normalized input set, sufficiency/data quality, and Meme classification.
+- Runtime gate and exchange reconciliation consume the canonical
+  `FuturesAccountSnapshot`; User Stream records proxy mode, latency, disconnect,
+  and reconnect health and passes the same unavailable state to reconciliation.
 
 ## Runtime Gate Status (2026-08-31)
 

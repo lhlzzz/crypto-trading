@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from reconciliation import Reconciler, apply_user_stream_event
+from risk import FuturesAccountSnapshot
 from user_stream import normalize_user_event
 
 
@@ -70,6 +72,30 @@ class ClientStub:
 
     def get_account(self):
         return self.account
+
+    def account_snapshot(self):
+        assets = self.account.get("assets") or []
+        usdt = next((row for row in assets if row.get("asset") == "USDT"), {})
+        return FuturesAccountSnapshot(
+            mode="testnet",
+            wallet_balance=Decimal(str(usdt.get("walletBalance", "0"))),
+            available_balance=Decimal(str(usdt.get("availableBalance", "0"))),
+            total_margin=Decimal(str(usdt.get("walletBalance", "0"))),
+            used_margin=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=Decimal("0"),
+            positions=tuple(self.positions),
+            open_orders=tuple(self.orders),
+            leverage={
+                str(row.get("symbol")): Decimal(str(row["leverage"]))
+                for row in self.positions
+                if row.get("symbol") and row.get("leverage") is not None
+            },
+            margin_mode="ISOLATED",
+            position_mode="ONE_WAY",
+            captured_at=datetime.now(timezone.utc),
+            source="binance_futures_rest",
+        )
 
     def get_open_orders(self, symbol=None):
         return self.orders

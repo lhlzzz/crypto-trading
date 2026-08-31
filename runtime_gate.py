@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 import os
 
 from binance_client import ClientConfig
-from risk import RiskLimits
+from risk import FuturesAccountSnapshot, RiskLimits
 
 
 def _enabled(name: str, *, default: bool = False) -> bool:
@@ -409,13 +409,18 @@ def evaluate_runtime_gate(
         reasons.append("CREDENTIALS_MISSING")
     if resolved_mode != "paper" and client is not None and probe_account and credentials_ok:
         try:
-            account = client.get_account()
-            account_reachable = isinstance(account, dict)
-            assets = account.get("assets") or account.get("balances") or []
-            usdt = next((row for row in assets if str(row.get("asset", "")).upper() == "USDT"), None)
-            wallet_balance_ok = usdt is not None and "walletBalance" in usdt
-            available_balance_ok = usdt is not None and (
-                "availableBalance" in usdt or "available" in usdt
+            snapshot_getter = getattr(client, "account_snapshot", None)
+            if snapshot_getter is None:
+                raise RuntimeError("FuturesAccountSnapshot is unavailable")
+            snapshot = snapshot_getter()
+            if not isinstance(snapshot, FuturesAccountSnapshot):
+                raise RuntimeError("invalid FuturesAccountSnapshot")
+            account_reachable = snapshot.fresh and snapshot.mode == resolved_mode
+            wallet_balance_ok = account_reachable and snapshot.wallet_balance >= 0
+            available_balance_ok = (
+                account_reachable
+                and snapshot.available_balance >= 0
+                and snapshot.available_balance <= snapshot.wallet_balance
             )
             server_time = client.get_server_time()
             server_ms = int(server_time.get("serverTime"))
@@ -423,26 +428,25 @@ def evaluate_runtime_gate(
             server_time_ok = abs(server_ms - local_ms) <= int(
                 os.environ.get("MAX_DATA_LATENCY_MS", "2000")
             )
-            position_mode = client.get_position_mode()
-            actual_position_mode = "HEDGE" if str(position_mode.get("dualSidePosition", "")).lower() in {"true", "1"} else "ONE_WAY"
-            account_mode_ok = actual_position_mode == _expected_position_mode()
+            account_mode_ok = snapshot.position_mode == _expected_position_mode()
             margin_mode_ok = bool(selected_symbols)
             for symbol in selected_symbols:
                 margin = client.get_margin_type(symbol)
-                leverage = client.get_leverage(symbol)
                 actual_margin = str(margin.get("marginType", "")).upper()
-                if actual_margin != _expected_margin_mode():
+                snapshot_margin = snapshot.margin_mode.upper()
+                if actual_margin != _expected_margin_mode() or (
+                    snapshot_margin != "UNKNOWN"
+                    and snapshot_margin != _expected_margin_mode()
+                ):
                     margin_mode_ok = False
-                symbol_leverage[symbol] = str(leverage.get("leverage", ""))
+                symbol_leverage[symbol] = str(snapshot.leverage.get(symbol, ""))
             expected_leverage = os.environ.get("DEFAULT_LEVERAGE", "1")
             leverage_ok = bool(symbol_leverage) and all(
                 value == expected_leverage for value in symbol_leverage.values()
             )
             margin_mode_ok = bool(selected_symbols) and margin_mode_ok
-            positions = client.get_positions()
-            open_orders = client.get_open_orders()
-            exchange_positions_ok = isinstance(positions, list)
-            open_orders_ok = isinstance(open_orders, list)
+            exchange_positions_ok = isinstance(snapshot.positions, tuple)
+            open_orders_ok = isinstance(snapshot.open_orders, tuple)
         except Exception as exc:
             reasons.append(f"ACCOUNT_PREFLIGHT_FAILED:{type(exc).__name__}")
             account_reachable = False

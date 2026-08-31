@@ -204,6 +204,18 @@ class UserStreamClient:
         self.connected_at: datetime | None = None
         self.last_message_at: datetime | None = None
         self.last_error_at: datetime | None = None
+        self.last_disconnect_at: datetime | None = None
+        self.last_error: str | None = None
+        self.transport_latency_ms: int | None = None
+        self.proxy_mode = (
+            "CONFIGURED"
+            if os.environ.get("BIAN_HTTP_PROXY")
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+            else "DIRECT"
+        )
         self.reconnect_count = 0
         self.consecutive_failures = 0
 
@@ -224,6 +236,7 @@ class UserStreamClient:
         websocket = await _maybe_await(self._websocket_connect(self._ws_url(listen_key)))
         self.state = "LIVE"
         self.connected_at = datetime.now(timezone.utc)
+        self.last_error = None
         return websocket
 
     async def run_forever(self) -> None:
@@ -246,7 +259,11 @@ class UserStreamClient:
                 except Exception as exc:
                     failures += 1
                     self.consecutive_failures = failures
-                    self.last_error_at = datetime.now(timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    self.last_error_at = now
+                    self.last_disconnect_at = now
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.state = "DISCONNECTED"
                     _dispatch(self.on_reconcile)
                     if failures >= self._max_failures:
                         self.state = "FAILED"
@@ -280,7 +297,15 @@ class UserStreamClient:
                 await websocket.wait_closed()
             return
         async for message in websocket:
-            self.last_message_at = datetime.now(timezone.utc)
+            received_at = datetime.now(timezone.utc)
+            self.last_message_at = received_at
+            raw = _payload(message)
+            event_time = _int_or_none(raw.get("E"))
+            if event_time is not None:
+                self.transport_latency_ms = max(
+                    0,
+                    int(received_at.timestamp() * 1000) - event_time,
+                )
             self._message_received(message)
             if self.stream_failure_reason is not None:
                 return
@@ -359,7 +384,14 @@ async def _close_ws(websocket: Any) -> None:
 async def _default_websocket_connect(url: str) -> Any:
     import websockets
 
-    return await websockets.connect(url)
+    proxy = (
+        os.environ.get("BIAN_HTTP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    return await websockets.connect(url, proxy=proxy or True)
 
 
 def _str_or_none(value: Any) -> str | None:
