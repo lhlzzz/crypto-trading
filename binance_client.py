@@ -32,7 +32,7 @@ from binance_sdk_spot import (
 from binance_sdk_spot.rest_api.models import (
     KlinesIntervalEnum,
 )
-from risk import FuturesRiskRules
+from risk import FuturesAccountSnapshot, FuturesRiskRules
 
 
 class BinanceError(Exception):
@@ -585,7 +585,7 @@ class FuturesPublicClient:
         lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
         price = filters.get("PRICE_FILTER") or {}
         notional = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
-        return {
+        normalized_rules = {
             "symbol": normalized,
             "status": str(row.get("status", "")),
             "min_qty": str(lot.get("minQty", "0")),
@@ -596,6 +596,20 @@ class FuturesPublicClient:
             "quantity_precision": str(row.get("quantityPrecision", "")),
             "price_precision": str(row.get("pricePrecision", "")),
         }
+        if normalized_rules["status"] != "TRADING":
+            raise BinanceAPIError(f"Futures symbol is not trading: {normalized}")
+        if any(
+            Decimal(normalized_rules[name]) <= 0
+            for name in ("min_qty", "step_size", "tick_size")
+        ):
+            raise BinanceAPIError(
+                f"Futures exchange rules are incomplete for {normalized}"
+            )
+        if not normalized_rules["quantity_precision"].strip():
+            raise BinanceAPIError(
+                f"Futures quantity precision is unavailable for {normalized}"
+            )
+        return normalized_rules
 
 
 class FuturesPrivateClient:
@@ -670,6 +684,21 @@ class FuturesPrivateClient:
 
     def get_account(self) -> dict[str, Any]:
         return self._signed("GET", "/fapi/v2/account", operation="get_account")
+
+    def account_snapshot(self) -> FuturesAccountSnapshot:
+        captured_at = datetime.now(timezone.utc)
+        account = self.get_account()
+        positions = self.get_positions()
+        open_orders = self.get_open_orders()
+        position_mode = self.get_position_mode()
+        return FuturesAccountSnapshot.from_binance(
+            mode=self.config.mode,  # type: ignore[arg-type]
+            account=account,
+            positions=positions,
+            open_orders=open_orders,
+            position_mode=position_mode,
+            captured_at=captured_at,
+        )
 
     def get_server_time(self) -> dict[str, Any]:
         return _futures_transport(

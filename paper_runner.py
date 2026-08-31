@@ -401,7 +401,21 @@ def _risk_context(
     public_client: FuturesPublicClient | None = None,
     executor: Executor | None = None,
 ) -> RiskContext:
-    if executor is not None and hasattr(executor, "account_state"):
+    account_snapshot = None
+    if executor is not None and hasattr(executor, "account_snapshot"):
+        account_snapshot = executor.account_snapshot()
+        if not account_snapshot.fresh:
+            raise RuntimeError("account snapshot is stale or unavailable")
+        account = {
+            "wallet_balance": account_snapshot.wallet_balance,
+            "available_balance": account_snapshot.available_balance,
+            "used_margin": account_snapshot.used_margin,
+            "equity": account_snapshot.total_margin,
+            "unrealized_pnl": account_snapshot.unrealized_pnl,
+            "realized_pnl": account_snapshot.realized_pnl,
+            "funding_pnl": Decimal("0"),
+        }
+    elif executor is not None and hasattr(executor, "account_state"):
         account = executor.account_state()
     else:
         quote = store.get_balance("USDT") or {}
@@ -455,6 +469,10 @@ def _risk_context(
             intent.leverage,
         )
     return RiskContext(
+        mode=(
+            getattr(getattr(executor, "config", None), "mode", None)
+            or os.environ.get("BIAN_MODE", "paper")
+        ),
         wallet_balance=Decimal(str(account.get("wallet_balance") or "0")),
         available_balance=Decimal(str(account.get("available_balance") or "0")),
         equity=Decimal(str(account.get("equity") or "0")),
@@ -496,6 +514,7 @@ def _risk_context(
         # classification is observe-only; it must not default to tradeable.
         meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
         is_meme=intent.is_meme,
+        account_snapshot=account_snapshot,
     )
 
 

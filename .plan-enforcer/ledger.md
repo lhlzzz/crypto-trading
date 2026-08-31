@@ -4,8 +4,8 @@
 
 ## Scoreboard
 
- 74 total  |  0 done  |  66 verified  |  0 skipped  |  2 blocked  |  6 remaining
- Drift: 8  |  Last reconcile: T74 |  Tier: structural
+ 75 total  |  0 done  |  67 verified  |  0 skipped  |  2 blocked  |  6 remaining
+ Drift: 9  |  Last reconcile: T75 |  Tier: structural
 
 ## Task Ledger
 
@@ -85,6 +85,7 @@
 | T72 | Add explicit Evidence Sufficiency | verified | 252 tests; status classes persisted | D19,V49 | OPEN requires complete critical evidence |
 | T73 | Preserve exit safety under uncertainty | verified | 252 tests; halted CLOSE fills | D19,V49 | REDUCE/CLOSE bypass entry-only blocks |
 | T74 | Separate Meme membership from risk tier | verified | 253 tests; unavailable is OBSERVE | D20,V50 | `is_meme` and provenance gate OPEN |
+| T75 | Unify account snapshots and exchange rules | verified | 257 tests; zero rules HALT | D21,V51 | Paper and Futures REST share contract |
 
 ## Decision Log
 
@@ -110,6 +111,7 @@
 | D18 | T70-T71 | Targeted P0 repair in existing owners | User supplied transport/GAP requirements; no new owner |
 | D19 | T72-T73 | Entry and exit safety are separate paths | Critical evidence gates OPEN; exits remain possible |
 | D20 | T74 | Meme membership is independent from risk tier | Classification unavailable cannot become tradeable |
+| D21 | T75 | Account truth and exchange rules fail closed | No local stale balance or zero-filter Live fallback |
 
 ## Reconciliation History
 

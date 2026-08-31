@@ -57,6 +57,16 @@ def test_risk_allows_valid_intent() -> None:
     assert decision.executable_intent == decision.intent
 
 
+def test_testnet_without_exchange_rules_halts() -> None:
+    decision = RiskGate().evaluate(
+        _intent(),
+        _context(mode="testnet", exchange_rules=None),
+    )
+
+    assert decision.decision == "HALT"
+    assert "exchange rules" in decision.reason
+
+
 def test_halt_blocks_new_orders() -> None:
     decision = RiskGate().evaluate(_intent(), _context(halted=True))
 

@@ -209,6 +209,23 @@ def test_paper_executor_runs_shared_order_lifecycle() -> None:
     assert store.get_balance("BTC") is None
 
 
+def test_paper_account_snapshot_uses_shared_contract() -> None:
+    executor = PaperExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="paper", initial_usdt=Decimal("250")),
+    )
+
+    snapshot = executor.account_snapshot()
+
+    assert snapshot.mode == "paper"
+    assert snapshot.source == "paper_executor"
+    assert snapshot.wallet_balance == Decimal("250")
+    assert snapshot.available_balance == Decimal("250")
+    assert snapshot.margin_mode == "ISOLATED"
+    assert snapshot.position_mode == "ONE_WAY"
+    assert snapshot.fresh is True
+
+
 def test_paper_open_and_close_long() -> None:
     store = MemoryStore()
     executor = PaperExecutor(

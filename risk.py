@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Literal
+from typing import Any, Literal, Mapping
 import os
 
 from trade_intent import TradeIntent
@@ -173,7 +173,93 @@ class ExchangeRules:
 
 
 @dataclass(frozen=True)
+class FuturesAccountSnapshot:
+    """Single account-truth contract for Paper, Testnet, and Live."""
+
+    mode: Literal["paper", "testnet", "live"]
+    wallet_balance: Decimal
+    available_balance: Decimal
+    total_margin: Decimal
+    used_margin: Decimal
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+    positions: tuple[Mapping[str, Any], ...]
+    open_orders: tuple[Mapping[str, Any], ...]
+    leverage: Mapping[str, Decimal]
+    margin_mode: str
+    position_mode: str
+    captured_at: datetime
+    source: str
+    freshness: str = "FRESH"
+
+    @property
+    def fresh(self) -> bool:
+        return self.freshness == "FRESH"
+
+    @classmethod
+    def from_binance(
+        cls,
+        *,
+        mode: Literal["testnet", "live"],
+        account: Mapping[str, Any],
+        positions: list[Mapping[str, Any]],
+        open_orders: list[Mapping[str, Any]],
+        position_mode: Mapping[str, Any],
+        captured_at: datetime,
+    ) -> "FuturesAccountSnapshot":
+        assets = account.get("assets") or account.get("balances") or ()
+        usdt = next(
+            (
+                row for row in assets
+                if str(row.get("asset", "")).upper() == "USDT"
+            ),
+            {},
+        )
+        leverages = {
+            str(row.get("symbol")).upper(): Decimal(str(row.get("leverage")))
+            for row in positions
+            if row.get("symbol") and row.get("leverage") is not None
+        }
+        margin_modes = {
+            str(row.get("marginType")).upper()
+            for row in positions
+            if row.get("marginType")
+        }
+        return cls(
+            mode=mode,
+            wallet_balance=Decimal(str(
+                usdt.get("walletBalance", account.get("totalWalletBalance", "0"))
+            )),
+            available_balance=Decimal(str(
+                usdt.get("availableBalance", account.get("availableBalance", "0"))
+            )),
+            total_margin=Decimal(str(
+                account.get("totalMarginBalance", usdt.get("marginBalance", "0"))
+            )),
+            used_margin=Decimal(str(
+                account.get("totalInitialMargin", usdt.get("initialMargin", "0"))
+            )),
+            unrealized_pnl=Decimal(str(
+                account.get("totalUnrealizedProfit", usdt.get("unrealizedProfit", "0"))
+            )),
+            realized_pnl=Decimal(str(account.get("totalCrossWalletBalance", "0"))),
+            positions=tuple(positions),
+            open_orders=tuple(open_orders),
+            leverage=leverages,
+            margin_mode=next(iter(margin_modes), "UNKNOWN"),
+            position_mode=(
+                "HEDGE"
+                if str(position_mode.get("dualSidePosition", "false")).lower() == "true"
+                else "ONE_WAY"
+            ),
+            captured_at=captured_at,
+            source="binance_futures_rest",
+        )
+
+
+@dataclass(frozen=True)
 class RiskContext:
+    mode: Literal["paper", "testnet", "live"] = "paper"
     halted: bool = False
     wallet_balance: Decimal = Decimal("0")
     available_balance: Decimal = Decimal("0")
@@ -213,6 +299,7 @@ class RiskContext:
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
     is_meme: bool | None = True
     meme_require_classification: bool = True
+    account_snapshot: FuturesAccountSnapshot | None = None
     symbol_meme_notional: Decimal = Decimal("0")
     total_meme_notional: Decimal = Decimal("0")
     directional_meme_exposure: Decimal = Decimal("0")
@@ -377,6 +464,8 @@ class RiskGate:
             return self._halt(intent, "intent leverage does not match validated account leverage")
 
         rules = context.exchange_rules
+        if context.mode in {"testnet", "live"} and rules is None:
+            return self._halt(intent, "Futures exchange rules are unavailable")
         if rules is not None:
             if rules.symbol.upper() != intent.symbol:
                 return self._deny(intent, "exchange rules symbol mismatch")

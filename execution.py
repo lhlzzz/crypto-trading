@@ -16,7 +16,7 @@ from binance_client import (
     ClientConfig,
     FuturesPrivateClient,
 )
-from risk import FuturesRiskRules, RiskDecision
+from risk import FuturesAccountSnapshot, FuturesRiskRules, RiskDecision
 from trade_intent import TradeIntent
 from trading_store import TradingStore
 
@@ -427,6 +427,28 @@ class PaperExecutor(_BaseExecutor):
             "equity": equity,
             "margin_balance": wallet + unrealized,
         }
+
+    def account_snapshot(self) -> FuturesAccountSnapshot:
+        account = self.account_state()
+        positions = getattr(self.store, "list_positions", lambda: [])()
+        return FuturesAccountSnapshot(
+            mode="paper",
+            wallet_balance=account["wallet_balance"],
+            available_balance=account["available_balance"],
+            total_margin=account["margin_balance"],
+            used_margin=account["used_margin"],
+            unrealized_pnl=account["unrealized_pnl"],
+            realized_pnl=account["realized_pnl"],
+            positions=tuple(positions),
+            open_orders=tuple(
+                getattr(self.store, "list_open_local_orders", lambda: [])()
+            ),
+            leverage={},
+            margin_mode="ISOLATED",
+            position_mode="ONE_WAY",
+            captured_at=datetime.now(timezone.utc),
+            source="paper_executor",
+        )
 
     def liquidation_price_for(
         self,
@@ -1094,6 +1116,9 @@ class BinanceExecutor(_BaseExecutor):
         if resolved_client_config.mode != config.mode:
             raise ValueError("execution and Binance client modes must match")
         self.client = FuturesPrivateClient(resolved_client_config)
+
+    def account_snapshot(self) -> FuturesAccountSnapshot:
+        return self.client.account_snapshot()
 
     def submit(
         self,

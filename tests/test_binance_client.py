@@ -5,6 +5,7 @@ import hmac
 import io
 import urllib.error
 import urllib.parse
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from binance_sdk_spot import NetworkError, ServerError, TooManyRequestsError
 
 from binance_client import (
     BinanceAuthError,
+    BinanceAPIError,
     BinanceConnectionError,
     BinanceOrderError,
     BinanceRateLimitError,
@@ -126,6 +128,74 @@ def test_futures_public_client_reads_aggregate_trades(monkeypatch) -> None:
             {"symbol": "BTCUSDT", "limit": 1000},
         )
     ]
+
+
+def test_futures_account_snapshot_uses_exchange_truth() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret")
+    )
+    with patch.object(
+        client,
+        "get_account",
+        return_value={
+            "totalMarginBalance": "120",
+            "totalInitialMargin": "20",
+            "totalUnrealizedProfit": "3",
+            "assets": [{
+                "asset": "USDT",
+                "walletBalance": "100",
+                "availableBalance": "80",
+            }],
+        },
+    ), patch.object(
+        client,
+        "get_positions",
+        return_value=[{
+            "symbol": "DOGEUSDT",
+            "positionAmt": "10",
+            "leverage": "3",
+            "marginType": "isolated",
+        }],
+    ), patch.object(
+        client, "get_open_orders", return_value=[{"orderId": 1}]
+    ), patch.object(
+        client, "get_position_mode", return_value={"dualSidePosition": False}
+    ):
+        snapshot = client.account_snapshot()
+
+    assert snapshot.mode == "testnet"
+    assert snapshot.source == "binance_futures_rest"
+    assert snapshot.wallet_balance == Decimal("100")
+    assert snapshot.available_balance == Decimal("80")
+    assert snapshot.used_margin == Decimal("20")
+    assert snapshot.leverage["DOGEUSDT"] == Decimal("3")
+    assert snapshot.position_mode == "ONE_WAY"
+    assert snapshot.fresh is True
+
+
+def test_futures_exchange_rules_zero_filters_fail_closed() -> None:
+    client = FuturesPublicClient(ClientConfig(mode="testnet"))
+    with patch.object(
+        client,
+        "get_exchange_info",
+        return_value={
+            "symbols": [{
+                "symbol": "DOGEUSDT",
+                "status": "TRADING",
+                "quantityPrecision": 3,
+                "filters": [{
+                    "filterType": "LOT_SIZE",
+                    "minQty": "0",
+                    "stepSize": "0",
+                }, {
+                    "filterType": "PRICE_FILTER",
+                    "tickSize": "0",
+                }],
+            }]
+        },
+    ):
+        with pytest.raises(BinanceAPIError):
+            client.get_symbol_rules("DOGEUSDT")
 
 
 def test_private_client_is_hard_blocked_in_paper_mode() -> None:
