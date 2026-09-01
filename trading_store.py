@@ -826,9 +826,30 @@ class TradingStore:
                 age_sec = max(0, int((now - received_dt).total_seconds()))
                 valid_timestamps = received_dt >= source_dt and source_dt <= now and received_dt <= now
                 valid_latency = latency_ms >= 0 and latency_ms == int((received_dt - source_dt).total_seconds() * 1000)
-                reported_status = str(payload.get("health_status", "")).upper()
-                if reported_status in {"GAP", "UNSAFE", "ERROR"}:
+                nested = (
+                    payload.get("metadata")
+                    if isinstance(payload.get("metadata"), dict)
+                    else {}
+                )
+                reported_status = str(
+                    payload.get("health_status")
+                    or payload.get("health")
+                    or nested.get("health_status")
+                    or nested.get("health")
+                    or ""
+                ).upper()
+                reported_state = str(
+                    payload.get("state") or nested.get("state") or ""
+                ).upper()
+                if reported_status in {
+                    "GAP", "UNSAFE", "ERROR", "STALE", "SYNCING", "UNINITIALIZED",
+                    "FAILED", "RECONNECTING", "STARTING",
+                }:
                     status = reported_status
+                elif reported_state in {
+                    "GAP", "UNSAFE", "ERROR", "SYNCING", "UNINITIALIZED", "FAILED",
+                }:
+                    status = reported_state
                 elif not valid_timestamps or not valid_latency:
                     status = "ERROR"
                 elif age_sec > max(1, max_age_sec):
@@ -878,7 +899,7 @@ class TradingStore:
         # Liveness and sparse event existence are separate observations. A
         # quiet force-order channel is healthy when its heartbeat is fresh.
         for symbol in sorted(requested_symbols or symbols):
-            heartbeat = canonical.get("FUTURES_LIQUIDATION_LIVENESS", {}).get(symbol)
+            _heartbeat = canonical.get("FUTURES_LIQUIDATION_LIVENESS", {}).get(symbol)
             heartbeat_row = next(
                 (
                     row for row in result

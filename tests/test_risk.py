@@ -510,3 +510,66 @@ def test_exit_safety_survives_halt_and_untrusted_entry_evidence() -> None:
 
     assert decision.decision == "ALLOW"
     assert decision.reason == "exit safety path"
+
+
+def test_stale_evidence_denies_open_but_allows_exit() -> None:
+    open_decision = RiskGate().evaluate(
+        _intent(action="OPEN"),
+        _context(evidence_freshness="STALE"),
+    )
+    close_decision = RiskGate().evaluate(
+        _intent(action="CLOSE", reduce_only=True),
+        _context(
+            evidence_freshness="STALE",
+            position_direction="LONG",
+            position_quantity=Decimal("0.1"),
+        ),
+    )
+    reduce_decision = RiskGate().evaluate(
+        _intent(action="REDUCE", reduce_only=True, quantity=Decimal("0.05")),
+        _context(
+            evidence_freshness="STALE",
+            position_direction="LONG",
+            position_quantity=Decimal("0.1"),
+        ),
+    )
+    assert open_decision.decision == "DENY"
+    assert "EVIDENCE_STALE" in open_decision.reason
+    assert close_decision.decision == "ALLOW"
+    assert reduce_decision.decision == "ALLOW"
+
+
+def test_symbol_isolation_allows_healthy_symbol_when_another_is_stale() -> None:
+    pepe_rules = ExchangeRules(
+        symbol="PEPEUSDT",
+        min_qty=Decimal("0.001"),
+        step_size=Decimal("0.001"),
+        tick_size=Decimal("0.01"),
+        min_notional=Decimal("5"),
+    )
+    doge_rules = ExchangeRules(
+        symbol="DOGEUSDT",
+        min_qty=Decimal("0.001"),
+        step_size=Decimal("0.001"),
+        tick_size=Decimal("0.01"),
+        min_notional=Decimal("5"),
+    )
+    pepe = RiskGate().evaluate(
+        _intent(symbol="PEPEUSDT", action="OPEN"),
+        _context(evidence_freshness="STALE", exchange_rules=pepe_rules),
+    )
+    doge = RiskGate().evaluate(
+        _intent(symbol="DOGEUSDT", action="OPEN"),
+        _context(evidence_freshness="FRESH", exchange_rules=doge_rules),
+    )
+    assert pepe.decision == "DENY"
+    assert doge.decision == "ALLOW"
+
+
+def test_global_market_data_failure_halts() -> None:
+    decision = RiskGate().evaluate(
+        _intent(),
+        _context(market_data_health="HALT"),
+    )
+    assert decision.decision == "HALT"
+    assert decision.reason == "GLOBAL_HALT"

@@ -402,6 +402,8 @@ def _risk_context(
     mode: str,
     public_client: FuturesPublicClient | None = None,
     paper_executor: PaperExecutor | None = None,
+    frame: MarketFrame | None = None,
+    market_data_health: str = "OK",
 ) -> RiskContext:
     if not isinstance(account_snapshot, FuturesAccountSnapshot):
         raise RuntimeError("canonical account snapshot is required")
@@ -465,6 +467,17 @@ def _risk_context(
             mark,
             intent.leverage,
         )
+    evidence_freshness = "FRESH"
+    if frame is not None:
+        orderbook = str((frame.evidence_status or {}).get("orderbook") or "").upper()
+        if orderbook in {"GAP", "UNSAFE", "ERROR"}:
+            evidence_freshness = "UNSAFE"
+        elif orderbook in {"STALE", "MISSING", "SYNCING", "UNINITIALIZED"}:
+            evidence_freshness = "STALE"
+        elif frame.freshness:
+            stale = [item for item in frame.freshness if not item.fresh()]
+            if stale:
+                evidence_freshness = "STALE"
     return RiskContext(
         mode=mode,  # type: ignore[arg-type]
         wallet_balance=account_snapshot.wallet_balance,
@@ -517,6 +530,8 @@ def _risk_context(
         ).strip().lower() in {"1", "true", "yes", "on"},
         account_snapshot=account_snapshot,
         account_state_error=account_state_error,
+        evidence_freshness=evidence_freshness,
+        market_data_health=market_data_health,
     )
 
 
@@ -547,10 +562,18 @@ def run_cycle(
         store=store,
         config=ExecutionConfig.from_env(mode=mode),
     )
-    frame = store.latest_market_observation(
-        symbol,
-        source_ttl_sec=engine.config.source_ttl_sec,
-    )
+    try:
+        frame = store.latest_market_observation(
+            symbol,
+            source_ttl_sec=engine.config.source_ttl_sec,
+        )
+    except Exception as exc:
+        reason = f"GLOBAL_HALT:{type(exc).__name__}"
+        try:
+            store.set_halt(True, reason=reason, source="paper_runner")
+        except Exception:
+            pass
+        return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
     market = _market_snapshot(frame)
     try:
         positioning, shadow = _record_shadow(frame, store=store, engine=engine)
@@ -621,6 +644,7 @@ def run_cycle(
             mode=mode,
             public_client=public_client,
             paper_executor=executor if isinstance(executor, PaperExecutor) else None,
+            frame=frame,
         ),
     )
     result = executor.submit(intent, decision, market=market)

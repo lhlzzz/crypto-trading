@@ -211,3 +211,32 @@ def test_start_episode_uses_one_active_row_per_symbol_market():
     assert "ON CONFLICT (symbol, market)" in statement
     assert "WHERE status IN ('OPEN', 'UNRESOLVED')" in statement
     assert first["episode_id"] == second["episode_id"]
+
+
+def test_market_data_freshness_reads_nested_health_status():
+    now = datetime.now(timezone.utc)
+    received = now - timedelta(seconds=1)
+    timestamp = received - timedelta(milliseconds=20)
+    rows = [
+        (
+            "BTCUSDT", "FUTURES", "ORDERBOOK", timestamp, received, 20,
+            {
+                "event_type": "ORDERBOOK",
+                "health": "GAP",
+                "metadata": {"health_status": "GAP", "state": "GAP"},
+            },
+        ),
+    ]
+    cursor = MagicMock()
+    cursor.fetchall.return_value = rows
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection), patch(
+        "trading_store._now", return_value=now
+    ):
+        result = TradingStore("postgresql://test").market_data_freshness(
+            max_age_sec=60, symbols=["BTCUSDT"]
+        )
+    by_source = {row["source"]: row for row in result}
+    assert by_source["FUTURES_DEPTH"]["status"] == "GAP"

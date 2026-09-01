@@ -241,6 +241,9 @@ class GateResult:
     current_reconciliation: str = "BLOCKED"
     current_orderbook: str = "UNKNOWN"
     current_user_stream: str = "UNKNOWN"
+    global_transport_health: str = "UNKNOWN"
+    per_symbol_transport_health: dict[str, str] = field(default_factory=dict)
+    per_symbol_source_health: dict[str, dict[str, str]] = field(default_factory=dict)
     realtime_30m_status: str = "NOT_STARTED"
     realtime_2h_status: str = "NOT_STARTED"
     realtime_6h_status: str = "NOT_STARTED"
@@ -353,12 +356,22 @@ class GateResult:
             "current_reconciliation": self.current_reconciliation,
             "current_orderbook": self.current_orderbook,
             "current_user_stream": self.current_user_stream,
+            "global_transport_health": self.global_transport_health,
+            "per_symbol_transport_health": dict(self.per_symbol_transport_health),
+            "per_symbol_source_health": {
+                symbol: dict(rows)
+                for symbol, rows in self.per_symbol_source_health.items()
+            },
             "live_allowed": self.live_allowed,
             "CODE_READY": True,
             "CODE_PASS": True,
             "ORDERBOOK_CODE_PASS": True,
             "ORDERBOOK_RUNTIME_PASS": self.current_orderbook == "OK",
-            "REAL_DATA_READY": self.realtime_24h_status == "PASSED",
+            "REAL_DATA_READY": (
+                self.data_health_ok
+                and self.current_orderbook == "OK"
+                and self.global_transport_health in {"OK", "LIVE"}
+            ),
             "PAPER_READY": self.paper_ready,
             "SHADOW_READY": self.shadow_gate_status == "PASSED",
             "TESTNET_READY": self.testnet_ready,
@@ -723,6 +736,45 @@ def evaluate_runtime_gate(
         if all(str(row.get("status", "")).upper() == "FRESH" for row in orderbook_rows)
         else str(orderbook_rows[0].get("status", "UNKNOWN")).upper()
     )
+    per_symbol_source_health: dict[str, dict[str, str]] = {}
+    per_symbol_transport_health: dict[str, str] = {}
+    for row in health_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        source = str(row.get("source") or row.get("event_type") or "").upper()
+        if not symbol or not source:
+            continue
+        per_symbol_source_health.setdefault(symbol, {})[source] = str(
+            row.get("status") or "MISSING"
+        ).upper()
+    realtime = {str(source).upper() for source in _REALTIME_FUTURES_SOURCES}
+    for symbol, sources in per_symbol_source_health.items():
+        relevant = {
+            source: status
+            for source, status in sources.items()
+            if source in realtime
+        }
+        if not relevant:
+            per_symbol_transport_health[symbol] = "UNKNOWN"
+        elif all(status == "FRESH" for status in relevant.values()):
+            per_symbol_transport_health[symbol] = "OK"
+        elif any(status in {"GAP", "UNSAFE", "ERROR", "FAILED"} for status in relevant.values()):
+            per_symbol_transport_health[symbol] = "FAILED"
+        else:
+            per_symbol_transport_health[symbol] = "DEGRADED"
+    if store is None:
+        global_transport_health = "UNKNOWN"
+    elif not health_rows and data_health_ok is False:
+        global_transport_health = "HALT"
+    elif per_symbol_transport_health and all(
+        value == "FAILED" for value in per_symbol_transport_health.values()
+    ):
+        global_transport_health = "HALT"
+    elif any(value != "OK" for value in per_symbol_transport_health.values()):
+        global_transport_health = "DEGRADED"
+    elif data_health_ok:
+        global_transport_health = "OK"
+    else:
+        global_transport_health = "DEGRADED"
     return GateResult(
         mode=resolved_mode,
         positioning_enabled=positioning_enabled,
@@ -783,6 +835,9 @@ def evaluate_runtime_gate(
         realtime_6h_status=realtime_6h_status,
         realtime_24h_status=realtime_24h_status,
         code_ready=True,
+        global_transport_health=global_transport_health,
+        per_symbol_transport_health=per_symbol_transport_health,
+        per_symbol_source_health=per_symbol_source_health,
     )
 
 

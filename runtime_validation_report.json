@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-09-01T16:55:38.092098+00:00",
+  "generated_at": "2026-09-01T19:22:14.822400+00:00",
   "gate": "realtime_30m",
-  "status": "FAILED",
+  "status": "PASSED",
   "CODE_PASS": true,
-  "RUNTIME_PASS": false,
+  "RUNTIME_PASS": true,
   "stages": {
     "realtime_30m": {
-      "status": "FAILED",
-      "reason": "SOURCE_OUTAGE",
-      "start_time": "2026-09-01T16:25:35.616679+00:00",
-      "end_time": "2026-09-01T16:55:36.226471+00:00",
-      "duration": 1800,
+      "status": "PASSED",
+      "reason": "OK",
+      "start_time": "2026-09-01T18:51:47.713647+00:00",
+      "end_time": "2026-09-01T19:22:00.814295+00:00",
+      "duration": 1813,
       "requested_duration": 1800,
       "required_sources": [
         "FUTURES_BOOK_TICKER",
@@ -24,596 +24,512 @@
         "FUTURES_TRADE"
       ],
       "missing_sources": [],
-      "stale_sources": [
-        "FUTURES_BOOK_TICKER",
-        "FUTURES_DEPTH",
-        "FUTURES_LIQUIDATION_LIVENESS"
-      ],
-      "healthy_seconds": 960,
-      "degraded_seconds": 807,
+      "stale_sources": [],
+      "healthy_seconds": 1688,
+      "degraded_seconds": 90,
       "failure_seconds": 0,
       "gap_count": 0,
       "reconnect_count": 0,
-      "stale_count": 3,
+      "stale_count": 0,
       "observation_count": 10,
       "samples": [
         {
-          "at": "2026-09-01T16:26:06.125911+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:26:36.616750+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:27:07.125719+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:27:37.649124+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:28:08.168121+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:28:38.692005+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:29:09.214372+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:29:39.750522+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:30:10.254993+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:30:40.772575+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:31:11.284492+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:31:41.814487+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:32:12.340129+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:32:42.904907+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:33:13.757356+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:33:44.287726+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:34:14.813921+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:34:45.391495+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:35:15.947129+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:35:46.486335+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:36:17.032188+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:36:47.595156+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:37:18.137132+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:37:48.675436+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:38:19.228529+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:38:49.778665+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:39:20.380251+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:39:50.928260+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:40:21.495292+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:40:52.088258+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:41:22.648961+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:41:53.254762+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T16:42:23.816505+00:00",
+          "at": "2026-09-01T18:52:18.541719+00:00",
           "status": "degraded",
           "missing_sources": [],
           "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
+            "FUTURES_FUNDING_LIVENESS",
+            "FUTURES_INDEX_PRICE",
+            "FUTURES_MARK_PRICE"
           ],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:42:54.380276+00:00",
+          "at": "2026-09-01T18:52:49.467103+00:00",
           "status": "degraded",
           "missing_sources": [],
           "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
+            "FUTURES_FUNDING_LIVENESS",
+            "FUTURES_INDEX_PRICE",
+            "FUTURES_MARK_PRICE"
           ],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:43:24.947437+00:00",
+          "at": "2026-09-01T18:53:20.374826+00:00",
           "status": "degraded",
           "missing_sources": [],
           "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
+            "FUTURES_FUNDING_LIVENESS",
+            "FUTURES_INDEX_PRICE",
+            "FUTURES_MARK_PRICE"
           ],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:43:55.530792+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:53:51.500594+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:44:26.092871+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:54:22.671485+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:44:56.672445+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:54:54.111889+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:45:27.255689+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:55:25.185733+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:45:57.857716+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:55:56.172293+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:46:28.554334+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:56:27.330610+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:46:59.215876+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:56:58.506273+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:47:29.802486+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:57:30.209879+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:48:00.401786+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:58:01.926780+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:48:30.991389+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:58:33.208272+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:49:01.570999+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:59:04.291791+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:49:32.159175+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T18:59:35.450676+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:50:02.760340+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:00:06.744847+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:50:33.371167+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:00:38.328719+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:51:03.978307+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:01:09.777285+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:51:34.593695+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:01:41.218843+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:52:05.239866+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:02:12.850277+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:52:35.928410+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:02:44.122200+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:53:06.536640+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:03:15.994878+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:53:37.144228+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:03:47.686820+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:54:07.769741+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:04:19.068939+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:54:38.377555+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:04:50.680525+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:55:09.004830+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:05:22.498733+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         },
         {
-          "at": "2026-09-01T16:55:36.226210+00:00",
-          "status": "degraded",
+          "at": "2026-09-01T19:05:54.262779+00:00",
+          "status": "healthy",
           "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_BOOK_TICKER",
-            "FUTURES_DEPTH",
-            "FUTURES_LIQUIDATION_LIVENESS"
-          ],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:06:25.933102+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:06:57.465632+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:07:29.247405+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:08:00.907277+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:08:32.530995+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:09:04.187192+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:09:35.860349+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:10:07.675742+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:10:39.402945+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:11:11.302332+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:11:43.352454+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:12:15.287860+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:12:47.091666+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:13:18.983948+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:13:50.873097+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:14:22.598898+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:14:54.506717+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:15:26.609997+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:15:58.416013+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:16:30.543570+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:17:02.715181+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:17:34.644033+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:18:06.947600+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:18:39.423646+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:19:11.607022+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:19:44.066310+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:20:16.119712+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:20:48.077179+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:21:20.513642+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:21:49.898470+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:21:54.524283+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:21:56.522886+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:21:58.709116+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10
+        },
+        {
+          "at": "2026-09-01T19:22:00.802054+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
           "gap_count": 0,
           "observation_count": 10
         }
@@ -658,20 +574,38 @@
         "paper_accounting_ok": true,
         "alpha_gate_status": "INSUFFICIENT_SAMPLE",
         "meme_universe_ready": false,
-        "evaluated_at": "2026-09-01T16:55:38.067714+00:00",
-        "evidence_verified_at": null,
-        "verification_age_sec": 0,
-        "verification_source": "runtime_gate",
+        "evaluated_at": "2026-09-01T19:22:14.802349+00:00",
+        "evidence_verified_at": "2026-09-01T16:55:36.226471+00:00",
+        "verification_age_sec": 8798,
+        "verification_source": "persisted_gate_evidence",
         "current_data_health": "BLOCKED",
         "current_account_health": "NOT_APPLICABLE",
         "current_reconciliation": "OK",
-        "current_orderbook": "STALE",
+        "current_orderbook": "OK",
         "current_user_stream": "NOT_APPLICABLE",
+        "global_transport_health": "DEGRADED",
+        "per_symbol_transport_health": {
+          "BTCUSDT": "OK"
+        },
+        "per_symbol_source_health": {
+          "BTCUSDT": {
+            "FUTURES_BOOK_TICKER": "FRESH",
+            "FUTURES_DEPTH": "FRESH",
+            "FUTURES_FUNDING_LIVENESS": "FRESH",
+            "FUTURES_INDEX_PRICE": "FRESH",
+            "FUTURES_LIQUIDATION_LIVENESS": "FRESH",
+            "FUTURES_MARK_PRICE": "FRESH",
+            "FUTURES_OPEN_INTEREST": "FRESH",
+            "FUTURES_TAKER": "FRESH",
+            "FUTURES_TRADE": "FRESH",
+            "FUTURES_FORCE_ORDER": "MISSING"
+          }
+        },
         "live_allowed": false,
         "CODE_READY": true,
         "CODE_PASS": true,
         "ORDERBOOK_CODE_PASS": true,
-        "ORDERBOOK_RUNTIME_PASS": false,
+        "ORDERBOOK_RUNTIME_PASS": true,
         "REAL_DATA_READY": false,
         "PAPER_READY": false,
         "SHADOW_READY": false,
@@ -690,11 +624,11 @@
         "PAPER_HEALTH": "NOT_STARTED",
         "TESTNET_HEALTH": "NOT_STARTED",
         "ALPHA_HEALTH": "INSUFFICIENT_SAMPLE",
-        "realtime_30m_status": "NOT_STARTED",
+        "realtime_30m_status": "FAILED",
         "realtime_2h_status": "NOT_STARTED",
         "realtime_6h_status": "NOT_STARTED",
         "realtime_24h_status": "NOT_STARTED",
-        "orderbook_health": "STALE",
+        "orderbook_health": "OK",
         "account_health": "NOT_APPLICABLE",
         "user_stream": "NOT_APPLICABLE",
         "risk": "SAFE",
@@ -703,9 +637,7 @@
           "FUTURES_BOOK_TICKER_STALE",
           "FUTURES_DEPTH_STALE",
           "FUTURES_INDEX_PRICE_STALE",
-          "FUTURES_LIQUIDATION_LIVENESS_STALE",
           "FUTURES_MARK_PRICE_STALE",
-          "FUTURES_OPEN_INTEREST_STALE",
           "FUTURES_TAKER_STALE",
           "FUTURES_TRADE_STALE",
           "DATA_HEALTH_NOT_VERIFIED"

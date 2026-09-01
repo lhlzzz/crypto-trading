@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
+import base64
+import socket
 
 # Running this owner as ``python scripts/bian_market.py`` does not place the
 # repository root on sys.path. Keep root-owned contracts importable in both
@@ -47,6 +49,26 @@ PRODUCT_ENDPOINTS = {
 USER_AGENT = "bian-market/1.1 (+public-read-only)"
 LOGGER = logging.getLogger(__name__)
 STREAM_STATES = frozenset({"CONNECTING", "LIVE", "DISCONNECTED", "RECONNECTING", "FAILED"})
+CHANNEL_STATES = frozenset(
+    {"STARTING", "LIVE", "STALE", "RECONNECTING", "FAILED", "STOPPED"}
+)
+FUTURES_LIVE_PUBLIC_WS = "wss://fstream.binance.com/stream"
+FUTURES_TESTNET_PUBLIC_WS = "wss://stream.binancefuture.com/stream"
+RECONNECT_BACKOFF_SEC = (1, 2, 4, 8, 16, 30, 60)
+FUTURES_CHANNEL_STREAMS = {
+    "TRADE": "trade",
+    "BOOK_TICKER": "bookTicker",
+    "DEPTH": "depth",
+    "MARK_PRICE": "markPrice",
+    "LIQUIDATION": "forceOrder",
+}
+FUTURES_CHANNEL_SOURCES = {
+    "TRADE": "futures_trade_flow",
+    "BOOK_TICKER": "futures_book_ticker",
+    "DEPTH": "futures_orderbook",
+    "MARK_PRICE": "futures_mark_price",
+    "LIQUIDATION": "futures_liquidation",
+}
 _HTTP_OPENER: Any | None = None
 _HTTP_OPENER_PROXY: str | None = None
 
@@ -104,6 +126,58 @@ class StreamHealth:
         self.reconnect_count += 1
 
 
+@dataclass
+class ChannelSession:
+    """Independent Futures public websocket session for one channel."""
+
+    channel: str
+    symbols: tuple[str, ...]
+    state: str = "STARTING"
+    connected_at: datetime | None = None
+    last_message_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_disconnect_at: datetime | None = None
+    reconnect_count: int = 0
+    consecutive_failures: int = 0
+    message_count: int = 0
+    last_event_timestamp: datetime | None = None
+    last_latency_ms: int | None = None
+    stale_count: int = 0
+    last_error: str | None = None
+    last_error_class: str | None = None
+    time_to_recover_ms: int | None = None
+    proxy_mode: str = "DIRECT"
+    subscribed: bool = False
+    connection_attempts: int = 0
+
+    def __post_init__(self) -> None:
+        self.channel = str(self.channel).upper()
+        if self.channel not in FUTURES_CHANNEL_STREAMS:
+            raise ValueError(f"invalid futures channel: {self.channel}")
+        if self.state not in CHANNEL_STATES:
+            raise ValueError(f"invalid channel state: {self.state}")
+        self.symbols = tuple(dict.fromkeys(self.symbols))
+        self.proxy_mode = "CONFIGURED" if _http_proxy() else "DIRECT"
+
+    def as_health(self) -> dict[str, Any]:
+        return {
+            "channel": self.channel,
+            "state": self.state,
+            "connected": self.state == "LIVE" and self.subscribed,
+            "last_message_at": (
+                self.last_message_at.isoformat() if self.last_message_at else None
+            ),
+            "message_count": self.message_count,
+            "reconnect_count": self.reconnect_count,
+            "stale_count": self.stale_count,
+            "error": self.last_error,
+            "last_error_class": self.last_error_class,
+            "time_to_recover_ms": self.time_to_recover_ms,
+            "proxy_mode": self.proxy_mode,
+            "consecutive_failures": self.consecutive_failures,
+        }
+
+
 def _get_http_opener() -> Any:
     """Return the one public REST opener used by every collector request."""
     global _HTTP_OPENER, _HTTP_OPENER_PROXY
@@ -156,6 +230,50 @@ def _http_proxy() -> str | None:
         or os.environ.get("HTTP_PROXY")
         or os.environ.get("http_proxy")
     )
+
+
+def _proxy_tunnel_socket(
+    host: str,
+    port: int,
+    proxy_url: str,
+    timeout: float = 10.0,
+) -> socket.socket:
+    """Open a TCP tunnel through an HTTP CONNECT proxy.
+
+    websockets' native HTTP proxy handshake times out here even when CONNECT
+    plus TLS succeeds, so the tunnel is created explicitly and handed over.
+    """
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        raise OSError("invalid_proxy")
+    proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    sock = socket.create_connection((parsed.hostname, proxy_port), timeout=timeout)
+    try:
+        target = f"{host}:{port}"
+        headers = [
+            f"CONNECT {target} HTTP/1.1",
+            f"Host: {target}",
+        ]
+        if parsed.username is not None:
+            token = base64.b64encode(
+                f"{parsed.username}:{parsed.password or ''}".encode()
+            ).decode()
+            headers.append(f"Proxy-Authorization: Basic {token}")
+        sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        status = data.split(b"\r\n", 1)[0]
+        if b" 200 " not in status:
+            raise OSError("proxy_connect_failed")
+        sock.settimeout(None)
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
 def _get_json(
@@ -222,6 +340,13 @@ def _event_datetime(value: Any) -> datetime:
         return datetime.fromtimestamp(number, tz=timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+
+def _native_event_id(*parts: object) -> str:
+    """Deterministic UUID identity derived from a native exchange key."""
+    identity = ":".join("" if part is None else str(part) for part in parts)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"bian:{identity}"))
 
 
 def _latency_ms(source_timestamp: Any, received_timestamp: Any) -> int:
@@ -916,16 +1041,17 @@ class LocalOrderBook:
             raise OrderBookGap("book must be initialized from a REST snapshot")
         if last <= self.last_update_id:
             return False
-        if first > self.last_update_id + 1:
+        previous_final = event.get("pu")
+        if previous_final is not None:
+            if self.state == "VALID" and int(previous_final) != self.last_update_id:
+                self._invalidate(event, "OrderBookGap")
+                raise OrderBookGap(
+                    f"depth bridge gap: expected pu={self.last_update_id}, got {previous_final}"
+                )
+        elif first > self.last_update_id + 1:
             self._invalidate(event, "OrderBookGap")
             raise OrderBookGap(
                 f"depth gap: expected {self.last_update_id + 1}, got {first}"
-            )
-        previous_final = event.get("pu")
-        if previous_final is not None and int(previous_final) != self.last_update_id:
-            self._invalidate(event, "OrderBookGap")
-            raise OrderBookGap(
-                f"depth bridge gap: expected pu={self.last_update_id}, got {previous_final}"
             )
         for side, target in (("b", self.bids), ("a", self.asks)):
             for price_text, quantity_text in event.get(side, []):
@@ -1810,12 +1936,21 @@ def _stream_market(
     quantity = _decimal(trade.amount) or Decimal("0")
     side = str(trade.side).lower()
     buyer_maker = side in {"sell", "none"}
-    event = {
-        "symbol": _storage_symbol(standard_symbol),
-        "event_id": str(uuid.uuid5(
+    native_trade_id = getattr(trade, "id", None)
+    raw_trade = getattr(trade, "raw", None)
+    if native_trade_id in {None, ""} and isinstance(raw_trade, dict):
+        native_trade_id = raw_trade.get("t")
+    storage_symbol = _storage_symbol(standard_symbol)
+    if market.upper() == "FUTURES" and native_trade_id not in {None, ""}:
+        event_id = _native_event_id("futures-trade", storage_symbol, native_trade_id)
+    else:
+        event_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"bian:trade:{standard_symbol}:{source_timestamp.isoformat()}:{price}:{quantity}",
-        )),
+        ))
+    event = {
+        "symbol": storage_symbol,
+        "event_id": event_id,
         "event_type": "FUTURES_TRADE" if market.upper() == "FUTURES" else "TRADE",
         "source": (
             "binance_futures_trade_stream"
@@ -1891,6 +2026,10 @@ def _stream_book_ticker(
         "metadata": {
             "bidPrice": str(bid),
             "askPrice": str(ask),
+            "bid_price": str(bid),
+            "ask_price": str(ask),
+            "bid_qty": str(_decimal(getattr(ticker, "bid_size", None) or getattr(ticker, "bid_qty", None)) or "") or None,
+            "ask_qty": str(_decimal(getattr(ticker, "ask_size", None) or getattr(ticker, "ask_qty", None)) or "") or None,
             "spread": str(ask - bid),
             "spreadBps": str((ask - bid) / mid * Decimal("10000")),
             "timestamp_semantics": "exchange_event" if getattr(ticker, "raw", {}).get("E") else "receipt_observed",
@@ -2146,73 +2285,880 @@ def _stream_funding(
     return standard_symbol, event
 
 
-def _build_futures_stream_handler(
-    symbols: list[str],
-    callback: Callable[[Any, float], Awaitable[None]] | None = None,
-    *,
-    ticker_callback: Callable[[Any, float], Awaitable[None]] | None = None,
-    book_callback: Callable[[Any, float], Awaitable[None]] | None = None,
-    funding_callback: Callable[[Any, float], Awaitable[None]] | None = None,
-    liquidation_callback: Callable[[Any, float], Awaitable[None]] | None = None,
-) -> Any:
-    from cryptofeed import FeedHandler
-    from cryptofeed.defines import FUNDING, L2_BOOK, LIQUIDATIONS, TICKER, TRADES
-    from cryptofeed.exchanges import BinanceFutures
+def futures_public_ws_url() -> str:
+    """Return the official USD-M public combined stream endpoint for the mode."""
+    mode = os.environ.get("BIAN_MODE", "paper").strip().lower()
+    if mode == "testnet":
+        return FUTURES_TESTNET_PUBLIC_WS
+    return FUTURES_LIVE_PUBLIC_WS
 
-    channels: list[str] = []
-    callbacks: dict[str, Callable[..., Awaitable[None]]] = {}
-    stream_health: dict[str, StreamHealth] = {}
 
-    def monitored(channel: str, target: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
-        health = StreamHealth(connection_attempts=1)
-        stream_health[channel] = health
+def channel_idle_sec(channel: str) -> int:
+    """Per-channel stale budget from SOURCE_REGISTRY, never a local hardcoded map."""
+    from engine import SOURCE_REGISTRY
 
-        async def callback_wrapper(*args: Any, **kwargs: Any) -> None:
-            started = time.monotonic()
-            now = datetime.now(timezone.utc)
-            health.mark_connected(now)
-            try:
-                await target(*args, **kwargs)
-            except Exception as exc:
-                health.mark_disconnected(exc)
-                raise
-            health.mark_message(
-                datetime.now(timezone.utc),
-                int((time.monotonic() - started) * 1000),
+    source = FUTURES_CHANNEL_SOURCES[str(channel).upper()]
+    return int(SOURCE_REGISTRY[source].ttl_sec)
+
+
+def futures_stream_params(
+    channel: str, symbols: list[str] | tuple[str, ...]
+) -> list[str]:
+    suffix = FUTURES_CHANNEL_STREAMS[str(channel).upper()]
+    params: list[str] = []
+    for symbol in symbols:
+        stream_symbol = _storage_symbol(symbol).lower()
+        if stream_symbol and stream_symbol not in {
+            item.split("@", 1)[0] for item in params
+        }:
+            params.append(f"{stream_symbol}@{suffix}")
+    if not params:
+        raise ValueError("at least one Futures public stream symbol is required")
+    return params
+
+
+def _connection_error(exc: Exception) -> Exception:
+    from binance_client import BinanceConnectionError
+
+    if isinstance(exc, BinanceConnectionError):
+        return exc
+    wrapped = BinanceConnectionError(type(exc).__name__)
+    wrapped.__cause__ = exc
+    return wrapped
+
+
+async def _default_futures_websocket_connect(url: str) -> Any:
+    import websockets
+
+    proxy = _http_proxy()
+    kwargs: dict[str, Any] = {
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        "close_timeout": 5,
+        "max_size": 2**23,
+        "max_queue": None,
+        "open_timeout": 10,
+        "compression": None,
+    }
+    sock = None
+    try:
+        if proxy and urlparse(proxy).scheme == "http":
+            parsed_url = urlparse(url)
+            if not parsed_url.hostname:
+                raise OSError("invalid_ws_url")
+            sock = await asyncio.to_thread(
+                _proxy_tunnel_socket,
+                parsed_url.hostname,
+                parsed_url.port or 443,
+                proxy,
             )
+            kwargs["sock"] = sock
+            kwargs["proxy"] = None
+            sock = None
+        else:
+            kwargs["proxy"] = proxy
+        return await websockets.connect(url, **kwargs)
+    except Exception as exc:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise _connection_error(exc)
 
-        return callback_wrapper
 
-    if callback is not None:
-        channels.append(TRADES)
-        callbacks[TRADES] = monitored(TRADES, callback)
-    if ticker_callback is not None:
-        channels.append(TICKER)
-        callbacks[TICKER] = monitored(TICKER, ticker_callback)
-    if book_callback is not None:
-        channels.append(L2_BOOK)
-        callbacks[L2_BOOK] = monitored(L2_BOOK, book_callback)
-    if funding_callback is not None:
-        channels.append(FUNDING)
-        callbacks[FUNDING] = monitored(FUNDING, funding_callback)
-    if liquidation_callback is not None:
-        channels.append(LIQUIDATIONS)
-        callbacks[LIQUIDATIONS] = monitored(LIQUIDATIONS, liquidation_callback)
-    if not channels:
-        raise ValueError("at least one Futures public channel is required")
-    handler = FeedHandler()
-    handler.add_feed(
-        BinanceFutures(
-            symbols=[_futures_feed_symbol(symbol) for symbol in symbols],
-            channels=channels,
-            callbacks=callbacks,
-            retries=_int_env("BIAN_WS_MAX_RECONNECTS", 5, minimum=0),
-            timeout=60,
-            http_proxy=_http_proxy(),
-        )
+def _ws_payload(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _futures_trade_event(payload: dict[str, Any], received_at: datetime) -> dict[str, Any] | None:
+    symbol = _storage_symbol(str(payload.get("s") or ""))
+    trade_id = payload.get("t")
+    price = _decimal(payload.get("p"))
+    quantity = _decimal(payload.get("q"))
+    if not symbol or trade_id in {None, ""} or price is None or quantity is None:
+        return None
+    if price <= 0 or quantity <= 0:
+        return None
+    source_timestamp = _event_datetime(payload.get("T") or payload.get("E") or received_at)
+    buyer_maker = bool(payload.get("m"))
+    return {
+        "symbol": symbol,
+        "event_id": _native_event_id("futures-trade", symbol, trade_id),
+        "event_type": "FUTURES_TRADE",
+        "source": "binance_futures_trade_stream",
+        "market": "FUTURES",
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": str(price),
+        "quantity": str(quantity),
+        "notional": str(price * quantity),
+        "buyer_maker": buyer_maker,
+        "direction": "SELL" if buyer_maker else "BUY",
+        "trade_id": str(trade_id),
+        "metadata": {
+            "health": "LIVE",
+            "health_status": "LIVE",
+            "native_trade_id": str(trade_id),
+        },
+    }
+
+
+def _futures_book_ticker_event(
+    payload: dict[str, Any], received_at: datetime
+) -> dict[str, Any] | None:
+    symbol = _storage_symbol(str(payload.get("s") or ""))
+    bid = _decimal(payload.get("b"))
+    ask = _decimal(payload.get("a"))
+    bid_qty = _decimal(payload.get("B"))
+    ask_qty = _decimal(payload.get("A"))
+    if not symbol or bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    source_timestamp = _event_datetime(payload.get("E") or payload.get("T") or received_at)
+    mid = (bid + ask) / Decimal("2")
+    return {
+        "symbol": symbol,
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:bookticker:{symbol}:{source_timestamp.isoformat()}:{bid}:{ask}",
+        )),
+        "event_type": "BOOK_TICKER",
+        "source": "binance_futures_book_ticker",
+        "market": "FUTURES",
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": str(mid),
+        "quantity": None,
+        "direction": None,
+        "metadata": {
+            "health": "LIVE",
+            "health_status": "LIVE",
+            "bid_price": str(bid),
+            "bid_qty": str(bid_qty) if bid_qty is not None else None,
+            "ask_price": str(ask),
+            "ask_qty": str(ask_qty) if ask_qty is not None else None,
+            "bidPrice": str(bid),
+            "askPrice": str(ask),
+            "spread": str(ask - bid),
+            "spreadBps": str((ask - bid) / mid * Decimal("10000")),
+            "timestamp_semantics": "exchange_event",
+        },
+    }
+
+
+def _futures_mark_price_event(
+    payload: dict[str, Any], received_at: datetime
+) -> dict[str, Any] | None:
+    symbol = _storage_symbol(str(payload.get("s") or ""))
+    mark_price = _decimal(payload.get("p"))
+    if not symbol or mark_price is None or mark_price <= 0:
+        return None
+    source_timestamp = _event_datetime(payload.get("E") or received_at)
+    index_price = _decimal(payload.get("i"))
+    rate = _decimal(payload.get("r"))
+    return {
+        "symbol": symbol,
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:mark-index-funding:{symbol}:{source_timestamp.isoformat()}:{mark_price}",
+        )),
+        "event_type": "MARK_INDEX_FUNDING",
+        "source": "binance_futures_mark_price_stream",
+        "market": "FUTURES",
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": str(mark_price),
+        "quantity": None,
+        "direction": None,
+        "metadata": {
+            "health": "LIVE",
+            "health_status": "LIVE",
+            "markPrice": str(mark_price),
+            "indexPrice": str(index_price) if index_price is not None else None,
+            "lastFundingRate": str(rate) if rate is not None else None,
+            "nextFundingTime": payload.get("T"),
+        },
+    }
+
+
+def _futures_force_order_event(
+    payload: dict[str, Any], received_at: datetime
+) -> dict[str, Any] | None:
+    order = payload.get("o") if isinstance(payload.get("o"), dict) else payload
+    symbol = _storage_symbol(str(order.get("s") or payload.get("s") or ""))
+    price = _decimal(order.get("ap") or order.get("p"))
+    quantity = _decimal(order.get("z") or order.get("q") or order.get("l"))
+    side = str(order.get("S") or "").upper()
+    if not symbol or price is None or quantity is None or price <= 0 or quantity <= 0:
+        return None
+    if side not in {"BUY", "SELL"}:
+        return None
+    source_timestamp = _event_datetime(order.get("T") or payload.get("E") or received_at)
+    native_id = payload.get("E")
+    event_id = _native_event_id(
+        "forceorder",
+        symbol,
+        native_id if native_id not in {None, ""} else source_timestamp.isoformat(),
+        side,
+        quantity,
+        price,
     )
-    handler.bian_stream_health = stream_health
-    return handler
+    return {
+        "symbol": symbol,
+        "event_id": event_id,
+        "event_type": "FORCE_ORDER",
+        "source": "binance_futures_force_order",
+        "market": "FUTURES",
+        "source_timestamp": source_timestamp.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": _latency_ms(source_timestamp, received_at),
+        "price": str(price),
+        "quantity": str(quantity),
+        "notional": str(price * quantity),
+        "direction": side,
+        "metadata": {
+            "health": "LIVE",
+            "health_status": "LIVE",
+            "side_semantics": (
+                "short_liquidation" if side == "BUY" else "long_liquidation"
+            ),
+            "status": str(order.get("X") or ""),
+        },
+    }
+
+
+def liquidation_heartbeat_event(
+    symbol: str,
+    received_at: datetime,
+    *,
+    health: str = "LIVE",
+) -> dict[str, Any]:
+    storage = _storage_symbol(symbol)
+    return {
+        "symbol": storage,
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:liquidation-heartbeat:{storage}:{received_at.isoformat()}",
+        )),
+        "event_type": "LIQUIDATION_HEARTBEAT",
+        "source": "binance_futures_force_order_subscription",
+        "market": "FUTURES",
+        "source_timestamp": received_at.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": 0,
+        "health": health,
+        "metadata": {
+            "observed_liquidation": False,
+            "health": health,
+            "health_status": health,
+            "liveness_source": "FUTURES_LIQUIDATION_LIVENESS",
+        },
+    }
+
+
+def _stale_source_event(
+    channel: str, symbol: str, now: datetime
+) -> dict[str, Any]:
+    event_type = {
+        "TRADE": "FUTURES_TRADE",
+        "BOOK_TICKER": "BOOK_TICKER",
+        "DEPTH": "ORDERBOOK",
+        "MARK_PRICE": "MARK_INDEX_FUNDING",
+        "LIQUIDATION": "LIQUIDATION_HEARTBEAT",
+    }[channel]
+    source = {
+        "TRADE": "binance_futures_trade_stream",
+        "BOOK_TICKER": "binance_futures_book_ticker",
+        "DEPTH": "binance_futures_diff_depth",
+        "MARK_PRICE": "binance_futures_mark_price_stream",
+        "LIQUIDATION": "binance_futures_force_order_subscription",
+    }[channel]
+    storage = _storage_symbol(symbol)
+    return {
+        "symbol": storage,
+        "event_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bian:stale:{channel}:{storage}:{now.isoformat()}",
+        )),
+        "event_type": event_type,
+        "source": source,
+        "market": "FUTURES",
+        "source_timestamp": now.isoformat(),
+        "received_timestamp": now.isoformat(),
+        "latency_ms": 0,
+        "price": None,
+        "quantity": None,
+        "direction": None,
+        "health": "STALE",
+        "metadata": {
+            "health": "STALE",
+            "health_status": "STALE",
+            "state": "STALE" if channel != "DEPTH" else "UNSAFE",
+        },
+    }
+
+
+class FuturesStreamSupervisor:
+    """Single owner for USD-M public websocket sessions and observation persist."""
+
+    def __init__(
+        self,
+        symbols: list[str],
+        *,
+        flush_sec: float,
+        dsn: str | None = None,
+        channels: tuple[str, ...] | None = None,
+        websocket_connect: Callable[[str], Any] | None = None,
+        persist_fn: Callable[..., Any] | None = None,
+        depth_snapshot_fn: Callable[..., dict[str, Any]] | None = None,
+        sleep: Callable[[float], Any] | None = None,
+        now: Callable[[], datetime] | None = None,
+        max_reconnects: int | None = None,
+    ) -> None:
+        if not symbols:
+            raise ValueError("at least one Futures public stream symbol is required")
+        selected = tuple(channels or tuple(FUTURES_CHANNEL_STREAMS))
+        for channel in selected:
+            if channel not in FUTURES_CHANNEL_STREAMS:
+                raise ValueError(f"invalid futures channel: {channel}")
+        self.symbols = tuple(dict.fromkeys(symbols))
+        self.storage_symbols = tuple(
+            dict.fromkeys(_storage_symbol(symbol) for symbol in self.symbols)
+        )
+        self.flush_sec = max(1.0, float(flush_sec))
+        self.dsn = dsn
+        self.sessions = {
+            channel: ChannelSession(channel=channel, symbols=self.symbols)
+            for channel in selected
+        }
+        self._connect = websocket_connect or _default_futures_websocket_connect
+        self._persist = persist_fn or persist
+        self._depth_snapshot = depth_snapshot_fn or (
+            lambda symbol: _depth_snapshot(symbol, market="FUTURES")
+        )
+        self._sleep = sleep or asyncio.sleep
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._max_reconnects = (
+            max_reconnects
+            if max_reconnects is not None
+            else _int_env("BIAN_WS_MAX_RECONNECTS", 5, minimum=0)
+        )
+        self._stopped = False
+        self._request_id = 0
+        self.pending_events: list[dict[str, Any]] = []
+        self.pending_observations: dict[tuple[str, str], dict[str, Any]] = {}
+        self.pending_markets: dict[str, dict[str, Any]] = {}
+        self.local_books: dict[str, LocalOrderBook] = {}
+        self.depth_buffers: dict[str, list[dict[str, Any]]] = {}
+        self._depth_snapshots: dict[str, dict[str, Any]] = {}
+        self._seen_event_ids: set[str] = set()
+        self.global_transport_health = "OK"
+        self._recover_started: dict[str, datetime] = {}
+
+    def start(self) -> None:
+        self._stopped = False
+        for session in self.sessions.values():
+            if session.state == "STOPPED":
+                session.state = "STARTING"
+
+    async def stop(self) -> None:
+        self._stopped = True
+        for session in self.sessions.values():
+            session.state = "STOPPED"
+
+    def channel_health(self) -> dict[str, dict[str, Any]]:
+        return {name: session.as_health() for name, session in self.sessions.items()}
+
+    def transport_health(self) -> dict[str, Any]:
+        sessions = self.channel_health()
+        live = [name for name, row in sessions.items() if row["state"] == "LIVE"]
+        failed = [name for name, row in sessions.items() if row["state"] == "FAILED"]
+        if self.global_transport_health == "HALT":
+            global_health = "HALT"
+        elif failed and not live:
+            global_health = "HALT"
+        elif failed or any(row["state"] == "STALE" for row in sessions.values()):
+            global_health = "DEGRADED"
+        else:
+            global_health = "OK"
+        per_symbol = {
+            symbol: (
+                "FAILED"
+                if failed and not live
+                else "DEGRADED"
+                if any(row["state"] in {"STALE", "RECONNECTING", "FAILED"} for row in sessions.values())
+                else "OK"
+            )
+            for symbol in self.storage_symbols
+        }
+        return {
+            "global_transport_health": global_health,
+            "channel_health": sessions,
+            "per_symbol_transport_health": per_symbol,
+        }
+
+    def build_flush_events(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Heartbeat is unconditional; empty market queues still persist liveness."""
+        now = now or self._now()
+        events = [*self.pending_events, *self.pending_observations.values()]
+        liquidation = self.sessions.get("LIQUIDATION")
+        health = (
+            "LIVE"
+            if liquidation is not None and liquidation.state == "LIVE"
+            else (liquidation.state if liquidation is not None else "LIVE")
+        )
+        reconnects = sum(session.reconnect_count for session in self.sessions.values())
+        for symbol in self.storage_symbols:
+            event = liquidation_heartbeat_event(symbol, now, health=health)
+            event["metadata"]["reconnect_count"] = reconnects
+            event["metadata"]["channel_health"] = self.channel_health()
+            events.append(event)
+        return events
+
+    def _queue(self, event: dict[str, Any] | None, *, snapshot: dict[str, Any] | None = None) -> None:
+        if event is None:
+            return
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            if event_id in self._seen_event_ids:
+                return
+            self._seen_event_ids.add(event_id)
+            if len(self._seen_event_ids) > 20000:
+                self._seen_event_ids = set(list(self._seen_event_ids)[-10000:])
+        health_status = str((event.get("metadata") or {}).get("health_status") or "").upper()
+        if health_status in {"GAP", "UNSAFE", "ERROR", "STALE"}:
+            self.pending_events.append(event)
+        elif event["event_type"] in {"FUTURES_TRADE", "FORCE_ORDER"}:
+            self.pending_events.append(event)
+        else:
+            self.pending_observations[(event["symbol"], event["event_type"])] = event
+        if snapshot is not None:
+            self.pending_markets[snapshot["symbol"]] = snapshot
+
+    def handle_payload(
+        self,
+        channel: str,
+        payload: dict[str, Any],
+        received_at: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions[channel]
+        now = received_at or self._now()
+        try:
+            return self._handle_payload_body(channel, session, payload, now)
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def _handle_payload_body(
+        self,
+        channel: str,
+        session: ChannelSession,
+        payload: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        if channel == "DEPTH":
+            return self._handle_depth(payload, now)
+        if channel == "TRADE":
+            event = _futures_trade_event(payload, now)
+            if event is not None:
+                self._queue(
+                    event,
+                    snapshot={
+                        "symbol": event["symbol"],
+                        "last_price": _decimal(event["price"]),
+                        "price_change_percent": None,
+                        "quote_volume": None,
+                        "payload": event,
+                    },
+                )
+                self._mark_message(session, now, event)
+                return event
+        elif channel == "BOOK_TICKER":
+            event = _futures_book_ticker_event(payload, now)
+        elif channel == "MARK_PRICE":
+            event = _futures_mark_price_event(payload, now)
+        elif channel == "LIQUIDATION":
+            event = _futures_force_order_event(payload, now)
+        else:
+            event = None
+        if event is not None and channel != "TRADE":
+            self._queue(event)
+            self._mark_message(session, now, event)
+        elif event is None and channel == "DEPTH":
+            pass
+        return event
+
+    def inspect_idle(self, now: datetime | None = None) -> list[str]:
+        now = now or self._now()
+        stale: list[str] = []
+        for session in self.sessions.values():
+            if session.channel == "LIQUIDATION":
+                continue
+            if session.state in {"FAILED", "STOPPED", "STALE", "RECONNECTING"}:
+                continue
+            idle = channel_idle_sec(session.channel)
+            anchor = session.last_message_at or session.connected_at
+            if anchor is None:
+                continue
+            if (now - anchor).total_seconds() > idle:
+                self._mark_stale(session, now)
+                stale.append(session.channel)
+        return stale
+
+    def _mark_message(
+        self, session: ChannelSession, now: datetime, event: dict[str, Any]
+    ) -> None:
+        started = self._recover_started.pop(session.channel, None)
+        if session.state in {"STALE", "RECONNECTING", "STARTING"} and started is not None:
+            session.time_to_recover_ms = max(
+                0, int((now - started).total_seconds() * 1000)
+            )
+        session.state = "LIVE"
+        session.subscribed = True
+        session.consecutive_failures = 0
+        session.last_message_at = now
+        session.message_count += 1
+        session.last_event_timestamp = _event_datetime(event["source_timestamp"])
+        session.last_latency_ms = int(event.get("latency_ms") or 0)
+        session.connected_at = session.connected_at or now
+
+    def _mark_stale(self, session: ChannelSession, now: datetime) -> None:
+        session.state = "STALE"
+        session.stale_count += 1
+        session.last_error = "STALE"
+        session.last_error_class = "STALE"
+        session.last_error_at = now
+        self._recover_started.setdefault(session.channel, now)
+        for symbol in self.storage_symbols:
+            self._queue(_stale_source_event(session.channel, symbol, now))
+
+    def _mark_disconnected(self, session: ChannelSession, error: Exception | str) -> None:
+        now = self._now()
+        session.last_disconnect_at = now
+        session.last_error_at = now
+        if isinstance(error, Exception):
+            wrapped = _connection_error(error)
+            session.last_error_class = type(wrapped).__name__
+            session.last_error = session.last_error_class
+        else:
+            session.last_error = str(error)
+            session.last_error_class = str(error)
+        session.consecutive_failures += 1
+        session.subscribed = False
+        self._recover_started.setdefault(session.channel, now)
+
+    def _handle_depth(
+        self, payload: dict[str, Any], received_at: datetime
+    ) -> dict[str, Any] | None:
+        symbol = _storage_symbol(str(payload.get("s") or ""))
+        if not symbol:
+            return None
+        session = self.sessions["DEPTH"]
+        book = self.local_books.get(symbol)
+        buffer = self.depth_buffers.setdefault(symbol, [])
+        if book is None or book.state in {"UNINITIALIZED", "GAP", "UNSAFE", "SYNCING"}:
+            buffer.append(payload)
+            try:
+                snapshot = self._depth_snapshots.get(symbol)
+                if snapshot is None:
+                    snapshot = self._depth_snapshot(symbol)
+                    self._depth_snapshots[symbol] = snapshot
+                book = LocalOrderBook.synchronize(snapshot, list(buffer))
+            except (OrderBookGap, ValueError, RuntimeError, OSError) as exc:
+                self.local_books.pop(symbol, None)
+                self._depth_snapshots.pop(symbol, None)
+                self.depth_buffers[symbol] = buffer[-1000:]
+                event = {
+                    "symbol": symbol,
+                    "event_id": str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"bian:orderbook-health:{symbol}:{received_at.isoformat()}:{type(exc).__name__}",
+                    )),
+                    "event_type": "ORDERBOOK",
+                    "source": "binance_futures_diff_depth",
+                    "market": "FUTURES",
+                    "source_timestamp": received_at.isoformat(),
+                    "received_timestamp": received_at.isoformat(),
+                    "latency_ms": 0,
+                    "price": None,
+                    "quantity": None,
+                    "direction": None,
+                    "metadata": {
+                        "health_status": "UNSAFE",
+                        "state": "GAP" if isinstance(exc, OrderBookGap) else "UNSAFE",
+                        "error_class": type(exc).__name__,
+                        "recovery_attempt": 1,
+                    },
+                }
+                self._queue(event)
+                self._mark_message(session, received_at, event)
+                return event
+            if book.state != "VALID":
+                self.depth_buffers[symbol] = buffer[-1000:]
+                event = {
+                    "symbol": symbol,
+                    "event_id": str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"bian:orderbook-health:{symbol}:{received_at.isoformat()}:SYNCING",
+                    )),
+                    "event_type": "ORDERBOOK",
+                    "source": "binance_futures_diff_depth",
+                    "market": "FUTURES",
+                    "source_timestamp": received_at.isoformat(),
+                    "received_timestamp": received_at.isoformat(),
+                    "latency_ms": 0,
+                    "price": None,
+                    "quantity": None,
+                    "direction": None,
+                    "metadata": {
+                        "health_status": "SYNCING",
+                        "state": "SYNCING",
+                        "buffered_events": len(buffer),
+                    },
+                }
+                self._queue(event)
+                self._mark_message(session, received_at, event)
+                return event
+            self.local_books[symbol] = book
+            self.depth_buffers.pop(symbol, None)
+            self._depth_snapshots.pop(symbol, None)
+            normalized = _orderbook_event(
+                symbol,
+                book,
+                source_timestamp=_event_datetime(payload.get("E", received_at)),
+                received_at=received_at,
+                timestamp_semantics="rest_snapshot_plus_diff",
+                market="FUTURES",
+            )
+            event = None if normalized is None else normalized[1]
+            if event is not None:
+                self._queue(event)
+                self._mark_message(session, received_at, event)
+            return event
+        try:
+            applied = book.apply_diff(payload)
+        except OrderBookGap as exc:
+            book._invalidate(payload, "OrderBookGap")
+            self.local_books.pop(symbol, None)
+            self._depth_snapshots.pop(symbol, None)
+            self.depth_buffers[symbol] = []
+            event = {
+                "symbol": symbol,
+                "event_id": str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"bian:orderbook-health:{symbol}:{received_at.isoformat()}:OrderBookGap",
+                )),
+                "event_type": "ORDERBOOK",
+                "source": "binance_futures_diff_depth",
+                "market": "FUTURES",
+                "source_timestamp": received_at.isoformat(),
+                "received_timestamp": received_at.isoformat(),
+                "latency_ms": 0,
+                "price": None,
+                "quantity": None,
+                "direction": None,
+                "metadata": {
+                    "health_status": "GAP",
+                    "state": "GAP",
+                    "error_class": type(exc).__name__,
+                    "received_U": payload.get("U"),
+                    "received_u": payload.get("u"),
+                },
+            }
+            self._queue(event)
+            self._mark_message(session, received_at, event)
+            return event
+        if not applied:
+            return None
+        normalized = _orderbook_event(
+            symbol,
+            book,
+            source_timestamp=_event_datetime(payload.get("E", received_at)),
+            received_at=received_at,
+            timestamp_semantics="exchange_event",
+            market="FUTURES",
+        )
+        event = None if normalized is None else normalized[1]
+        if event is not None:
+            self._queue(event)
+            self._mark_message(session, received_at, event)
+        return event
+
+    async def _flush_loop(self) -> None:
+        while not self._stopped:
+            await self._sleep(self.flush_sec)
+            await self.flush_once()
+
+    async def flush_once(self) -> None:
+        now = self._now()
+        self.inspect_idle(now)
+        events = self.build_flush_events(now)
+        markets = list(self.pending_markets.values())
+        self.pending_events.clear()
+        self.pending_observations.clear()
+        self.pending_markets.clear()
+        report = _stream_report(markets, market="FUTURES")
+        report["events"] = events
+        report["channel_health"] = self.channel_health()
+        report["transport_health"] = self.transport_health()
+        try:
+            await asyncio.to_thread(self._persist, report, self.dsn)
+            if self.global_transport_health != "HALT":
+                self.global_transport_health = self.transport_health()["global_transport_health"]
+        except Exception as exc:
+            self.global_transport_health = "HALT"
+            LOGGER.exception(
+                "futures stream persistence failed",
+                extra={
+                    "collection_kind": "stream_trade",
+                    "run_id": report["run_id"],
+                    "event_count": len(events),
+                    "error_class": type(exc).__name__,
+                },
+            )
+            try:
+                await asyncio.to_thread(
+                    record_collection_failure,
+                    report["run_id"],
+                    "stream_trade",
+                    _persistence_error_code(exc),
+                    dsn=self.dsn,
+                )
+            except Exception:
+                pass
+            try:
+                from trading_store import TradingStore
+
+                TradingStore(dsn=self.dsn).set_halt(
+                    True,
+                    reason=f"GLOBAL_HALT:{type(exc).__name__}",
+                    source="futures_stream",
+                )
+            except Exception:
+                pass
+
+    async def _run_channel(self, session: ChannelSession) -> None:
+        while not self._stopped and session.state != "STOPPED":
+            session.state = "STARTING" if session.reconnect_count == 0 else "RECONNECTING"
+            session.connection_attempts += 1
+            try:
+                await self._connect_and_consume(session)
+            except asyncio.CancelledError:
+                session.state = "STOPPED"
+                raise
+            except Exception as exc:
+                self._mark_disconnected(session, exc)
+                if session.consecutive_failures > self._max_reconnects:
+                    session.state = "FAILED"
+                    return
+                session.state = "RECONNECTING"
+                session.reconnect_count += 1
+                delay = RECONNECT_BACKOFF_SEC[
+                    min(session.reconnect_count - 1, len(RECONNECT_BACKOFF_SEC) - 1)
+                ]
+                await self._sleep(float(delay))
+
+    async def _connect_and_consume(self, session: ChannelSession) -> None:
+        from binance_client import BinanceConnectionError
+
+        ws = await self._connect(futures_public_ws_url())
+        try:
+            session.connected_at = session.connected_at or self._now()
+            session.proxy_mode = "CONFIGURED" if _http_proxy() else "DIRECT"
+            self._request_id += 1
+            request_id = self._request_id
+            params = futures_stream_params(session.channel, session.symbols)
+            await ws.send(json.dumps({
+                "method": "SUBSCRIBE",
+                "params": params,
+                "id": request_id,
+            }))
+            subscribed = False
+            pre_ack: list[dict[str, Any]] = []
+            deadline = time.monotonic() + 10.0
+            while not subscribed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BinanceConnectionError("subscribe_timeout")
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                payload = _ws_payload(raw)
+                if payload.get("id") == request_id:
+                    if payload.get("error"):
+                        session.state = "FAILED"
+                        raise BinanceConnectionError("subscribe_failed")
+                    subscribed = True
+                    session.subscribed = True
+                    if session.channel == "LIQUIDATION":
+                        session.state = "LIVE"
+                    break
+                if payload.get("data") or payload.get("e"):
+                    pre_ack.append(payload)
+            for payload in pre_ack:
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                if isinstance(data, dict):
+                    self.handle_payload(session.channel, data)
+            if session.channel == "DEPTH":
+                for symbol in self.storage_symbols:
+                    self.depth_buffers.setdefault(symbol, [])
+            while not self._stopped:
+                idle_stale = self.inspect_idle()
+                if session.channel in idle_stale or session.state == "STALE":
+                    raise BinanceConnectionError("channel_stale")
+                timeout = (
+                    5.0
+                    if session.channel == "LIQUIDATION"
+                    else max(1.0, float(channel_idle_sec(session.channel)))
+                )
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if session.channel == "LIQUIDATION":
+                        continue
+                    if session.channel in self.inspect_idle():
+                        raise BinanceConnectionError("channel_stale")
+                    continue
+                payload = _ws_payload(raw)
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                if not isinstance(data, dict):
+                    continue
+                if payload.get("id") is not None and "result" in payload:
+                    continue
+                self.handle_payload(session.channel, data)
+        finally:
+            closer = getattr(ws, "close", None)
+            if closer is not None:
+                try:
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    pass
+
+
+    async def run(self) -> None:
+        self.start()
+        tasks = [
+            asyncio.create_task(self._run_channel(session), name=f"futures-{channel}")
+            for channel, session in self.sessions.items()
+        ]
+        flush_task = asyncio.create_task(self._flush_loop())
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self._stopped = True
+            flush_task.cancel()
+            await asyncio.gather(flush_task, *tasks, return_exceptions=True)
+
+
 
 
 async def _shutdown_feed_handler(handler: Any, loop: asyncio.AbstractEventLoop) -> None:
@@ -2228,6 +3174,13 @@ async def stream(
     market: str = "SPOT",
 ) -> None:
     """Maintain a public ticker stream and persist the latest batch per interval."""
+    if market.upper() == "FUTURES":
+        await FuturesStreamSupervisor(
+            list(symbols),
+            flush_sec=flush_sec,
+            dsn=dsn,
+        ).run()
+        return
     pending: dict[str, dict[str, Any]] = {}
     pending_events: list[dict[str, Any]] = []
     pending_observations: dict[tuple[str, str], dict[str, Any]] = {}
@@ -2348,24 +3301,6 @@ async def stream(
             await asyncio.sleep(flush_sec)
             if not pending_events and not pending_observations:
                 continue
-            if market.upper() == "FUTURES":
-                received_at = datetime.now(timezone.utc)
-                for standard_symbol in symbols:
-                    symbol = _storage_symbol(standard_symbol)
-                    pending_observations[(symbol, "LIQUIDATION_HEARTBEAT")] = {
-                        "symbol": symbol,
-                        "event_id": str(uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"bian:liquidation-heartbeat:{symbol}:{received_at.isoformat()}",
-                        )),
-                        "event_type": "LIQUIDATION_HEARTBEAT",
-                        "source": "binance_futures_force_order_subscription",
-                        "market": "FUTURES",
-                        "source_timestamp": received_at.isoformat(),
-                        "received_timestamp": received_at.isoformat(),
-                        "latency_ms": 0,
-                        "metadata": {"observed_liquidation": False},
-                    }
             markets = list(pending.values())
             events = [*pending_events, *pending_observations.values()]
             pending.clear()
@@ -2395,36 +3330,12 @@ async def stream(
                 except Exception:
                     pass
 
-    if market.upper() == "FUTURES":
-        async def on_funding(funding: Any, receipt_timestamp: float) -> None:
-            normalized = _stream_funding(funding, receipt_timestamp)
-            if normalized is not None:
-                _, event = normalized
-                pending_observations[(event["symbol"], event["event_type"])] = event
-                mark_queued()
-
-        async def on_liquidation(liquidation: Any, receipt_timestamp: float) -> None:
-            normalized = _stream_liquidation(liquidation, receipt_timestamp)
-            if normalized is not None:
-                _, event = normalized
-                pending_events.append(event)
-                mark_queued()
-
-        handler = _build_futures_stream_handler(
-            symbols,
-            on_trade,
-            ticker_callback=on_ticker,
-            book_callback=on_book,
-            funding_callback=on_funding,
-            liquidation_callback=on_liquidation,
-        )
-    else:
-        handler = _build_stream_handler(
-            symbols,
-            on_trade,
-            ticker_callback=on_ticker,
-            book_callback=on_book,
-        )
+    handler = _build_stream_handler(
+        symbols,
+        on_trade,
+        ticker_callback=on_ticker,
+        book_callback=on_book,
+    )
     loop = asyncio.get_running_loop()
     flush_task = asyncio.create_task(flush())
     handler.run(start_loop=False, install_signal_handlers=False)
@@ -2474,62 +3385,12 @@ async def stream_futures_liquidations(
     dsn: str | None = None,
 ) -> None:
     """Persist public Futures liquidations without starting Futures execution."""
-    pending_events: list[dict[str, Any]] = []
-
-    async def on_liquidation(liquidation: Any, receipt_timestamp: float) -> None:
-        normalized = _stream_liquidation(liquidation, receipt_timestamp)
-        if normalized is not None:
-            _, event = normalized
-            pending_events.append(event)
-
-    async def flush() -> None:
-        while True:
-            await asyncio.sleep(flush_sec)
-            if not pending_events:
-                continue
-            events = list(pending_events)
-            pending_events.clear()
-            report = _stream_report([])
-            report["collection_kind"] = "stream_futures_liquidation"
-            report["source_url"] = "wss://fstream.binance.com"
-            report["events"] = events
-            try:
-                await asyncio.to_thread(persist, report, dsn)
-            except Exception as exc:
-                LOGGER.exception(
-                    "futures liquidation persistence failed",
-                    extra={
-                        "collection_kind": "stream_futures_liquidation",
-                        "run_id": report["run_id"],
-                        "event_count": len(events),
-                    },
-                )
-                try:
-                    await asyncio.to_thread(
-                        record_collection_failure,
-                        report["run_id"],
-                        "stream_futures_liquidation",
-                        _persistence_error_code(exc),
-                        dsn=dsn,
-                    )
-                except Exception:
-                    pass
-
-    handler = _build_futures_stream_handler(
-        symbols, liquidation_callback=on_liquidation
-    )
-    loop = asyncio.get_running_loop()
-    flush_task = asyncio.create_task(flush())
-    handler.run(start_loop=False, install_signal_handlers=False)
-    try:
-        await asyncio.Future()
-    finally:
-        flush_task.cancel()
-        try:
-            await flush_task
-        except asyncio.CancelledError:
-            pass
-        await _shutdown_feed_handler(handler, loop)
+    await FuturesStreamSupervisor(
+        list(symbols),
+        flush_sec=flush_sec,
+        dsn=dsn,
+        channels=("LIQUIDATION",),
+    ).run()
 
 
 @dataclass(frozen=True)

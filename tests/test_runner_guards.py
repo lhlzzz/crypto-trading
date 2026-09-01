@@ -467,3 +467,95 @@ def test_shadow_cycle_recovers_the_persisted_predecessor_state() -> None:
     decision = store.snapshots[0][0]
     assert decision.previous_state == "SHORT_COVERING"
     assert decision.transition == "SHORT_COVERING->UNKNOWN"
+
+
+def test_paper_cycle_does_not_call_rest_klines(monkeypatch) -> None:
+    from datetime import datetime, timezone
+    from engine import StrategyEngine, StrategyConfig
+    from risk import FuturesAccountSnapshot
+
+    class Store:
+        def __init__(self):
+            self.events = []
+
+        def latest_market_observation(self, *args, **kwargs):
+            return _frame()
+
+        def latest_positioning_state(self, *args, **kwargs):
+            return None
+
+        def get_active_episode(self, *args, **kwargs):
+            return None
+
+        def record_positioning_snapshot(self, *args, **kwargs):
+            return None
+
+        def record_system_event(self, **payload):
+            self.events.append(payload)
+
+    class UnusedExecutor:
+        def account_snapshot(self):
+            return FuturesAccountSnapshot(
+                mode="paper",
+                wallet_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                total_margin=Decimal("1000"),
+                used_margin=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                positions=(),
+                open_orders=(),
+                leverage={},
+                margin_mode="ISOLATED",
+                position_mode="ONE_WAY",
+                captured_at=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        def submit(self, *args, **kwargs):
+            raise AssertionError("no signal must not submit")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("paper cycle must not fetch REST klines")
+
+    monkeypatch.setattr("scripts.bian_market.get_klines", explode)
+    monkeypatch.setattr("binance_client.FuturesPublicClient.get_klines", explode)
+    result = run_cycle(
+        "BTCUSDT",
+        store=Store(),
+        engine=StrategyEngine(
+            StrategyConfig(
+                positioning_decision_enabled=False,
+                legacy_execution_enabled=False,
+            )
+        ),
+        executor=UnusedExecutor(),
+        mode="paper",
+    )
+    assert result["status"] == "no_signal"
+
+
+def test_paper_cycle_global_halt_when_observation_store_fails() -> None:
+    class Store:
+        def latest_market_observation(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+        def set_halt(self, halted, reason="", source=""):
+            self.reason = reason
+            self.halted = halted
+
+    class UnusedExecutor:
+        def account_snapshot(self):
+            raise AssertionError("global halt must not reach the executor")
+
+        def submit(self, *args, **kwargs):
+            raise AssertionError("global halt must not submit")
+
+    result = run_cycle(
+        "BTCUSDT",
+        store=Store(),
+        executor=UnusedExecutor(),
+        mode="paper",
+    )
+    assert result["status"] == "halted"
+    assert result["reason"].startswith("GLOBAL_HALT")

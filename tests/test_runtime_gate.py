@@ -291,3 +291,15 @@ def test_runtime_gate_rejects_stale_persisted_gate_evidence(monkeypatch) -> None
     assert gate.paper_gate_status == "FAILED"
     assert "PAPER_EVIDENCE_STALE" in gate.reasons
     assert gate.verification_age_sec is not None
+
+
+def test_runtime_gate_exposes_transport_health() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+    )
+    assert gate.global_transport_health in {"OK", "DEGRADED"}
+    assert "BTCUSDT" in gate.per_symbol_source_health
+    assert "FUTURES_DEPTH" in gate.per_symbol_source_health["BTCUSDT"]
+    assert gate.per_symbol_transport_health["BTCUSDT"] in {"OK", "DEGRADED", "FAILED"}

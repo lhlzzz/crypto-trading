@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import subprocess
 import sys
@@ -1011,47 +1012,31 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertEqual(event["metadata"]["side_semantics"], "long_liquidation")
 
     def test_futures_liquidation_stream_is_public_only(self):
-        from cryptofeed.symbols import Symbols
-
-        async def callback(liquidation, receipt_timestamp):
-            del liquidation, receipt_timestamp
-
-        with patch.object(Symbols, "populated", return_value=True), patch.object(
-            Symbols,
-            "get",
-            return_value=({"BTC-USDT-PERP": "BTCUSDT"}, None),
-        ):
-            handler = bian_market._build_futures_stream_handler(["BTC-USDT"], callback)
-        feed = handler.feeds[0]
-        self.assertEqual(feed.id, "BINANCE_FUTURES")
-        self.assertFalse(feed.requires_authentication)
+        params = bian_market.futures_stream_params("LIQUIDATION", ["BTC-USDT"])
+        self.assertEqual(params, ["btcusdt@forceOrder"])
+        self.assertEqual(
+            bian_market.futures_public_ws_url(),
+            bian_market.FUTURES_LIVE_PUBLIC_WS,
+        )
+        self.assertTrue(
+            bian_market.FUTURES_LIVE_PUBLIC_WS.startswith("wss://fstream.binance.com")
+        )
 
     def test_futures_stream_handler_subscribes_to_primary_public_channels(self):
-        from cryptofeed.symbols import Symbols
-
-        async def callback(*args):
-            del args
-
-        with patch.object(Symbols, "populated", return_value=True), patch.object(
-            Symbols,
-            "get",
-            return_value=({"BTC-USDT-PERP": "BTCUSDT"}, None),
-        ):
-            handler = bian_market._build_futures_stream_handler(
-                ["BTC-USDT"],
-                callback,
-                ticker_callback=callback,
-                book_callback=callback,
-                funding_callback=callback,
-                liquidation_callback=callback,
-            )
-
-        subscription = handler.feeds[0].subscription
+        symbols = ["BTC-USDT"]
         self.assertEqual(
-            set(subscription),
-            {"aggTrade", "bookTicker", "depth", "markPrice", "forceOrder"},
+            {
+                channel: bian_market.futures_stream_params(channel, symbols)[0]
+                for channel in bian_market.FUTURES_CHANNEL_STREAMS
+            },
+            {
+                "TRADE": "btcusdt@trade",
+                "BOOK_TICKER": "btcusdt@bookTicker",
+                "DEPTH": "btcusdt@depth",
+                "MARK_PRICE": "btcusdt@markPrice",
+                "LIQUIDATION": "btcusdt@forceOrder",
+            },
         )
-        self.assertTrue(all(value == ["BTCUSDT"] for value in subscription.values()))
 
     def test_futures_perpetual_feed_symbols_keep_rest_storage_symbols(self):
         trade = SimpleNamespace(
@@ -1171,6 +1156,292 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("non-bian service", result.stderr)
+    def test_liquidation_heartbeat_flushes_when_queues_are_empty(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTC-USDT"], flush_sec=1, persist_fn=lambda report, dsn=None: None
+        )
+        supervisor.pending_events = []
+        supervisor.pending_observations = {}
+        supervisor.sessions["LIQUIDATION"].state = "LIVE"
+        events = supervisor.build_flush_events(now)
+        self.assertTrue(events)
+        self.assertEqual(events[0]["event_type"], "LIQUIDATION_HEARTBEAT")
+        self.assertEqual(events[0]["market"], "FUTURES")
+        self.assertEqual(events[0]["health"], "LIVE")
+
+    def test_native_binance_trade_id_is_idempotent(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        payload = {
+            "e": "trade", "E": int(now.timestamp() * 1000),
+            "T": int(now.timestamp() * 1000), "s": "BTCUSDT",
+            "t": 99, "p": "100", "q": "1", "m": False,
+        }
+        first = bian_market._futures_trade_event(payload, now)
+        second = bian_market._futures_trade_event(payload, now)
+        self.assertEqual(first["trade_id"], "99")
+        self.assertEqual(first["event_id"], second["event_id"])
+        other = bian_market._futures_trade_event({**payload, "t": 100}, now)
+        self.assertNotEqual(first["event_id"], other["event_id"])
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTCUSDT"], flush_sec=1, persist_fn=lambda report, dsn=None: None
+        )
+        supervisor.handle_payload("TRADE", payload, now)
+        supervisor.handle_payload("TRADE", payload, now)
+        self.assertEqual(len(supervisor.pending_events), 1)
+
+    def test_channel_stale_is_isolated(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTCUSDT"], flush_sec=1, persist_fn=lambda report, dsn=None: None
+        )
+        supervisor.sessions["TRADE"].state = "LIVE"
+        supervisor.sessions["TRADE"].last_message_at = now - timedelta(seconds=120)
+        supervisor.sessions["BOOK_TICKER"].state = "LIVE"
+        supervisor.sessions["BOOK_TICKER"].last_message_at = now
+        stale = supervisor.inspect_idle(now)
+        self.assertEqual(stale, ["TRADE"])
+        self.assertEqual(supervisor.sessions["TRADE"].state, "STALE")
+        self.assertEqual(supervisor.sessions["BOOK_TICKER"].state, "LIVE")
+
+    def test_depth_failure_does_not_fail_trade_channel(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTCUSDT"],
+            flush_sec=1,
+            persist_fn=lambda report, dsn=None: None,
+            depth_snapshot_fn=lambda symbol: (_ for _ in ()).throw(RuntimeError("rest")),
+        )
+        supervisor.sessions["TRADE"].state = "LIVE"
+        event = supervisor.handle_payload(
+            "DEPTH",
+            {"e": "depthUpdate", "s": "BTCUSDT", "U": 12, "u": 12, "b": [], "a": [], "E": int(now.timestamp()*1000)},
+            now,
+        )
+        self.assertEqual(event["metadata"]["state"], "UNSAFE")
+        self.assertEqual(supervisor.sessions["TRADE"].state, "LIVE")
+
+    def test_stale_channel_recovers_to_live_with_timing(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTCUSDT"], flush_sec=1, persist_fn=lambda report, dsn=None: None
+        )
+        session = supervisor.sessions["TRADE"]
+        session.state = "LIVE"
+        session.last_message_at = now - timedelta(seconds=120)
+        supervisor.inspect_idle(now)
+        self.assertEqual(session.state, "STALE")
+        recovered_at = now + timedelta(milliseconds=40)
+        payload = {
+            "e": "trade", "E": int(recovered_at.timestamp() * 1000),
+            "T": int(recovered_at.timestamp() * 1000), "s": "BTCUSDT",
+            "t": 7, "p": "100", "q": "1", "m": False,
+        }
+        supervisor.handle_payload("TRADE", payload, recovered_at)
+        self.assertEqual(session.state, "LIVE")
+        self.assertEqual(session.time_to_recover_ms, 40)
+
+    def test_reconnect_exhaustion_marks_channel_failed(self):
+        async def scenario() -> None:
+            calls = {"n": 0}
+
+            async def connect(url: str):
+                calls["n"] += 1
+                raise ConnectionError("down")
+
+            supervisor = bian_market.FuturesStreamSupervisor(
+                ["BTCUSDT"],
+                flush_sec=1,
+                persist_fn=lambda report, dsn=None: None,
+                websocket_connect=connect,
+                sleep=lambda delay: asyncio.sleep(0),
+                max_reconnects=2,
+                channels=("TRADE",),
+            )
+            await supervisor._run_channel(supervisor.sessions["TRADE"])
+            self.assertEqual(supervisor.sessions["TRADE"].state, "FAILED")
+            self.assertGreaterEqual(supervisor.sessions["TRADE"].reconnect_count, 2)
+
+        asyncio.run(scenario())
+
+    def test_orderbook_snapshot_buffer_bridge_gap_and_resync(self):
+        now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        snapshots = [
+            {"lastUpdateId": 10, "bids": [["100", "2"]], "asks": [["101", "3"]]},
+            {"lastUpdateId": 14, "bids": [["100", "5"]], "asks": [["101", "3"]]},
+        ]
+
+        def snapshot(symbol: str):
+            return snapshots.pop(0)
+
+        supervisor = bian_market.FuturesStreamSupervisor(
+            ["BTCUSDT"],
+            flush_sec=1,
+            persist_fn=lambda report, dsn=None: None,
+            depth_snapshot_fn=snapshot,
+        )
+        first = {
+            "e": "depthUpdate", "s": "BTCUSDT", "U": 8, "u": 11, "pu": 7,
+            "b": [["100", "4"]], "a": [], "E": int(now.timestamp()*1000),
+        }
+        event = supervisor.handle_payload("DEPTH", first, now)
+        self.assertEqual(supervisor.local_books["BTCUSDT"].state, "VALID")
+        self.assertEqual(event["metadata"]["state"], "VALID")
+        gap = {
+            "e": "depthUpdate", "s": "BTCUSDT", "U": 20, "u": 21, "pu": 15,
+            "b": [["100", "9"]], "a": [], "E": int(now.timestamp()*1000),
+        }
+        gap_event = supervisor.handle_payload("DEPTH", gap, now)
+        self.assertEqual(gap_event["metadata"]["state"], "GAP")
+        self.assertNotIn("BTCUSDT", supervisor.local_books)
+        recovered = {
+            "e": "depthUpdate", "s": "BTCUSDT", "U": 14, "u": 15, "pu": 14,
+            "b": [["100", "6"]], "a": [], "E": int(now.timestamp()*1000),
+        }
+        recovered_event = supervisor.handle_payload("DEPTH", recovered, now)
+        self.assertEqual(supervisor.local_books["BTCUSDT"].state, "VALID")
+        self.assertEqual(recovered_event["metadata"]["state"], "VALID")
+        self.assertIn("spread_bps", supervisor.local_books["BTCUSDT"].features())
+
+    def test_supervisor_connect_subscribe_and_message(self):
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+                self.queue = asyncio.Queue()
+
+            async def send(self, data):
+                self.sent.append(json.loads(data))
+
+            async def recv(self):
+                return await self.queue.get()
+
+            async def close(self):
+                return None
+
+        async def scenario() -> None:
+            socket = FakeWS()
+
+            async def connect(url: str):
+                self.assertEqual(url, bian_market.FUTURES_LIVE_PUBLIC_WS)
+                return socket
+
+            supervisor = bian_market.FuturesStreamSupervisor(
+                ["BTCUSDT"],
+                flush_sec=1,
+                persist_fn=lambda report, dsn=None: None,
+                websocket_connect=connect,
+                channels=("TRADE",),
+                max_reconnects=1,
+            )
+            task = asyncio.create_task(supervisor._connect_and_consume(supervisor.sessions["TRADE"]))
+            await asyncio.sleep(0)
+            while not socket.sent:
+                await asyncio.sleep(0)
+            self.assertEqual(socket.sent[0]["method"], "SUBSCRIBE")
+            await socket.queue.put({"result": None, "id": socket.sent[0]["id"]})
+            now = datetime.now(timezone.utc)
+            await socket.queue.put({
+                "stream": "btcusdt@trade",
+                "data": {
+                    "e": "trade", "E": int(now.timestamp()*1000),
+                    "T": int(now.timestamp()*1000), "s": "BTCUSDT",
+                    "t": 5, "p": "100", "q": "1", "m": False,
+                },
+            })
+            await asyncio.sleep(0.05)
+            self.assertEqual(supervisor.sessions["TRADE"].state, "LIVE")
+            self.assertEqual(supervisor.pending_events[0]["trade_id"], "5")
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    def test_reconnect_success_resets_failures(self):
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+                self.queue = asyncio.Queue()
+
+            async def send(self, data):
+                self.sent.append(json.loads(data))
+
+            async def recv(self):
+                return await self.queue.get()
+
+            async def close(self):
+                return None
+
+        async def scenario() -> None:
+            calls = {"n": 0}
+            socket = FakeWS()
+
+            async def connect(url: str):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise ConnectionError("down")
+                return socket
+
+            supervisor = bian_market.FuturesStreamSupervisor(
+                ["BTCUSDT"],
+                flush_sec=1,
+                persist_fn=lambda report, dsn=None: None,
+                websocket_connect=connect,
+                sleep=lambda delay: asyncio.sleep(0),
+                max_reconnects=3,
+                channels=("TRADE",),
+            )
+            task = asyncio.create_task(supervisor._run_channel(supervisor.sessions["TRADE"]))
+            while not socket.sent:
+                await asyncio.sleep(0)
+            await socket.queue.put({"result": None, "id": socket.sent[0]["id"]})
+            now = datetime.now(timezone.utc)
+            await socket.queue.put({
+                "stream": "btcusdt@trade",
+                "data": {
+                    "e": "trade", "E": int(now.timestamp() * 1000),
+                    "T": int(now.timestamp() * 1000), "s": "BTCUSDT",
+                    "t": 8, "p": "100", "q": "1", "m": False,
+                },
+            })
+            for _ in range(20):
+                if supervisor.sessions["TRADE"].state == "LIVE":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(supervisor.sessions["TRADE"].state, "LIVE")
+            self.assertEqual(supervisor.sessions["TRADE"].consecutive_failures, 0)
+            self.assertGreaterEqual(supervisor.sessions["TRADE"].reconnect_count, 1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    def test_http_proxy_tunnel_sends_connect(self):
+        class FakeSock:
+            def __init__(self):
+                self.sent = b""
+                self.chunks = [b"HTTP/1.1 200 Connection established\r\n\r\n"]
+
+            def sendall(self, data):
+                self.sent += data
+
+            def recv(self, n):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def close(self):
+                return None
+
+        fake = FakeSock()
+        with patch.object(bian_market.socket, "create_connection", return_value=fake):
+            sock = bian_market._proxy_tunnel_socket(
+                "fstream.binance.com", 443, "http://127.0.0.1:7897"
+            )
+        self.assertIs(sock, fake)
+        self.assertIn(b"CONNECT fstream.binance.com:443 HTTP/1.1", fake.sent)
+
+
 
 if __name__ == "__main__":
     unittest.main()

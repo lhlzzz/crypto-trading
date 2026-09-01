@@ -489,10 +489,13 @@ class RiskGate:
             ("RECONCILIATION", context.reconciliation_health),
             ("ACCOUNT", context.account_health),
         ):
-            if str(health).upper() in {"UNKNOWN", "FAILED", "HALT", "BLOCKED"}:
+            status = str(health).upper()
+            if label == "MARKET_DATA" and status in {"FAILED", "HALT", "BLOCKED"}:
+                return self._halt(intent, "GLOBAL_HALT")
+            if status in {"UNKNOWN", "FAILED", "HALT", "BLOCKED"}:
                 return self._halt(intent, f"{label}_HEALTH_UNKNOWN")
         if entry and context.evidence_freshness in {"STALE", "UNSAFE", "MISSING", "UNKNOWN"}:
-            return self._halt(intent, "EVIDENCE_STALE")
+            return self._deny(intent, "EVIDENCE_STALE")
         if entry and not context.account_snapshot.is_fresh(
             now=datetime.now(timezone.utc),
             max_age_sec=_int_env("ACCOUNT_SNAPSHOT_MAX_AGE_SEC", 30),
