@@ -281,6 +281,7 @@ class FuturesAccountSnapshot:
         positions: list[Mapping[str, Any]],
         open_orders: list[Mapping[str, Any]],
         captured_at: datetime,
+        symbol_leverage: Mapping[str, Decimal] | None = None,
     ) -> "FuturesAccountSnapshot":
         leverages = {
             str(row.get("symbol")).upper(): Decimal(str(row["leverage"]))
@@ -314,7 +315,7 @@ class FuturesAccountSnapshot:
             position_mode="ONE_WAY",
             captured_at=captured_at,
             source="paper_executor",
-            symbol_leverage=leverages,
+            symbol_leverage=dict(symbol_leverage or {}),
         )
 
 

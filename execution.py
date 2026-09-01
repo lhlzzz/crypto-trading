@@ -448,11 +448,17 @@ class PaperExecutor(_BaseExecutor):
     def account_snapshot(self) -> FuturesAccountSnapshot:
         account = self.account_state()
         positions = getattr(self.store, "list_positions", lambda: [])()
+        configured = {
+            str(row.get("symbol")).upper(): self.config.default_leverage
+            for row in positions
+            if row.get("symbol")
+        }
         return FuturesAccountSnapshot.from_paper(
             account=account,
             positions=positions,
             open_orders=getattr(self.store, "list_open_local_orders", lambda: [])(),
             captured_at=datetime.now(timezone.utc),
+            symbol_leverage=configured,
         )
 
     def liquidation_price_for(

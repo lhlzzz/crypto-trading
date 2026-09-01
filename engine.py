@@ -704,7 +704,7 @@ class StrategyConfig:
     maximum_crowding: Decimal = Decimal("0.9")
     minimum_liquidity_score: Decimal = Decimal("0.4")
     meme_require_classification: bool = True
-    legacy_execution_enabled: bool = True
+    legacy_execution_enabled: bool = False
     source_ttl_sec: int = 900
     positioning_weights: PositioningWeights = field(default_factory=PositioningWeights)
 
@@ -783,7 +783,7 @@ class Signal:
 
 
 class StrategyEngine:
-    """Single owner for legacy SMA and deterministic positioning decisions."""
+    """Single owner for capital-positioning TradeIntent creation."""
 
     def __init__(self, config: StrategyConfig | None = None) -> None:
         self.config = config or StrategyConfig()
@@ -802,34 +802,11 @@ class StrategyEngine:
         ):
             return None
         if not self.config.positioning_decision_enabled:
-            if not self.config.legacy_execution_enabled:
-                return None
-            return self._legacy_intent(frame, current_position=current)
+            return None
         return self._intent_from_positioning(
             self.positioning_decision(frame),
             frame,
             current_position=current,
-        )
-
-    def _legacy_intent(
-        self,
-        frame: MarketFrame,
-        current_position: CurrentPosition | None = None,
-    ) -> TradeIntent | None:
-        signal = self.signal(frame)
-        if signal is None:
-            return None
-        desired: Direction = "LONG" if signal.side == "BUY" else "SHORT"
-        return self._intent_for_action(
-            symbol=signal.symbol,
-            desired=desired,
-            state="LONG_BUILDING" if desired == "LONG" else "SHORT_BUILDING",
-            frame=frame,
-            current=current_position or CurrentPosition(),
-            confidence=signal.confidence,
-            reason=signal.reason,
-            strategy_version=self.config.strategy_version,
-            created_at=signal.captured_at,
         )
 
     def evaluate_shadow(

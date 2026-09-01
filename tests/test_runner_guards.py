@@ -227,6 +227,111 @@ def test_no_signal_is_recorded_without_lowering_strategy_threshold() -> None:
     assert store.events[-1]["event_type"] == "NO_SIGNAL"
 
 
+def test_disabled_positioning_does_not_open_from_sufficient_evidence() -> None:
+    from datetime import datetime, timezone
+    from engine import SourceFreshness, StrategyConfig, StrategyEngine
+    from risk import FuturesAccountSnapshot
+
+    captured = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    source_timestamps = {
+        source: {
+            "source_timestamp": captured.isoformat(),
+            "received_timestamp": captured.isoformat(),
+            "latency_ms": 0,
+        }
+        for source in (
+            "futures_open_interest",
+            "futures_funding",
+            "futures_trade_flow",
+            "futures_taker_ratio",
+        )
+    }
+    frame = MarketFrame(
+        symbol="BTCUSDT",
+        closes=(Decimal("100"), Decimal("101")),
+        captured_at=captured,
+        futures_trade_flow=Decimal("8"),
+        cvd_change=Decimal("8"),
+        taker_buy_volume=Decimal("10"),
+        taker_sell_volume=Decimal("3"),
+        oi_change=Decimal("0.03"),
+        funding_rate=Decimal("0.0001"),
+        spread_bps=Decimal("2"),
+        depth_25bps=Decimal("100"),
+        market_regime="RISK_ON",
+        meme_risk_tier="TRADEABLE",
+        is_meme=True,
+        freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
+        source_timestamps=source_timestamps,
+    )
+
+    class Store:
+        def __init__(self):
+            self.events = []
+
+        def latest_market_observation(self, *args, **kwargs):
+            return frame
+
+        def latest_positioning_state(self, *args, **kwargs):
+            return None
+
+        def get_active_episode(self, *args, **kwargs):
+            return None
+
+        def start_episode(self, **kwargs):
+            return {
+                "episode_id": "00000000-0000-0000-0000-000000000001",
+                "direction": kwargs["direction"],
+                "status": "OPEN",
+                "started_at": captured,
+            }
+
+        def record_positioning_snapshot(self, *args, **kwargs):
+            return None
+
+        def record_system_event(self, **fields):
+            self.events.append(fields)
+
+    class UnusedExecutor:
+        def account_snapshot(self):
+            return FuturesAccountSnapshot(
+                mode="paper",
+                wallet_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                total_margin=Decimal("1000"),
+                used_margin=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                positions=(),
+                open_orders=(),
+                leverage={},
+                margin_mode="ISOLATED",
+                position_mode="ONE_WAY",
+                captured_at=captured,
+                source="test",
+            )
+
+        def submit(self, *args, **kwargs):
+            raise AssertionError("disabled positioning must not submit")
+
+    store = Store()
+    result = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=StrategyEngine(
+            StrategyConfig(
+                positioning_decision_enabled=False,
+                legacy_execution_enabled=True,
+            )
+        ),
+        executor=UnusedExecutor(),
+        mode="paper",
+    )
+
+    assert result["status"] == "no_signal"
+    assert store.events[-1]["event_type"] == "NO_SIGNAL"
+
+
 def test_persisted_episode_survives_restart_and_unresolved_states() -> None:
     from dataclasses import replace
     from datetime import datetime, timezone

@@ -551,11 +551,13 @@ def run_cycle(
         reason = f"ACCOUNT_UNAVAILABLE: {type(exc).__name__}"
         store.set_halt(True, reason=reason, source="paper_runner")
         return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
-    intent = injected_intent or engine._intent_from_positioning(
-        positioning,
-        frame,
-        current_position=current,
-    )
+    intent = injected_intent
+    if intent is None and engine.config.positioning_decision_enabled:
+        intent = engine._intent_from_positioning(
+            positioning,
+            frame,
+            current_position=current,
+        )
     if intent is None:
         if isinstance(executor, PaperExecutor):
             if market.settlement_timestamp is not None:

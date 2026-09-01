@@ -86,6 +86,13 @@ class MemoryStore:
                 return position
         return None
 
+    def list_positions(self, *, market: str = "FUTURES"):
+        del market
+        latest: dict[str, dict[str, object]] = {}
+        for position in self.positions:
+            latest[str(position["symbol"])] = position
+        return list(latest.values())
+
     def upsert_balance(self, asset: str, **fields: object) -> None:
         self.balances[asset] = {"asset": asset, **fields}
 
@@ -250,6 +257,28 @@ def test_paper_account_snapshot_uses_shared_contract() -> None:
     assert snapshot.margin_mode == "ISOLATED"
     assert snapshot.position_mode == "ONE_WAY"
     assert snapshot.fresh is True
+    assert snapshot.symbol_leverage == {}
+    assert snapshot.leverage == {}
+
+
+def test_paper_account_snapshot_separates_configured_and_position_leverage() -> None:
+    store = MemoryStore()
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(
+            mode="paper",
+            fee_rate=Decimal("0"),
+            slippage_bps=Decimal("0"),
+            default_leverage=Decimal("1"),
+        ),
+    )
+    intent = _intent(leverage=Decimal("2"))
+    executor.submit(intent, _risk(intent), market=_market())
+
+    snapshot = executor.account_snapshot()
+
+    assert snapshot.leverage["BTCUSDT"] == Decimal("2")
+    assert snapshot.symbol_leverage["BTCUSDT"] == Decimal("1")
 
 
 def test_paper_open_and_close_long() -> None:

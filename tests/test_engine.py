@@ -30,24 +30,25 @@ def test_engine_returns_no_intent_until_slow_window_is_ready() -> None:
     assert engine.evaluate(_frame(["1", "2", "3", "4"])) is None
 
 
-def test_engine_creates_buy_intent_without_execution_dependencies() -> None:
+def test_research_sma_signal_does_not_create_a_production_intent() -> None:
     engine = StrategyEngine(
         StrategyConfig(
             fast_window=3,
             slow_window=5,
             minimum_confidence=Decimal("0.5"),
             order_quote_usdt=Decimal("25"),
+            positioning_decision_enabled=False,
+            legacy_execution_enabled=True,
         )
     )
-    intent = engine.evaluate(_frame(["1", "1", "1", "1", "1", "2", "3"]))
+    frame = _frame(["1", "1", "1", "1", "1", "2", "3"])
+    signal = engine.signal(frame)
 
-    assert intent is not None
-    assert intent.direction == "LONG"
-    assert intent.action == "OPEN"
-    assert intent.reduce_only is False
-    assert intent.order_type == "MARKET"
-    assert intent.quantity > 0
-    assert intent.strategy_version == "momentum-sma-1"
+    assert signal is not None
+    assert signal.side == "BUY"
+    assert "SMA" in signal.reason
+    assert engine.evaluate(frame) is None
+    assert not hasattr(engine, "_legacy_intent")
 
 
 def test_engine_does_not_create_intent_without_tradeable_meme_evidence() -> None:
