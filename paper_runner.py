@@ -14,7 +14,14 @@ from typing import Any
 from uuid import UUID
 
 from backtesting import replay_positioning_frames
-from engine import CurrentPosition, MarketFrame, PositioningDecision, StrategyConfig, StrategyEngine
+from engine import (
+    CurrentEpisode,
+    CurrentPosition,
+    MarketFrame,
+    PositioningDecision,
+    StrategyConfig,
+    StrategyEngine,
+)
 from binance_client import ClientConfig, FuturesPublicClient
 from execution import (
     BinanceExecutor,
@@ -26,8 +33,7 @@ from execution import (
 )
 from reconciliation import Reconciler, apply_user_stream_event
 from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate, RiskLimits
-from runtime_gate import GateResult, evaluate_runtime_gate, max_data_age_sec
-from scripts import bian_market
+from runtime_gate import GateResult, evaluate_runtime_gate
 from trade_intent import TradeIntent
 from trading_store import TradingStore
 
@@ -140,10 +146,12 @@ def _record_shadow(
     previous_state = store.latest_positioning_state(
         frame.symbol, before=frame.captured_at
     )
+    current_episode = _current_episode(store, frame.symbol, engine)
     positioning = engine.positioning_decision(
         frame,
         now=frame.captured_at,
         previous_state=previous_state,
+        current_episode=current_episode,
     )
     positioning = _with_persisted_episode(positioning, store=store, engine=engine)
     store.record_positioning_snapshot(
@@ -154,13 +162,13 @@ def _record_shadow(
     store.record_system_event(
         event_type="POSITIONING_SHADOW_DECISION",
         severity="INFO",
-        message="legacy and positioning decisions compared",
+        message="positioning shadow decision recorded",
         payload={
             "symbol": frame.symbol,
-            "legacy_decision": shadow["legacy_decision"],
+            "action": shadow["action"],
+            "direction": shadow["direction"],
+            "state": shadow["state"],
             "positioning_decision": positioning.as_dict(),
-            "agreement": shadow["agreement"],
-            "why_different": shadow["why_different"],
         },
     )
     return positioning, shadow
@@ -181,6 +189,28 @@ def _episode_timestamp(row: dict[str, Any], field: str) -> datetime:
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _current_episode(
+    store: TradingStore,
+    symbol: str,
+    engine: StrategyEngine,
+) -> CurrentEpisode:
+    getter = getattr(store, "get_active_episode", None)
+    active = getter(symbol) if callable(getter) else None
+    if not active:
+        return CurrentEpisode(symbol=symbol.upper())
+    state = str(active.get("state") or "")
+    started = active.get("started_at")
+    ended = active.get("ended_at")
+    return CurrentEpisode(
+        episode_id=_episode_uuid(active),
+        symbol=str(active.get("symbol") or symbol).upper(),
+        direction=active.get("direction") or "FLAT",
+        status=engine.episode_status(state) if state else "FLAT",
+        started_at=_episode_timestamp(active, "started_at") if started else None,
+        ended_at=_episode_timestamp(active, "ended_at") if ended else None,
+    )
 
 
 def _with_persisted_episode(
@@ -297,7 +327,8 @@ def run_shadow_cycle(
         "status": "shadow_recorded",
         "symbol": frame.symbol,
         "captured_at": frame.captured_at.isoformat(),
-        "legacy_decision": shadow["legacy_decision"],
+        "action": shadow["action"],
+        "direction": shadow["direction"],
         "positioning_decision": positioning.direction,
         "positioning_state": positioning.state,
         "evidence_snapshot_id": str(positioning.evidence_snapshot_id),
@@ -320,7 +351,7 @@ def paper_shadow_attribution(
     store.record_system_event(
         event_type="PAPER_SHADOW_ATTRIBUTION",
         severity="INFO",
-        message="positioning, legacy SMA, and momentum attribution calculated",
+        message="positioning attribution calculated",
         payload={"symbol": symbol.upper(), **payload},
     )
     return {"symbol": symbol.upper(), **payload}
@@ -712,7 +743,15 @@ async def _run_private_forever(
                     )
                     print(result, flush=True)
                 except Exception as exc:
-                    print({"status": "cycle_failed", "symbol": symbol, "error": str(exc)}, flush=True)
+                    reason = f"WATCHDOG:engine:{type(exc).__name__}"
+                    store.set_halt(True, reason=reason, source="watchdog")
+                    store.record_system_event(
+                        event_type="RUNTIME_HALT",
+                        severity="CRITICAL",
+                        message=reason,
+                        payload={"symbol": symbol, "error": str(exc)},
+                    )
+                    raise RuntimeError(reason) from exc
             await asyncio.sleep(interval)
     finally:
         stream_task.cancel()
@@ -751,7 +790,15 @@ def run_forever(symbols: list[str], *, mode: str | None = None) -> None:
                         flush=True,
                     )
                 except Exception as exc:
-                    print({"status": "cycle_failed", "symbol": symbol, "error": str(exc)}, flush=True)
+                    reason = f"WATCHDOG:engine:{type(exc).__name__}"
+                    store.set_halt(True, reason=reason, source="watchdog")
+                    store.record_system_event(
+                        event_type="RUNTIME_HALT",
+                        severity="CRITICAL",
+                        message=reason,
+                        payload={"symbol": symbol, "error": str(exc)},
+                    )
+                    raise RuntimeError(reason) from exc
             time.sleep(interval)
         return
     asyncio.run(
@@ -777,10 +824,13 @@ def run_shadow_forever(symbols: list[str]) -> None:
             try:
                 print(run_shadow_cycle(symbol, store=store, engine=engine), flush=True)
             except Exception as exc:
-                print(
-                    {"status": "shadow_cycle_failed", "symbol": symbol, "error": str(exc)},
-                    flush=True,
+                store.record_system_event(
+                    event_type="SHADOW_CYCLE_FAILED",
+                    severity="CRITICAL",
+                    message=f"WATCHDOG:shadow:{type(exc).__name__}",
+                    payload={"symbol": symbol, "error": str(exc)},
                 )
+                raise
         time.sleep(interval)
 
 

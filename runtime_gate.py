@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 import os
 
 from binance_client import ClientConfig
-from engine import runtime_required_sources, validate_source_timestamps
+from engine import ObservationFreshnessPolicy, runtime_required_sources, validate_source_timestamps
 from risk import FuturesAccountSnapshot, RiskLimits
 
 
@@ -56,7 +56,13 @@ def gate_evidence_max_age_sec() -> int:
 
 
 _GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
-_EXTERNAL_GATES = ("observation", "paper", "shadow", "testnet")
+_RUNTIME_GATES = (
+    "realtime_30m",
+    "realtime_2h",
+    "realtime_6h",
+    "realtime_24h",
+)
+_EXTERNAL_GATES = ("observation", "paper", "shadow", "testnet", *_RUNTIME_GATES)
 REQUIRED_FUTURES_SOURCES = runtime_required_sources()
 _REALTIME_FUTURES_SOURCES = frozenset(
     {
@@ -126,6 +132,7 @@ def _data_health_report(
         if str(symbol).strip()
     }
     max_latency_ms = int(os.environ.get("MAX_DATA_LATENCY_MS", "2000"))
+    policy = ObservationFreshnessPolicy.from_env()
     for source in sorted(REQUIRED_FUTURES_SOURCES):
         source_rows = [
             row for row in rows
@@ -169,7 +176,7 @@ def _data_health_report(
                         "source_timestamp": row.get("source_timestamp"),
                         "received_timestamp": row.get("received_timestamp"),
                         "latency_ms": row.get("latency_ms"),
-                        "max_age_sec": max_age_sec,
+                        "max_age_sec": policy.max_age_for(source),
                     }
                 },
                 now,
@@ -234,6 +241,11 @@ class GateResult:
     current_reconciliation: str = "BLOCKED"
     current_orderbook: str = "UNKNOWN"
     current_user_stream: str = "UNKNOWN"
+    realtime_30m_status: str = "NOT_STARTED"
+    realtime_2h_status: str = "NOT_STARTED"
+    realtime_6h_status: str = "NOT_STARTED"
+    realtime_24h_status: str = "NOT_STARTED"
+    code_ready: bool = True
 
     @property
     def trading_enabled(self) -> bool:
@@ -343,13 +355,31 @@ class GateResult:
             "current_user_stream": self.current_user_stream,
             "live_allowed": self.live_allowed,
             "CODE_READY": True,
-            "REAL_DATA_READY": self.observation_gate_status == "PASSED",
+            "CODE_PASS": True,
+            "ORDERBOOK_CODE_PASS": True,
+            "ORDERBOOK_RUNTIME_PASS": self.current_orderbook == "OK",
+            "REAL_DATA_READY": self.realtime_24h_status == "PASSED",
             "PAPER_READY": self.paper_ready,
             "SHADOW_READY": self.shadow_gate_status == "PASSED",
             "TESTNET_READY": self.testnet_ready,
             "ALPHA_STATUS": self.alpha_gate_status,
+            "ALPHA_READY": self.alpha_gate_status == "ALPHA_SUPPORTED",
             "LIVE_PREFLIGHT": self.live_ready,
             "LIVE_ALLOWED": self.live_allowed,
+            "MARKET_HEALTH": self.current_data_health,
+            "OBSERVATION_HEALTH": self.observation_gate_status,
+            "EVIDENCE_HEALTH": self.current_data_health,
+            "ACCOUNT_HEALTH": self.current_account_health,
+            "RECONCILIATION_HEALTH": self.current_reconciliation,
+            "USER_STREAM_HEALTH": self.current_user_stream,
+            "RISK_HEALTH": self.risk_status,
+            "PAPER_HEALTH": self.paper_gate_status,
+            "TESTNET_HEALTH": self.testnet_gate_status,
+            "ALPHA_HEALTH": self.alpha_gate_status,
+            "realtime_30m_status": self.realtime_30m_status,
+            "realtime_2h_status": self.realtime_2h_status,
+            "realtime_6h_status": self.realtime_6h_status,
+            "realtime_24h_status": self.realtime_24h_status,
             "orderbook_health": self.current_orderbook,
             "account_health": self.current_account_health,
             "user_stream": self.current_user_stream,
@@ -609,6 +639,21 @@ def evaluate_runtime_gate(
     paper_gate_status = statuses["paper"]
     shadow_gate_status = statuses["shadow"]
     testnet_gate_status = statuses["testnet"]
+    realtime_30m_status = statuses["realtime_30m"]
+    realtime_2h_status = statuses["realtime_2h"]
+    realtime_6h_status = statuses["realtime_6h"]
+    realtime_24h_status = statuses["realtime_24h"]
+    for prior, current in (
+        ("realtime_30m", "realtime_2h"),
+        ("realtime_2h", "realtime_6h"),
+        ("realtime_6h", "realtime_24h"),
+    ):
+        if statuses[current] == "PASSED" and statuses[prior] != "PASSED":
+            statuses[current] = "FAILED"
+            reasons.append(f"{current.upper()}_SKIPPED_LADDER")
+    realtime_2h_status = statuses["realtime_2h"]
+    realtime_6h_status = statuses["realtime_6h"]
+    realtime_24h_status = statuses["realtime_24h"]
     observation_gates_ok = (
         observation_gate_status == "PASSED" and shadow_gate_status == "PASSED"
     )
@@ -654,6 +699,7 @@ def evaluate_runtime_gate(
             meme_ready,
             live_trading_enabled,
             confirmation_ok,
+            realtime_24h_status == "PASSED",
         )
     )
     if resolved_mode in {"testnet", "live"} and not testnet_lifecycle_ok:
@@ -732,4 +778,15 @@ def evaluate_runtime_gate(
         current_reconciliation="OK" if reconciliation_ok else "BLOCKED",
         current_orderbook=current_orderbook,
         current_user_stream=current_user_stream,
+        realtime_30m_status=realtime_30m_status,
+        realtime_2h_status=realtime_2h_status,
+        realtime_6h_status=realtime_6h_status,
+        realtime_24h_status=realtime_24h_status,
+        code_ready=True,
     )
+
+
+class RuntimeGate:
+    """Single production readiness owner."""
+
+    evaluate = staticmethod(evaluate_runtime_gate)

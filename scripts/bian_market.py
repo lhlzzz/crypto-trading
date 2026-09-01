@@ -123,6 +123,14 @@ def _get_http_opener() -> Any:
     return _HTTP_OPENER
 
 
+def reset_http_opener() -> Any:
+    """Drop cached REST opener after SSL/connection reset."""
+    global _HTTP_OPENER, _HTTP_OPENER_PROXY
+    _HTTP_OPENER = None
+    _HTTP_OPENER_PROXY = None
+    return _get_http_opener()
+
+
 def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         value = int(os.environ.get(name, default))
@@ -161,58 +169,28 @@ def _get_json(
     max_backoff_sec = _float_env(
         "BIAN_HTTP_MAX_BACKOFF_SEC", 8.0, minimum=0.0
     )
-    last_error: Exception | None = None
-    opener = _get_http_opener()
     parsed = urlparse(url)
     operation = parsed.path.rsplit("/", 1)[-1] or "request"
-    host = parsed.netloc or "unknown"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+    )
+    from binance_client import BinanceError, execute_rest_request
 
-    for attempt in range(attempts):
-        started = time.monotonic()
-        request = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+    try:
+        return execute_rest_request(
+            _get_http_opener(),
+            request,
+            operation=operation,
+            attempts=attempts,
+            timeout_sec=timeout_sec,
+            backoff_sec=backoff_sec,
+            max_backoff_sec=max_backoff_sec,
+            logger=LOGGER,
+            on_connection_error=reset_http_opener,
         )
-        try:
-            with opener.open(request, timeout=timeout_sec) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            error_class = type(exc).__name__
-            last_error = RuntimeError(f"HTTP {exc.code} from {url}")
-            retry_after = exc.headers.get("Retry-After")
-            retryable = exc.code == 429 or 500 <= exc.code < 600
-            if retry_after and retry_after.isdecimal():
-                delay = min(float(retry_after), max_backoff_sec)
-            else:
-                delay = min(backoff_sec * (2**attempt), max_backoff_sec)
-            if not retryable:
-                delay = 0.0
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            error_class = type(exc).__name__
-            last_error = RuntimeError(f"request failed for {url}: {exc}")
-            retryable = isinstance(exc, OSError)
-            delay = min(backoff_sec * (2**attempt), max_backoff_sec)
-
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        LOGGER.warning(
-            "public REST request failed",
-            extra={
-                "operation": operation,
-                "host": host,
-                "attempt": attempt + 1,
-                "error_class": error_class,
-                "retryable": retryable,
-                "elapsed_ms": elapsed_ms,
-            },
-        )
-
-        if attempt + 1 < attempts and retryable and delay:
-            jitter = random.uniform(0.0, min(0.1, max_backoff_sec))
-            time.sleep(min(delay + jitter, max_backoff_sec))
-        elif not retryable:
-            break
-
-    raise last_error or RuntimeError(f"request failed for {url}")
+    except BinanceError as exc:
+        raise RuntimeError(f"request failed for {url}: {exc}") from exc
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -314,6 +292,8 @@ class TradeFlowAggregate:
     buy_notional: Decimal = Decimal("0")
     sell_notional: Decimal = Decimal("0")
     delta_notional: Decimal = Decimal("0")
+    trade_count: int = 0
+    bucket: str = "all"
 
     @property
     def net_flow(self) -> Decimal:
@@ -333,11 +313,13 @@ def aggregate_trade_flow(
     sell = Decimal("0")
     buy_notional = Decimal("0")
     sell_notional = Decimal("0")
+    trade_count = 0
     for event in sorted(events, key=lambda item: _event_datetime(item["event_timestamp"])):
         event_time = _event_datetime(event["event_timestamp"])
         received_time = _event_datetime(event.get("received_timestamp", event_time))
         if cutoff is not None and (event_time > cutoff or received_time > cutoff):
             continue
+        trade_count += 1
         quantity = _decimal(event.get("quantity")) or Decimal("0")
         notional = _event_notional(event)
         metadata = event.get("metadata") or {}
@@ -359,10 +341,12 @@ def aggregate_trade_flow(
         buy_notional=buy_notional,
         sell_notional=sell_notional,
         delta_notional=buy_notional - sell_notional,
+        trade_count=trade_count,
     )
 
 
 FLOW_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("1s", 1), ("5s", 5), ("15s", 15),
     ("1m", 60), ("3m", 180), ("5m", 300), ("15m", 900), ("30m", 1800), ("1h", 3600),
 )
 NATIVE_FUTURES_PERIODS: tuple[str, ...] = ("5m", "15m", "30m", "1h")
@@ -2249,6 +2233,11 @@ async def stream(
     pending_observations: dict[tuple[str, str], dict[str, Any]] = {}
     local_books: dict[str, LocalOrderBook] = {}
     depth_buffers: dict[str, list[dict[str, Any]]] = {}
+    last_queued = time.monotonic()
+
+    def mark_queued() -> None:
+        nonlocal last_queued
+        last_queued = time.monotonic()
 
     async def on_trade(trade: Any, receipt_timestamp: float) -> None:
         normalized = _stream_market(trade, receipt_timestamp, market=market)
@@ -2259,6 +2248,7 @@ async def stream(
         event = snapshot.get("market_data_event")
         if event:
             pending_events.append(event)
+            mark_queued()
 
     async def on_ticker(ticker: Any, receipt_timestamp: float) -> None:
         normalized = _stream_book_ticker(
@@ -2269,6 +2259,8 @@ async def stream(
             _queue_orderbook_observation(
                 pending_events, pending_observations, event
             )
+            mark_queued()
+            mark_queued()
 
     async def on_book(book: Any, receipt_timestamp: float) -> None:
         raw = getattr(book, "raw", None)
@@ -2409,12 +2401,14 @@ async def stream(
             if normalized is not None:
                 _, event = normalized
                 pending_observations[(event["symbol"], event["event_type"])] = event
+                mark_queued()
 
         async def on_liquidation(liquidation: Any, receipt_timestamp: float) -> None:
             normalized = _stream_liquidation(liquidation, receipt_timestamp)
             if normalized is not None:
                 _, event = normalized
                 pending_events.append(event)
+                mark_queued()
 
         handler = _build_futures_stream_handler(
             symbols,
@@ -2435,14 +2429,42 @@ async def stream(
     flush_task = asyncio.create_task(flush())
     handler.run(start_loop=False, install_signal_handlers=False)
     try:
-        await asyncio.Future()
+        idle_sec = _int_env("BIAN_WS_IDLE_RESTART_SEC", 30, minimum=5)
+        started_at = time.monotonic()
+        while True:
+            await asyncio.sleep(min(5.0, float(idle_sec)))
+            health = getattr(handler, "bian_stream_health", None)
+            if not health:
+                if market.upper() != "FUTURES":
+                    continue
+                raise RuntimeError("websocket channels missing")
+            now = datetime.now(timezone.utc)
+            live_channels = [
+                name
+                for name in health
+                if str(name).upper() in {"TRADES", "TICKER", "L2_BOOK"}
+            ]
+            if market.upper() == "FUTURES" and not live_channels:
+                raise RuntimeError("websocket live channels missing")
+            if time.monotonic() - last_queued > idle_sec:
+                if time.monotonic() - started_at < idle_sec * 2:
+                    continue
+                raise RuntimeError("websocket idle:no_queued_events")
     finally:
         flush_task.cancel()
         try:
-            await flush_task
+            await asyncio.wait_for(flush_task, timeout=5.0)
         except asyncio.CancelledError:
             pass
-        await _shutdown_feed_handler(handler, loop)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(_shutdown_feed_handler(handler, loop), timeout=8.0)
+        except Exception:
+            LOGGER.warning(
+                "websocket shutdown failed",
+                extra={"market": market, "error_class": "shutdown_timeout"},
+            )
 
 
 async def stream_futures_liquidations(
@@ -2508,6 +2530,68 @@ async def stream_futures_liquidations(
         except asyncio.CancelledError:
             pass
         await _shutdown_feed_handler(handler, loop)
+
+
+@dataclass(frozen=True)
+class MemeUniverseMember:
+    symbol: str
+    rank: int
+    membership: bool
+    volume: Decimal
+    liquidity: Decimal
+    volatility: Decimal
+    risk_score: Decimal
+
+
+class MemeUniverse:
+    """Single owner for dynamic USD-M meme membership and rank."""
+
+    def rank(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        limit: int = 20,
+    ) -> list[MemeUniverseMember]:
+        scored: list[MemeUniverseMember] = []
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper().replace("-", "")
+            if not symbol.endswith("USDT") or len(symbol) <= 4:
+                continue
+            volume = _decimal(row.get("quoteVolume") or row.get("volume") or 0) or Decimal("0")
+            open_interest = _decimal(row.get("openInterest") or 0) or Decimal("0")
+            spread = _decimal(row.get("spread_bps") or 0) or Decimal("0")
+            change = abs(_decimal(row.get("priceChangePercent") or 0) or Decimal("0"))
+            if volume <= 0:
+                continue
+            liquidity = volume + open_interest
+            volatility = min(Decimal("1"), change / Decimal("20"))
+            crowding = min(Decimal("1"), spread / Decimal("50"))
+            risk_score = min(Decimal("1"), (volatility + crowding) / Decimal("2"))
+            scored.append(
+                MemeUniverseMember(
+                    symbol=symbol,
+                    rank=0,
+                    membership=True,
+                    volume=volume,
+                    liquidity=liquidity,
+                    volatility=volatility,
+                    risk_score=risk_score,
+                )
+            )
+        scored.sort(key=lambda item: item.liquidity, reverse=True)
+        limited = scored[: max(1, min(limit, 100))]
+        return [
+            MemeUniverseMember(
+                symbol=item.symbol,
+                rank=index + 1,
+                membership=True,
+                volume=item.volume,
+                liquidity=item.liquidity,
+                volatility=item.volatility,
+                risk_score=item.risk_score,
+            )
+            for index, item in enumerate(limited)
+        ]
 
 
 def _candidate_stream_symbols(
@@ -2602,7 +2686,13 @@ async def _stop_observation_streams(tasks: list[asyncio.Task[None]]) -> None:
     for task in tasks:
         task.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=15.0,
+            )
+        except Exception:
+            pass
 
 
 async def observe(
@@ -2612,6 +2702,7 @@ async def observe(
     refresh_sec: float,
     flush_sec: float,
     dsn: str | None = None,
+    duration_sec: float | None = None,
 ) -> None:
     """Continuously observe candidates without enabling any trading decision.
 
@@ -2620,17 +2711,67 @@ async def observe(
     only when the selected candidate universe materially changes.
     """
     fallback = list(dict.fromkeys(fallback_symbols))
-    active_symbols: tuple[str, ...] = ()
-    stream_tasks: list[asyncio.Task[None]] = []
+    active_symbols: tuple[str, ...] = tuple(fallback)
+    stream_tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(
+            stream(
+                active_symbols,
+                flush_sec=flush_sec,
+                dsn=dsn,
+                market="FUTURES",
+            )
+        )
+    ]
+    deadline = (
+        None
+        if duration_sec is None
+        else time.monotonic() + max(1.0, float(duration_sec))
+    )
     try:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
-                candidates = await asyncio.to_thread(
-                    collect_positioning_observations,
-                    fallback_symbols=fallback,
-                    candidate_limit=candidate_limit,
-                    dsn=dsn,
+                collect_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        collect_positioning_observations,
+                        fallback_symbols=fallback,
+                        candidate_limit=candidate_limit,
+                        dsn=dsn,
+                    )
                 )
+                candidates: list[str] | None = None
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        collect_task.cancel()
+                        await asyncio.gather(collect_task, return_exceptions=True)
+                        candidates = None
+                        break
+                    streams_failed = any(task.done() for task in stream_tasks)
+                    if streams_failed:
+                        await _stop_observation_streams(stream_tasks)
+                        stream_tasks = [
+                            asyncio.create_task(
+                                stream(
+                                    active_symbols,
+                                    flush_sec=flush_sec,
+                                    dsn=dsn,
+                                    market="FUTURES",
+                                )
+                            )
+                        ]
+                    done, _pending = await asyncio.wait(
+                        {collect_task},
+                        timeout=5.0,
+                    )
+                    if collect_task in done:
+                        try:
+                            candidates = list(collect_task.result())
+                        except Exception:
+                            candidates = list(active_symbols) or fallback
+                        break
+                if candidates is None:
+                    break
             except Exception:
                 # Failure has been persisted with a run ID. Keep existing
                 # streams, or use the operator-provided baseline on startup.
@@ -2651,7 +2792,29 @@ async def observe(
                     ),
                 ]
                 active_symbols = candidate_set
-            await asyncio.sleep(max(1.0, refresh_sec))
+            sleep_for = max(1.0, refresh_sec)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sleep_for = min(sleep_for, remaining)
+            slept = 0.0
+            while slept < sleep_for:
+                if any(task.done() for task in stream_tasks):
+                    await _stop_observation_streams(stream_tasks)
+                    stream_tasks = [
+                        asyncio.create_task(
+                            stream(
+                                active_symbols,
+                                flush_sec=flush_sec,
+                                dsn=dsn,
+                                market="FUTURES",
+                            )
+                        )
+                    ]
+                slice_sec = min(5.0, sleep_for - slept)
+                await asyncio.sleep(slice_sec)
+                slept += slice_sec
     finally:
         await _stop_observation_streams(stream_tasks)
 
@@ -2684,6 +2847,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=_int_env("POSITIONING_OBSERVER_CANDIDATE_LIMIT", 5),
         help="maximum scanner candidates upgraded to continuous positioning observation",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="stop observe after this many seconds; omit to run until interrupted",
     )
     parser.add_argument(
         "--retention-days",
@@ -2746,6 +2915,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_limit=max(1, min(args.observe_candidate_limit, 100)),
                 refresh_sec=max(1.0, args.observe_interval_sec),
                 flush_sec=max(1.0, args.stream_flush_sec),
+                duration_sec=None if args.duration is None else max(1.0, args.duration),
             )
         )
         return 0

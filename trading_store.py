@@ -1898,7 +1898,16 @@ class TradingStore:
         """Persist externally verified readiness evidence for one gate."""
         normalized_gate = gate.strip().lower()
         normalized_status = status.strip().upper()
-        if normalized_gate not in {"observation", "paper", "shadow", "testnet"}:
+        if normalized_gate not in {
+            "observation",
+            "paper",
+            "shadow",
+            "testnet",
+            "realtime_30m",
+            "realtime_2h",
+            "realtime_6h",
+            "realtime_24h",
+        }:
             raise ValueError("unsupported runtime gate")
         if normalized_status not in {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}:
             raise ValueError("unsupported runtime gate status")
@@ -1919,6 +1928,10 @@ class TradingStore:
             "paper": "NOT_STARTED",
             "shadow": "NOT_STARTED",
             "testnet": "NOT_STARTED",
+            "realtime_30m": "NOT_STARTED",
+            "realtime_2h": "NOT_STARTED",
+            "realtime_6h": "NOT_STARTED",
+            "realtime_24h": "NOT_STARTED",
         }
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
@@ -1927,7 +1940,7 @@ class TradingStore:
                     SELECT DISTINCT ON ((payload->>'gate')) payload->>'gate', payload->>'status'
                     FROM system_events
                     WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
-                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet')
+                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet', 'realtime_30m', 'realtime_2h', 'realtime_6h', 'realtime_24h')
                     ORDER BY (payload->>'gate'), event_at DESC
                     """
                 )
@@ -1949,7 +1962,7 @@ class TradingStore:
                            payload->>'gate', payload->>'status', event_at, payload
                     FROM system_events
                     WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
-                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet')
+                      AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet', 'realtime_30m', 'realtime_2h', 'realtime_6h', 'realtime_24h')
                     ORDER BY (payload->>'gate'), event_at DESC
                     """
                 )

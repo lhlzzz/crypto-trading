@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 import hashlib
 import json
+from statistics import fmean
 from typing import Any, Iterable, Mapping
 from uuid import UUID, uuid4
 
@@ -318,11 +319,19 @@ def _metric_from_returns(values: list[Decimal]) -> tuple[Decimal, Decimal, Decim
     )
 
 
-def _direction_from_signal(signal: object | None) -> Direction:
-    side = getattr(signal, "side", None)
-    if side == "BUY":
+def _research_sma_direction(frame: MarketFrame, config: StrategyConfig) -> Direction:
+    """Research-only SMA baseline. Never used as a production owner."""
+    closes = tuple(Decimal(value) for value in frame.closes)
+    if len(closes) < config.slow_window:
+        return "FLAT"
+    if any(value <= 0 for value in closes):
+        return "FLAT"
+    fast = Decimal(str(fmean(closes[-config.fast_window :])))
+    slow = Decimal(str(fmean(closes[-config.slow_window :])))
+    price = closes[-1]
+    if fast > slow and price >= fast:
         return "LONG"
-    if side == "SELL":
+    if fast < slow and price <= fast:
         return "SHORT"
     return "FLAT"
 
@@ -404,7 +413,7 @@ def replay_positioning_frames(
             previous_state=previous_state,
         )
         previous_state = decision.state
-        legacy = _direction_from_signal(replay_engine.signal(frame))
+        legacy = _research_sma_direction(frame, replay_engine.config)
         momentum: Direction = "FLAT"
         if len(frame.closes) >= 2:
             momentum = "LONG" if frame.closes[-1] > frame.closes[-2] else (
@@ -616,10 +625,8 @@ def run_backtest(
     max_exposure = Decimal("0")
 
     for frame in historical_frames:
-        # Keep the baseline strategy observable, but never turn BUY/SELL into
-        # an alternative inventory model for the Futures backtest.
-        if hasattr(strategy, "signal"):
-            strategy.signal(frame)
+        if hasattr(strategy, "evaluate") and not isinstance(strategy, StrategyEngine):
+            strategy.evaluate(frame)
         decision = None
         intent = None
         if isinstance(strategy, StrategyEngine):

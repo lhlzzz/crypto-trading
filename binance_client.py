@@ -6,7 +6,10 @@ import time
 import json
 import hmac
 import hashlib
+import http.client
+import logging
 import random
+import ssl
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -33,6 +36,8 @@ from binance_sdk_spot.rest_api.models import (
     KlinesIntervalEnum,
 )
 from risk import FuturesAccountSnapshot, FuturesRiskRules
+
+LOGGER = logging.getLogger("bian.futures.rest")
 
 
 class BinanceError(Exception):
@@ -193,7 +198,18 @@ def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
         if operation in {"create_order", "cancel_order", "cancel_all_orders"}:
             return BinanceOrderError(f"{operation} rejected: {detail}")
         return BinanceAPIError(f"{operation} failed: {detail}")
-    if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
+    if isinstance(
+        exc,
+        (
+            OSError,
+            TimeoutError,
+            ConnectionError,
+            ssl.SSLError,
+            http.client.RemoteDisconnected,
+            http.client.IncompleteRead,
+            http.client.BadStatusLine,
+        ),
+    ):
         return BinanceConnectionError(f"{operation} connection failure")
     return BinanceAPIError(f"{operation} failed: {exc}")
 
@@ -253,6 +269,137 @@ def _signed_query(secret: str, params: dict[str, Any]) -> str:
     return f"{query}&signature={signature}"
 
 
+def _reset_shared_opener() -> Any:
+    try:
+        from scripts.bian_market import reset_http_opener
+    except Exception:
+        return None
+    reset_http_opener()
+    return _get_http_opener()
+
+
+def _safe_diagnostics(
+    *,
+    endpoint: str,
+    method: str,
+    symbol: str | None,
+    attempt: int,
+    elapsed_ms: int,
+    exception_type: str | None,
+    status_code: int | None,
+    retryable: bool,
+    request_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "endpoint": endpoint,
+        "method": method,
+        "symbol": symbol,
+        "attempt": attempt,
+        "elapsed_ms": elapsed_ms,
+        "exception_type": exception_type,
+        "status_code": status_code,
+        "retryable": retryable,
+        "request_id": request_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def execute_rest_request(
+    opener: Any,
+    request: urllib.request.Request,
+    *,
+    operation: str,
+    attempts: int,
+    timeout_sec: float,
+    backoff_sec: float,
+    max_backoff_sec: float = 8.0,
+    metadata: TransportMetadata | None = None,
+    logger: logging.Logger | None = None,
+    on_connection_error: Callable[[], Any] | None = None,
+    symbol: str | None = None,
+) -> Any:
+    """Single Futures REST retry loop for public and private calls."""
+    logger = logger or LOGGER
+    last_error: Exception | None = None
+    parsed = urllib.parse.urlparse(request.full_url)
+    endpoint = parsed.path or request.full_url
+    host = parsed.netloc or "unknown"
+    method = request.get_method() or "GET"
+    tries = max(1, attempts)
+    current_opener = opener
+    for attempt in range(tries):
+        started = time.monotonic()
+        status_code: int | None = None
+        request_id: str | None = None
+        retryable = False
+        error_class = None
+        try:
+            with current_opener.open(request, timeout=timeout_sec) as response:
+                request_id = response.headers.get("X-MbX-Used-Weight") or response.headers.get(
+                    "x-mbx-used-weight"
+                )
+                payload = json.loads(response.read().decode("utf-8") or "null")
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if metadata is not None:
+                now = datetime.now(timezone.utc)
+                metadata.connected_at = metadata.connected_at or now
+                metadata.last_message_at = now
+                metadata.transport_latency_ms = elapsed_ms
+                metadata.last_error = None
+            return payload
+        except urllib.error.HTTPError as exc:
+            status_code = int(exc.code)
+            request_id = exc.headers.get("x-mbx-used-weight") if exc.headers else None
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            translated = _translate_error(exc, operation=operation)
+            last_error = translated
+            error_class = type(exc).__name__
+            retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
+            if retry_after and str(retry_after).replace(".", "", 1).isdigit():
+                delay = min(float(retry_after), max_backoff_sec)
+            else:
+                delay = min(backoff_sec * (2 ** attempt), max_backoff_sec)
+        except Exception as exc:
+            translated = _translate_error(exc, operation=operation)
+            last_error = translated
+            error_class = type(exc).__name__
+            retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
+            delay = min(backoff_sec * (2 ** attempt), max_backoff_sec)
+            if retryable and on_connection_error is not None:
+                replacement = on_connection_error()
+                if replacement is not None:
+                    current_opener = replacement
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if metadata is not None:
+            metadata.last_error = str(last_error)
+            metadata.last_disconnect_at = datetime.now(timezone.utc)
+        logger.warning(
+            "REST request failed",
+            extra=_safe_diagnostics(
+                endpoint=endpoint,
+                method=method,
+                symbol=symbol,
+                attempt=attempt + 1,
+                elapsed_ms=elapsed_ms,
+                exception_type=error_class,
+                status_code=status_code,
+                retryable=retryable,
+                request_id=request_id,
+            )
+            | {"operation": operation, "host": host, "error_class": error_class},
+        )
+        if attempt + 1 < tries and retryable and delay:
+            if metadata is not None:
+                metadata.reconnect_count += 1
+            jitter = random.uniform(0.0, min(0.1, max_backoff_sec))
+            time.sleep(min(delay + jitter, max_backoff_sec))
+        elif not retryable:
+            break
+    if isinstance(last_error, BinanceError):
+        raise last_error
+    raise BinanceConnectionError(f"{operation} connection failure")
+
+
 def _futures_transport(
     config: ClientConfig,
     method: str,
@@ -277,39 +424,32 @@ def _futures_transport(
         query = urllib.parse.urlencode(
             {key: value for key, value in query_params.items() if value is not None}
         )
-    url = f"{_futures_rest_host(config)}{path}"
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        url = f"{_futures_rest_host(config)}{path}"
     if query:
-        url = f"{url}?{query}"
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{query}"
     request = urllib.request.Request(url, method=method.upper(), headers=headers)
     opener = _get_http_opener()
     metadata = config.transport_metadata
     metadata.proxy_mode = _proxy_mode()
-    for attempt in range(max(0, retries) + 1):
-        started = time.monotonic()
-        try:
-            with opener.open(request, timeout=config.timeout_ms / 1000) as response:
-                payload = json.loads(response.read().decode("utf-8") or "null")
-            now = datetime.now(timezone.utc)
-            metadata.connected_at = metadata.connected_at or now
-            metadata.last_message_at = now
-            metadata.transport_latency_ms = int(
-                (time.monotonic() - started) * 1000
-            )
-            metadata.last_error = None
-            return payload
-        except Exception as exc:
-            translated = _translate_error(exc, operation=operation)
-            metadata.last_error = str(translated)
-            metadata.last_disconnect_at = datetime.now(timezone.utc)
-            retryable = isinstance(translated, (BinanceConnectionError, BinanceRateLimitError))
-            if not retryable or attempt >= retries:
-                raise translated from exc
-            metadata.reconnect_count += 1
-            delay_sec = config.backoff_ms / 1000 * (2 ** attempt)
-            if delay_sec:
-                jitter = random.uniform(0, min(delay_sec * 0.25, 0.1))
-                time.sleep(delay_sec + jitter)
-    raise AssertionError("Futures transport loop must return or raise")
+    symbol = None
+    if query_params.get("symbol"):
+        symbol = str(query_params["symbol"])
+    return execute_rest_request(
+        opener,
+        request,
+        operation=operation,
+        attempts=max(0, retries) + 1,
+        timeout_sec=config.timeout_ms / 1000,
+        backoff_sec=config.backoff_ms / 1000,
+        max_backoff_sec=8.0,
+        metadata=metadata,
+        on_connection_error=_reset_shared_opener,
+        symbol=symbol,
+    )
 
 
 def _futures_signed_request(
@@ -492,25 +632,16 @@ class FuturesPublicClient:
     def _get(self, path: str, **params: Any) -> Any:
         query = urllib.parse.urlencode({key: value for key, value in params.items() if value is not None})
         url = f"{path}?{query}" if query else path
-        request = urllib.request.Request(
-            url, headers={"Accept": "application/json", "User-Agent": "bian-futures-observer/1.0"}
+        parsed = urllib.parse.urlparse(path)
+        operation = parsed.path.rsplit("/", 1)[-1] or "futures_observation"
+        return _futures_transport(
+            self.config,
+            "GET",
+            url,
+            auth="public",
+            retries=self.config.retries,
+            operation=operation,
         )
-        opener = _get_http_opener()
-        for attempt in range(self.config.retries + 1):
-            try:
-                with opener.open(request, timeout=self.config.timeout_ms / 1000) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except Exception as exc:
-                translated = _translate_error(exc, operation="futures_observation")
-                retryable = isinstance(
-                    translated, (BinanceConnectionError, BinanceRateLimitError)
-                )
-                if not retryable or attempt >= self.config.retries:
-                    raise translated from exc
-                delay_sec = self.config.backoff_ms / 1000 * (2**attempt)
-                if delay_sec:
-                    time.sleep(delay_sec)
-        raise AssertionError("Futures public retry loop must return or raise")
 
     def get_mark_price(self, symbol: str) -> dict[str, Any]:
         return self._get(f"{self.base_url}/premiumIndex", symbol=symbol.upper())

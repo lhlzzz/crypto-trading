@@ -52,9 +52,11 @@ def test_futures_public_client_retries_transient_timeout() -> None:
         ClientConfig(mode="paper", retries=1, backoff_ms=25)
     )
 
-    with patch("binance_client.urllib.request.urlopen", side_effect=[
+    with patch("scripts.bian_market.urllib.request.urlopen", side_effect=[
         TimeoutError("timed out"), response,
-    ]) as urlopen, patch("binance_client.time.sleep") as sleep:
+    ]) as urlopen, patch("binance_client.time.sleep") as sleep, patch(
+        "binance_client.random.uniform", return_value=0
+    ):
         payload = client.get_mark_price("BTCUSDT")
 
     assert payload == {"markPrice": "100"}
@@ -262,7 +264,7 @@ def test_private_testnet_create_order_preserves_client_order_id() -> None:
         ClientConfig(mode="testnet", api_key="key", api_secret="secret")
     )
 
-    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen, patch(
+    with patch("scripts.bian_market.urllib.request.urlopen", return_value=response) as urlopen, patch(
         "binance_client.time.time", return_value=1_700_000_000
     ):
         payload = client.create_order(
@@ -306,7 +308,7 @@ def test_create_order_timeout_does_not_resubmit() -> None:
     )
 
     with patch(
-        "binance_client.urllib.request.urlopen",
+        "scripts.bian_market.urllib.request.urlopen",
         side_effect=TimeoutError("timed out"),
     ) as urlopen:
         with pytest.raises(BinanceConnectionError):
@@ -327,7 +329,7 @@ def test_create_order_5xx_does_not_resubmit() -> None:
         fp=io.BytesIO(b"temporarily unavailable"),
     )
 
-    with patch("binance_client.urllib.request.urlopen", side_effect=error) as urlopen:
+    with patch("scripts.bian_market.urllib.request.urlopen", side_effect=error) as urlopen:
         with pytest.raises(BinanceConnectionError):
             client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
 
@@ -343,7 +345,7 @@ def test_unknown_order_can_be_resolved_by_get_order() -> None:
     response.__enter__.return_value = response
 
     with patch(
-        "binance_client.urllib.request.urlopen",
+        "scripts.bian_market.urllib.request.urlopen",
         side_effect=[TimeoutError("timed out"), response],
     ) as urlopen:
         with pytest.raises(BinanceConnectionError):
@@ -372,7 +374,7 @@ def test_create_order_rejected_http_400_is_not_retried() -> None:
         fp=io.BytesIO(b"Filter failure"),
     )
 
-    with patch("binance_client.urllib.request.urlopen", side_effect=error) as urlopen:
+    with patch("scripts.bian_market.urllib.request.urlopen", side_effect=error) as urlopen:
         with pytest.raises(BinanceOrderError):
             client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
 
@@ -397,7 +399,7 @@ def test_listen_key_requests_are_api_key_only(
         ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=0)
     )
 
-    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen, patch(
+    with patch("scripts.bian_market.urllib.request.urlopen", return_value=response) as urlopen, patch(
         "binance_client.time.time", return_value=1_700_000_000
     ):
         result = getattr(client, method)()
@@ -428,7 +430,7 @@ def test_create_order_client_order_id_is_preserved_on_single_attempt() -> None:
         ClientConfig(mode="testnet", api_key="key", api_secret="secret", retries=3)
     )
 
-    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen:
+    with patch("scripts.bian_market.urllib.request.urlopen", return_value=response) as urlopen:
         client.create_order(
             "BTCUSDT", "BUY", "MARKET", quantity="0.01", client_order_id="BIAN-IDEMPOTENT-1"
         )
@@ -451,7 +453,7 @@ def test_order_client_error_is_translated() -> None:
         fp=io.BytesIO(b'{"code":-1111,"msg":"Filter failure"}'),
     )
 
-    with patch("binance_client.urllib.request.urlopen", side_effect=error):
+    with patch("scripts.bian_market.urllib.request.urlopen", side_effect=error):
         with pytest.raises(BinanceOrderError, match="Filter failure"):
             client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
 
@@ -478,7 +480,7 @@ def test_futures_private_live_order_uses_production_host() -> None:
         )
     )
 
-    with patch("binance_client.urllib.request.urlopen", return_value=response) as urlopen:
+    with patch("scripts.bian_market.urllib.request.urlopen", return_value=response) as urlopen:
         client.create_order("BTCUSDT", "SELL", "MARKET", quantity="0.01", reduce_only=True)
 
     request = urlopen.call_args.args[0]

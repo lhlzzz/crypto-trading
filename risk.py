@@ -78,6 +78,8 @@ class RiskLimits:
     max_meme_symbol_notional_usdt: Decimal = Decimal("500")
     max_meme_portfolio_notional_usdt: Decimal = Decimal("500")
     max_directional_meme_exposure_usdt: Decimal = Decimal("500")
+    max_funding_abs: Decimal = Decimal("0.01")
+    max_margin_ratio: Decimal = Decimal("0.8")
 
     @classmethod
     def from_env(cls) -> "RiskLimits":
@@ -391,6 +393,13 @@ class RiskContext:
     confidence_modifier: Decimal = Decimal("1")
     liquidity_modifier: Decimal = Decimal("1")
     crowding_modifier: Decimal = Decimal("1")
+    margin_ratio: Decimal | None = None
+    funding: Decimal | None = None
+    volatility: Decimal | None = None
+    evidence_freshness: str | None = None
+    market_data_health: str = "OK"
+    reconciliation_health: str = "OK"
+    account_health: str = "OK"
 
 
 @dataclass(frozen=True)
@@ -475,6 +484,15 @@ class RiskGate:
             return self._halt(
                 intent, f"INVALID_ACCOUNT_STATE: {context.account_state_error}"
             )
+        for label, health in (
+            ("MARKET_DATA", context.market_data_health),
+            ("RECONCILIATION", context.reconciliation_health),
+            ("ACCOUNT", context.account_health),
+        ):
+            if str(health).upper() in {"UNKNOWN", "FAILED", "HALT", "BLOCKED"}:
+                return self._halt(intent, f"{label}_HEALTH_UNKNOWN")
+        if entry and context.evidence_freshness in {"STALE", "UNSAFE", "MISSING", "UNKNOWN"}:
+            return self._halt(intent, "EVIDENCE_STALE")
         if entry and not context.account_snapshot.is_fresh(
             now=datetime.now(timezone.utc),
             max_age_sec=_int_env("ACCOUNT_SNAPSHOT_MAX_AGE_SEC", 30),
@@ -571,6 +589,8 @@ class RiskGate:
             or context.leverage > self.limits.max_leverage
         ):
             return self._deny(intent, "maximum leverage exceeded")
+        if entry and context.margin_ratio is not None and context.margin_ratio >= self.limits.max_margin_ratio:
+            return self._halt(intent, "margin ratio too high")
         if entry and (
             context.account_leverage is not None
             and intent.leverage != context.account_leverage
@@ -678,6 +698,9 @@ class RiskGate:
         ) or (
             context.regime_risk is not None
             and context.regime_risk >= Decimal("0.8")
+        ) or (
+            context.funding is not None
+            and abs(context.funding) >= self.limits.max_funding_abs
         ):
             reduced_quantity = _floor_step(
                 normalized.quantity / Decimal("2"),

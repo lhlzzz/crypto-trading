@@ -79,12 +79,18 @@ class TradeIntent(BaseModel):
     transition_strength: Decimal | None = Field(default=None, ge=0, le=1)
     reason_codes: tuple[str, ...] = ()
     evidence_snapshot_id: UUID | None = None
+    evidence_id: UUID | None = None
+    episode_id: UUID | None = None
     market_regime: str | None = Field(default=None, max_length=32)
     meme_risk_tier: MemeRiskTier | None = None
     is_meme: bool | None = None
 
     def exchange_side(self) -> ExchangeSide:
         return exchange_side(self.direction, self.action)
+
+    @property
+    def margin_mode(self) -> MarginType:
+        return self.margin_type
 
     @model_validator(mode="after")
     def validate_order_contract(self) -> "TradeIntent":
@@ -115,4 +121,8 @@ class TradeIntent(BaseModel):
                 "client_order_id",
                 _client_order_id(self.id, self.symbol, self.created_at),
             )
+        if self.evidence_id is None and self.evidence_snapshot_id is not None:
+            object.__setattr__(self, "evidence_id", self.evidence_snapshot_id)
+        if self.evidence_snapshot_id is None and self.evidence_id is not None:
+            object.__setattr__(self, "evidence_snapshot_id", self.evidence_id)
         return self

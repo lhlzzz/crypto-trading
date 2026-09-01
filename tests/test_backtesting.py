@@ -41,7 +41,7 @@ def test_backtest_frames_are_timestamp_safe_and_prefix_only() -> None:
     seen: list[tuple[int, Decimal]] = []
 
     class PrefixOnlyStrategy:
-        def signal(self, frame):
+        def evaluate(self, frame):
             seen.append((len(frame.closes), frame.closes[-1]))
             return None
 
@@ -249,3 +249,20 @@ def test_alpha_cost_stress_rejects_strategy(monkeypatch) -> None:
 
     assert result.status == "ALPHA_NOT_SUPPORTED"
     assert result.oos_metrics["cost_stress"]["net_expectancy"] == "-0.01"
+
+
+def test_future_data_injection_does_not_change_replay() -> None:
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    frames = [
+        _positioning_frame(start + timedelta(minutes=index), str(100 + index), str(101 + index))
+        for index in range(8)
+    ]
+    baseline = replay_positioning_frames(frames)
+    future = _positioning_frame(start + timedelta(days=1), "200", "201")
+    injected = replay_positioning_frames([*frames, future])
+    assert [record.positioning.direction for record in baseline.records] == [
+        record.positioning.direction for record in injected.records[:-1]
+    ]
+    assert [record.positioning.state for record in baseline.records] == [
+        record.positioning.state for record in injected.records[:-1]
+    ]

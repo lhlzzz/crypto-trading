@@ -42,13 +42,13 @@ def test_research_sma_signal_does_not_create_a_production_intent() -> None:
         )
     )
     frame = _frame(["1", "1", "1", "1", "1", "2", "3"])
-    signal = engine.signal(frame)
+    source = open("engine.py", encoding="utf-8").read()
 
-    assert signal is not None
-    assert signal.side == "BUY"
-    assert "SMA" in signal.reason
+    assert "def signal(" not in source
+    assert "fast SMA" not in source
     assert engine.evaluate(frame) is None
     assert not hasattr(engine, "_legacy_intent")
+    assert not hasattr(engine, "signal")
 
 
 def test_engine_does_not_create_intent_without_tradeable_meme_evidence() -> None:

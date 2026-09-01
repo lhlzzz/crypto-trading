@@ -61,4 +61,14 @@ fi
 
 export BIAN_LIVE_CONFIRMATION="$confirmation"
 cd "$script_dir"
+if ! "$python_bin" - <<'PY'
+from runtime_gate import evaluate_runtime_gate
+result = evaluate_runtime_gate(mode="live", probe_account=True)
+print(result.as_dict())
+raise SystemExit(0 if result.live_allowed else 1)
+PY
+then
+  echo "LIVE HARD BLOCK: runtime preflight failed" >&2
+  exit 1
+fi
 exec "$python_bin" paper_runner.py --mode live "$@"

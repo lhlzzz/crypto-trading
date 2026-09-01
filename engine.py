@@ -1,7 +1,9 @@
-"""Pure legacy and capital-positioning decision core for bian.
+"""Pure capital-positioning decision engine for bian.
 
-The engine consumes normalized observations only. It never parses exchange
-payloads, calls a broker, evaluates risk, or writes to storage.
+The engine consumes PositioningEvidence / MarketFrame only. It never parses
+exchange payloads, calls a broker, evaluates risk, or writes to storage.
+Strategy semantics are LONG/SHORT/FLAT with OPEN/HOLD/REDUCE/CLOSE. BUY/SELL
+belongs to the Futures adapter, not this owner.
 """
 from __future__ import annotations
 
@@ -9,7 +11,6 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from statistics import fmean
 from typing import Any, Literal, Mapping
 from uuid import UUID, NAMESPACE_URL, uuid5
 
@@ -22,7 +23,7 @@ PositioningState = Literal[
     "CONFLICTED", "UNKNOWN",
 ]
 Direction = Literal["LONG", "SHORT", "FLAT"]
-Action = Literal["OPEN", "REDUCE", "CLOSE"]
+Action = Literal["OPEN", "HOLD", "REDUCE", "CLOSE"]
 MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
 EvidenceStatus = Literal[
     "REQUIRED", "AVAILABLE", "STALE", "UNSAFE", "MISSING", "CONFLICTING"
@@ -350,6 +351,57 @@ def validate_source_timestamps(
 
 
 @dataclass(frozen=True)
+class ObservationFreshnessPolicy:
+    """Single stale budget owner for every observation type."""
+
+    trade_max_age_sec: int = 5
+    book_max_age_sec: int = 5
+    mark_max_age_sec: int = 5
+    oi_max_age_sec: int = 30
+    funding_max_age_sec: int = 3600
+    liquidation_max_age_sec: int = 30
+    ticker_max_age_sec: int = 5
+
+    @classmethod
+    def from_env(cls) -> "ObservationFreshnessPolicy":
+        import os
+
+        def age(name: str, default: int) -> int:
+            try:
+                return max(1, int(os.environ.get(name, default)))
+            except ValueError:
+                return default
+
+        return cls(
+            trade_max_age_sec=age("FRESHNESS_TRADE_MAX_AGE_SEC", 5),
+            book_max_age_sec=age("FRESHNESS_BOOK_MAX_AGE_SEC", 5),
+            mark_max_age_sec=age("FRESHNESS_MARK_MAX_AGE_SEC", 5),
+            oi_max_age_sec=age("FRESHNESS_OI_MAX_AGE_SEC", 30),
+            funding_max_age_sec=age("FRESHNESS_FUNDING_MAX_AGE_SEC", 3600),
+            liquidation_max_age_sec=age("FRESHNESS_LIQUIDATION_MAX_AGE_SEC", 30),
+            ticker_max_age_sec=age("FRESHNESS_TICKER_MAX_AGE_SEC", 5),
+        )
+
+    def max_age_for(self, source: str) -> int:
+        name = str(source).upper()
+        if "TRADE" in name and "LIQUIDATION" not in name:
+            return self.trade_max_age_sec
+        if "DEPTH" in name or "BOOK" in name or "ORDERBOOK" in name:
+            return self.book_max_age_sec
+        if "MARK" in name or "INDEX" in name:
+            return self.mark_max_age_sec
+        if name.endswith("_OI") or name.endswith("OPEN_INTEREST") or "OI" == name or "FUTURES_OI" in name:
+            return self.oi_max_age_sec
+        if "FUNDING" in name:
+            return self.funding_max_age_sec
+        if "LIQUIDATION" in name:
+            return self.liquidation_max_age_sec
+        if "TICKER" in name:
+            return self.ticker_max_age_sec
+        return self.ticker_max_age_sec
+
+
+@dataclass(frozen=True)
 class MarketDataEnvelope:
     """Normalized exchange observation with explicit clock provenance."""
 
@@ -459,6 +511,67 @@ class EvidenceVector:
 
 
 @dataclass(frozen=True)
+class EvidenceField:
+    """One stamped evidence input. Missing values stay None; never synthesized."""
+
+    value: Decimal | int | str | bool | None = None
+    source_timestamp: datetime | None = None
+    received_timestamp: datetime | None = None
+    latency_ms: int | None = None
+    freshness: str = "MISSING"
+    source_status: str = "MISSING"
+
+
+@dataclass(frozen=True)
+class PositioningEvidence:
+    """Canonical strategy input. Engine never rereads market tables."""
+
+    symbol: str
+    captured_at: datetime
+    frame: "MarketFrame"
+    fields: Mapping[str, EvidenceField] = field(default_factory=dict)
+    universe_rank: int | None = None
+    disagreement: Decimal = Decimal("0")
+
+    @classmethod
+    def from_frame(
+        cls,
+        frame: "MarketFrame",
+        *,
+        universe_rank: int | None = None,
+    ) -> "PositioningEvidence":
+        freshness_by_source = {
+            item.source.lower(): item for item in frame.freshness
+        }
+        fields: dict[str, EvidenceField] = {}
+        for name, timestamps in (frame.source_timestamps or {}).items():
+            source = str(name).lower()
+            stamped = freshness_by_source.get(source)
+            status = str((frame.evidence_status or {}).get(source, "MISSING")).upper()
+            fields[source] = EvidenceField(
+                value=None,
+                source_timestamp=(
+                    stamped.source_timestamp if stamped is not None else None
+                ),
+                received_timestamp=(
+                    stamped.received_timestamp if stamped is not None else None
+                ),
+                latency_ms=stamped.latency_ms if stamped is not None else (
+                    int(timestamps["latency_ms"]) if "latency_ms" in timestamps else None
+                ),
+                freshness="FRESH" if status == "AVAILABLE" else status,
+                source_status=status,
+            )
+        return cls(
+            symbol=frame.symbol.upper(),
+            captured_at=_aware(frame.captured_at),
+            frame=frame,
+            fields=fields,
+            universe_rank=universe_rank,
+        )
+
+
+@dataclass(frozen=True)
 class EvidenceSufficiency:
     """Explain whether critical positioning evidence can support an entry."""
 
@@ -554,12 +667,14 @@ class PositioningDecision:
     episode_status: str = "NONE"
     episode_started_at: datetime | None = None
     episode_ended_at: datetime | None = None
+    action: Action = "HOLD"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
             "timestamp": _aware(self.timestamp).isoformat(),
             "direction": self.direction,
+            "action": self.action,
             "state": self.state,
             "transition": self.transition,
             "previous_state": self.previous_state,
@@ -610,6 +725,16 @@ class CurrentPosition:
     entry_price: Decimal | None = None
     leverage: Decimal = Decimal("1")
     meme_risk_tier: MemeRiskTier = "TRADEABLE"
+
+
+@dataclass(frozen=True)
+class CurrentEpisode:
+    episode_id: UUID | None = None
+    symbol: str = ""
+    direction: Direction = "FLAT"
+    status: str = "FLAT"
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -899,16 +1024,6 @@ class StrategyConfig:
             raise ValueError("positioning_strategy_version is required")
 
 
-@dataclass(frozen=True)
-class Signal:
-    symbol: str
-    side: str
-    confidence: Decimal
-    reason: str
-    price: Decimal
-    captured_at: datetime
-
-
 class StrategyEngine:
     """Single owner for capital-positioning TradeIntent creation."""
 
@@ -917,12 +1032,17 @@ class StrategyEngine:
 
     def evaluate(
         self,
-        frame: MarketFrame,
+        evidence: PositioningEvidence | MarketFrame,
         *,
         current_position: CurrentPosition | None = None,
+        current_episode: CurrentEpisode | None = None,
         previous_state: PositioningState | None = None,
         now: datetime | None = None,
     ) -> TradeIntent | None:
+        if isinstance(evidence, PositioningEvidence):
+            frame = evidence.frame
+        else:
+            frame = evidence
         current = current_position or CurrentPosition()
         if (
             current.meme_risk_tier in {"BLOCK", "OBSERVE"}
@@ -933,7 +1053,10 @@ class StrategyEngine:
             return None
         return self._intent_from_positioning(
             self.positioning_decision(
-                frame, now=now, previous_state=previous_state
+                frame,
+                now=now,
+                previous_state=previous_state,
+                current_episode=current_episode,
             ),
             frame,
             current_position=current,
@@ -944,22 +1067,22 @@ class StrategyEngine:
         frame: MarketFrame,
         *,
         positioning: PositioningDecision | None = None,
+        current_position: CurrentPosition | None = None,
+        current_episode: CurrentEpisode | None = None,
     ) -> dict[str, Any]:
-        """Return both decisions without changing the execution path."""
-        legacy = self.signal(frame)
-        positioning = positioning or self.positioning_decision(frame)
-        legacy_direction: Direction = "FLAT" if legacy is None else (
-            "LONG" if legacy.side == "BUY" else "SHORT"
+        """Record the production positioning decision without placing orders."""
+        positioning = positioning or self.positioning_decision(
+            frame,
+            current_episode=current_episode,
         )
         return {
             "symbol": frame.symbol.upper(),
-            "timestamp": _aware(frame.captured_at),
-            "legacy_decision": legacy_direction,
-            "positioning_decision": positioning,
-            "agreement": legacy_direction == positioning.direction,
-            "why_different": None if legacy_direction == positioning.direction else (
-                f"legacy={legacy_direction}; positioning={positioning.direction}"
-            ),
+            "timestamp": _aware(frame.captured_at).isoformat(),
+            "action": positioning.action,
+            "direction": positioning.direction,
+            "state": positioning.state,
+            "episode_id": str(positioning.episode_id) if positioning.episode_id else None,
+            "evidence_snapshot_id": str(positioning.evidence_snapshot_id),
         }
 
     def positioning_decision(
@@ -968,6 +1091,7 @@ class StrategyEngine:
         *,
         now: datetime | None = None,
         previous_state: PositioningState | None = None,
+        current_episode: CurrentEpisode | None = None,
     ) -> PositioningDecision:
         timestamp = _aware(frame.captured_at)
         evaluation_now = _aware(now or timestamp)
@@ -1038,6 +1162,9 @@ class StrategyEngine:
         ):
             reasons.append("STATE_CHANGE_STRENGTH_LOW")
         snapshot_id = self._snapshot_id(frame, timestamp, evidence)
+        episode = current_episode or CurrentEpisode()
+        mapped = _map_position_action(episode.direction, direction, state)
+        action: Action = mapped[1] if mapped is not None else "HOLD"
         return PositioningDecision(
             symbol=frame.symbol.upper(),
             timestamp=timestamp,
@@ -1065,6 +1192,12 @@ class StrategyEngine:
             meme_classification_version=frame.meme_classification_version,
             meme_classified_at=frame.meme_classified_at,
             meme_reason_codes=frame.meme_reason_codes,
+            episode_id=episode.episode_id,
+            episode_direction=self.episode_direction(state),
+            episode_status=self.episode_status(state),
+            episode_started_at=episode.started_at,
+            episode_ended_at=episode.ended_at,
+            action=action,
         )
 
     def _unknown_decision(
@@ -1176,6 +1309,20 @@ class StrategyEngine:
             return "SHORT"
         return "FLAT"
 
+    @staticmethod
+    def episode_status(state: PositioningState) -> str:
+        if state in {"LONG_BUILDING", "SHORT_BUILDING"}:
+            return "BUILDING"
+        if state in {"ABSORPTION_LONG", "ABSORPTION_SHORT"}:
+            return "CONFIRMED"
+        if state in {
+            "EXHAUSTION_LONG", "EXHAUSTION_SHORT", "LONG_UNWIND", "SHORT_COVERING",
+        }:
+            return "EXHAUSTING"
+        if state == "FORCED_DELEVERAGING":
+            return "CLOSED"
+        return "FLAT"
+
     def _intent_from_positioning(
         self,
         decision: PositioningDecision,
@@ -1264,6 +1411,8 @@ class StrategyEngine:
                 transition_strength=positioning.transition_strength,
                 reason_codes=positioning.reason_codes,
                 evidence_snapshot_id=positioning.evidence_snapshot_id,
+                evidence_id=positioning.evidence_snapshot_id,
+                episode_id=positioning.episode_id,
                 market_regime=positioning.market_regime,
             )
         return TradeIntent(**values)
@@ -1663,30 +1812,3 @@ class StrategyEngine:
         if frame.depth_25bps is not None and frame.depth_25bps <= 0:
             return Decimal("0")
         return max(Decimal("0"), score)
-
-    def signal(self, frame: MarketFrame) -> Signal | None:
-        closes = tuple(Decimal(value) for value in frame.closes)
-        if len(closes) < self.config.slow_window:
-            return None
-        if any(value <= 0 for value in closes):
-            return None
-        fast = Decimal(str(fmean(closes[-self.config.fast_window :])))
-        slow = Decimal(str(fmean(closes[-self.config.slow_window :])))
-        price = closes[-1]
-        spread = abs(fast - slow) / slow if slow else Decimal("0")
-        confidence = min(Decimal("1"), Decimal("0.5") + spread * Decimal("10"))
-        if confidence < self.config.minimum_confidence:
-            return None
-        if fast > slow and price >= fast:
-            return Signal(
-                symbol=frame.symbol.upper(), side="BUY", confidence=confidence,
-                reason="fast SMA above slow SMA with price confirmation", price=price,
-                captured_at=_aware(frame.captured_at),
-            )
-        if fast < slow and price <= fast:
-            return Signal(
-                symbol=frame.symbol.upper(), side="SELL", confidence=confidence,
-                reason="fast SMA below slow SMA with price confirmation", price=price,
-                captured_at=_aware(frame.captured_at),
-            )
-        return None

@@ -151,7 +151,7 @@ class BianMarketTests(unittest.TestCase):
             bian_market.urllib.request,
             "urlopen",
             side_effect=[transient, response],
-        ), patch.object(bian_market.time, "sleep") as sleep:
+        ), patch("binance_client.time.sleep") as sleep:
             payload = bian_market._get_json(
                 "https://example.test",
                 attempts=2,
@@ -168,8 +168,8 @@ class BianMarketTests(unittest.TestCase):
             __import__("os").environ,
             {"BIAN_HTTP_BACKOFF_SEC": "0.25", "BIAN_HTTP_MAX_BACKOFF_SEC": "0.3"},
             clear=False,
-        ), patch.object(bian_market.random, "uniform", return_value=0.1), patch.object(
-            bian_market.time, "sleep"
+        ), patch("binance_client.random.uniform", return_value=0.1), patch(
+            "binance_client.time.sleep"
         ) as sleep:
             with self.assertRaises(RuntimeError):
                 bian_market._get_json("https://example.test", attempts=2)
