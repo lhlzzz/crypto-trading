@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 import os
 
 from binance_client import ClientConfig
-from engine import validate_source_timestamps
+from engine import runtime_required_sources, validate_source_timestamps
 from risk import FuturesAccountSnapshot, RiskLimits
 
 
@@ -57,19 +57,7 @@ def gate_evidence_max_age_sec() -> int:
 
 _GATE_STATUSES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
 _EXTERNAL_GATES = ("observation", "paper", "shadow", "testnet")
-REQUIRED_FUTURES_SOURCES = frozenset(
-    {
-        "FUTURES_TRADE",
-        "FUTURES_BOOK_TICKER",
-        "FUTURES_DEPTH",
-        "FUTURES_MARK_PRICE",
-        "FUTURES_INDEX_PRICE",
-        "FUTURES_OPEN_INTEREST",
-        "FUTURES_FUNDING",
-        "FUTURES_TAKER",
-        "FUTURES_LIQUIDATION",
-    }
-)
+REQUIRED_FUTURES_SOURCES = runtime_required_sources()
 _REALTIME_FUTURES_SOURCES = frozenset(
     {
         "FUTURES_TRADE",
@@ -77,8 +65,8 @@ _REALTIME_FUTURES_SOURCES = frozenset(
         "FUTURES_DEPTH",
         "FUTURES_MARK_PRICE",
         "FUTURES_INDEX_PRICE",
-        "FUTURES_FUNDING",
-        "FUTURES_LIQUIDATION",
+        "FUTURES_FUNDING_LIVENESS",
+        "FUTURES_LIQUIDATION_LIVENESS",
     }
 )
 
@@ -354,6 +342,19 @@ class GateResult:
             "current_orderbook": self.current_orderbook,
             "current_user_stream": self.current_user_stream,
             "live_allowed": self.live_allowed,
+            "CODE_READY": True,
+            "REAL_DATA_READY": self.observation_gate_status == "PASSED",
+            "PAPER_READY": self.paper_ready,
+            "SHADOW_READY": self.shadow_gate_status == "PASSED",
+            "TESTNET_READY": self.testnet_ready,
+            "ALPHA_STATUS": self.alpha_gate_status,
+            "LIVE_PREFLIGHT": self.live_ready,
+            "LIVE_ALLOWED": self.live_allowed,
+            "orderbook_health": self.current_orderbook,
+            "account_health": self.current_account_health,
+            "user_stream": self.current_user_stream,
+            "risk": self.risk_status,
+            "meme_universe": self.meme_universe_ready,
             "reasons": list(self.reasons),
         }
 

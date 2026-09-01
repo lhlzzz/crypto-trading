@@ -26,6 +26,7 @@ def _frame() -> MarketFrame:
         closes=(Decimal("100"), Decimal("101")),
         captured_at=datetime.now(timezone.utc),
         meme_risk_tier="TRADEABLE",
+        evidence_status={"orderbook": "VALID"},
     )
 
 
@@ -244,6 +245,9 @@ def test_disabled_positioning_does_not_open_from_sufficient_evidence() -> None:
             "futures_funding",
             "futures_trade_flow",
             "futures_taker_ratio",
+            "futures_mark_price",
+            "futures_orderbook",
+            "futures_book_ticker",
         )
     }
     frame = MarketFrame(
@@ -260,6 +264,7 @@ def test_disabled_positioning_does_not_open_from_sufficient_evidence() -> None:
         depth_25bps=Decimal("100"),
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
+        evidence_status={"orderbook": "VALID"},
         is_meme=True,
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,

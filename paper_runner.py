@@ -374,12 +374,8 @@ def _risk_context(
 ) -> RiskContext:
     if not isinstance(account_snapshot, FuturesAccountSnapshot):
         raise RuntimeError("canonical account snapshot is required")
+    current = _current_position(account_snapshot, intent.symbol)
     account_state_error: str | None = None
-    try:
-        current = _current_position(account_snapshot, intent.symbol)
-    except ValueError as exc:
-        current = CurrentPosition()
-        account_state_error = str(exc)
     position = next(
         (
             dict(row)
@@ -450,7 +446,11 @@ def _risk_context(
         entry_price=(
             Decimal(str(position["entry_price"]))
             if position.get("entry_price") is not None
-            else Decimal(str(position.get("average_price") or "0"))
+            else (
+                Decimal(str(position["average_price"]))
+                if position.get("average_price") not in {None, "", "0", 0}
+                else None
+            )
         ),
         mark_price=mark,
         index_price=market.index_price,

@@ -693,6 +693,9 @@ def test_futures_observation_to_paper_position_path() -> None:
             "futures_funding",
             "futures_trade_flow",
             "futures_taker_ratio",
+            "futures_mark_price",
+            "futures_orderbook",
+            "futures_book_ticker",
         )
     }
     frame = MarketFrame(
@@ -710,6 +713,7 @@ def test_futures_observation_to_paper_position_path() -> None:
         depth_25bps=Decimal("100"),
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
+        evidence_status={"orderbook": "VALID"},
         is_meme=True,
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,

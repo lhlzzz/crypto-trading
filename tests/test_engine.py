@@ -97,6 +97,9 @@ def _positioning_frame(**updates: object) -> MarketFrame:
             "futures_funding",
             "futures_trade_flow",
             "futures_taker_ratio",
+            "futures_mark_price",
+            "futures_orderbook",
+            "futures_book_ticker",
             "spot_book_ticker",
             "spot_orderbook",
         )
@@ -105,6 +108,8 @@ def _positioning_frame(**updates: object) -> MarketFrame:
         "symbol": "BTCUSDT",
         "closes": (Decimal("100"), Decimal("101")),
         "captured_at": captured,
+        "last_price": Decimal("101"),
+        "mark_price": Decimal("101"),
         "spot_buy_volume": Decimal("12"),
         "spot_sell_volume": Decimal("4"),
         "net_spot_flow": Decimal("8"),
@@ -116,8 +121,11 @@ def _positioning_frame(**updates: object) -> MarketFrame:
         "funding_rate": Decimal("0.0001"),
         "spread_bps": Decimal("2"),
         "depth_25bps": Decimal("100"),
+        "bid_depth_10": Decimal("50"),
+        "ask_depth_10": Decimal("40"),
         "market_regime": "RISK_ON",
         "meme_risk_tier": "TRADEABLE",
+        "evidence_status": {"orderbook": "VALID"},
         "freshness": (SourceFreshness("spot", captured, captured, 900, captured),),
         "source_timestamps": source_timestamps,
     }
@@ -367,8 +375,11 @@ def test_positioning_decision_has_no_process_local_episode_state() -> None:
 
     assert first.episode_id is None
     assert second.episode_id is None
+    assert first.previous_state is None
+    assert second.previous_state is None
     assert StrategyEngine.episode_direction(first.state) == "LONG"
     assert "_episodes" not in engine.__dict__
+    assert "_previous_states" not in engine.__dict__
 
 
 def test_positioning_episode_direction_follows_market_interpretation() -> None:
@@ -592,3 +603,26 @@ def test_missing_sign_is_not_neutral() -> None:
     from engine import _sign
     assert _sign(None) is None
     assert _sign(Decimal("0")) == 0
+
+def test_positioning_decision_does_not_keep_process_local_history() -> None:
+    engine = StrategyEngine()
+    frame = _positioning_frame()
+    first = engine.positioning_decision(frame)
+    later = engine.positioning_decision(frame)
+    recovered = engine.positioning_decision(frame, previous_state="NEUTRAL")
+
+    assert first.previous_state is None
+    assert later.previous_state is None
+    assert later.transition == "NONE"
+    assert recovered.previous_state == "NEUTRAL"
+    assert recovered.transition == "NEUTRAL->LONG_BUILDING"
+
+
+def test_missing_source_timestamp_cannot_make_evidence_available() -> None:
+    frame = _positioning_frame(source_timestamps={})
+    decision = StrategyEngine().positioning_decision(frame)
+    sufficiency = decision.evidence_sufficiency
+
+    assert sufficiency.sufficient is False
+    assert "trade_flow" in sufficiency.missing
+    assert decision.direction == "FLAT"

@@ -173,6 +173,34 @@ class TradingStore:
                 )
         return event_id
 
+
+    _EPISODE_COLUMNS = (
+        "episode_id", "symbol", "market", "direction", "started_at",
+        "ended_at", "state", "status", "last_observed_at",
+        "strategy_version", "config_hash", "metadata",
+    )
+
+    def _episode_from_row(self, row: Any) -> dict[str, Any]:
+        return _row_dict(self._EPISODE_COLUMNS, row)
+
+    def _load_episode(self, episode_id: UUID | str) -> dict[str, Any] | None:
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT episode_id, symbol, market, direction, started_at, ended_at,
+                           state, status, last_observed_at, strategy_version,
+                           config_hash, metadata
+                    FROM positioning_episodes
+                    WHERE episode_id = %s
+                    """,
+                    (str(episode_id),),
+                )
+                row = cursor.fetchone()
+        return self._episode_from_row(row) if row is not None else None
+
     def get_active_episode(
         self, symbol: str, *, market: str = "FUTURES"
     ) -> dict[str, Any] | None:
@@ -299,15 +327,11 @@ class TradingStore:
                 )
                 row = cursor.fetchone()
         if row is None:
-            raise RuntimeError("active positioning episode disappeared")
-        return _row_dict(
-            (
-                "episode_id", "symbol", "market", "direction", "started_at",
-                "ended_at", "state", "status", "last_observed_at",
-                "strategy_version", "config_hash", "metadata",
-            ),
-            row,
-        )
+            current = self._load_episode(episode_id)
+            if current is None:
+                raise RuntimeError("active positioning episode disappeared")
+            return current
+        return self._episode_from_row(row)
 
     def close_episode(
         self,
@@ -344,15 +368,11 @@ class TradingStore:
                 )
                 row = cursor.fetchone()
         if row is None:
-            raise RuntimeError("active positioning episode disappeared")
-        return _row_dict(
-            (
-                "episode_id", "symbol", "market", "direction", "started_at",
-                "ended_at", "state", "status", "last_observed_at",
-                "strategy_version", "config_hash", "metadata",
-            ),
-            row,
-        )
+            current = self._load_episode(episode_id)
+            if current is None:
+                raise RuntimeError("active positioning episode disappeared")
+            return current
+        return self._episode_from_row(row)
 
     def record_positioning_snapshot(
         self, decision: Any, *, strategy_version: str
@@ -692,7 +712,7 @@ class TradingStore:
                 if status in {"GAP", "UNSAFE", "ERROR"}:
                     evidence_status["orderbook"] = "UNSAFE"
                 elif status == "FRESH":
-                    evidence_status["orderbook"] = "AVAILABLE"
+                    evidence_status["orderbook"] = "VALID"
         allowed = set(MarketFrame.__dataclass_fields__) - {
             "symbol", "closes", "captured_at", "quote_volume", "freshness",
             "source_timestamps", "evidence_status",
@@ -729,7 +749,7 @@ class TradingStore:
         funding settlement is not a stale realtime observation.
         """
         import psycopg2
-        from runtime_gate import REQUIRED_FUTURES_SOURCES
+        from engine import runtime_required_sources
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
@@ -755,9 +775,9 @@ class TradingStore:
             "MARK_INDEX_FUNDING": (
                 "FUTURES_MARK_PRICE",
                 "FUTURES_INDEX_PRICE",
-                "FUTURES_FUNDING",
+                "FUTURES_FUNDING_LIVENESS",
             ),
-            "LIQUIDATION_HEARTBEAT": ("FUTURES_LIQUIDATION",),
+            "LIQUIDATION_HEARTBEAT": ("FUTURES_LIQUIDATION_LIVENESS",),
         }
         requested_symbols = {
             str(symbol).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
@@ -784,7 +804,7 @@ class TradingStore:
                     )
 
         result = []
-        for source in sorted(REQUIRED_FUTURES_SOURCES):
+        for source in sorted(runtime_required_sources()):
             for symbol in sorted(requested_symbols or symbols):
                 record = canonical.get(source, {}).get(symbol)
                 if record is None:
@@ -815,6 +835,30 @@ class TradingStore:
                     status = "STALE"
                 else:
                     status = "FRESH"
+                spec = None
+                try:
+                    from engine import _source_spec
+                    spec = _source_spec(source)
+                except Exception:
+                    spec = None
+                expected_interval = spec.expected_interval_sec if spec else None
+                ttl_sec = spec.ttl_sec if spec else max_age_sec
+                gap_duration = (
+                    max(0, age_sec - expected_interval)
+                    if expected_interval is not None else 0
+                )
+                consecutive_gap_count = int(payload.get("consecutive_gap_count") or 0)
+                if expected_interval is not None and age_sec > expected_interval:
+                    consecutive_gap_count = max(1, consecutive_gap_count)
+                elif expected_interval is not None:
+                    consecutive_gap_count = 0
+                if (
+                    spec is not None
+                    and spec.event_driven
+                    and status == "STALE"
+                    and age_sec <= max(1, ttl_sec)
+                ):
+                    status = "FRESH"
                 result.append({
                     "source": source,
                     "event_type": source,
@@ -825,16 +869,20 @@ class TradingStore:
                     "latency_ms": latency_ms,
                     "age_sec": age_sec,
                     "status": status,
+                    "last_seen": received_dt.isoformat(),
+                    "expected_interval": expected_interval,
+                    "gap_duration": gap_duration,
+                    "consecutive_gap_count": consecutive_gap_count,
                     "transport_source": payload.get("source"),
                 })
         # Liveness and sparse event existence are separate observations. A
         # quiet force-order channel is healthy when its heartbeat is fresh.
         for symbol in sorted(requested_symbols or symbols):
-            heartbeat = canonical.get("FUTURES_LIQUIDATION", {}).get(symbol)
+            heartbeat = canonical.get("FUTURES_LIQUIDATION_LIVENESS", {}).get(symbol)
             heartbeat_row = next(
                 (
                     row for row in result
-                    if row["source"] == "FUTURES_LIQUIDATION"
+                    if row["source"] == "FUTURES_LIQUIDATION_LIVENESS"
                     and row["symbol"] == symbol
                 ),
                 None,
@@ -852,7 +900,7 @@ class TradingStore:
                 None,
             )
             result.append({
-                "source": "FUTURES_LIQUIDATION_EVENT",
+                "source": "FUTURES_FORCE_ORDER",
                 "event_type": "FORCE_ORDER",
                 "symbol": symbol,
                 "market": "FUTURES",

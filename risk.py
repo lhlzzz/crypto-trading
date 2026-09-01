@@ -161,10 +161,16 @@ class ExchangeRules:
     symbol: str
     status: str = "TRADING"
     min_qty: Decimal = Decimal("0.001")
-    max_qty: Decimal | None = None
     step_size: Decimal = Decimal("0.001")
     tick_size: Decimal = Decimal("0.01")
     min_notional: Decimal = Decimal("5")
+    max_qty: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if self.min_qty <= 0 or self.step_size <= 0 or self.tick_size <= 0 or self.min_notional <= 0:
+            raise ValueError("exchange rules must be explicit and positive")
+        if not self.symbol.strip() or not self.status.strip():
+            raise ValueError("exchange rules require symbol and status")
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,18 @@ class FuturesAccountSnapshot:
     source: str
     freshness: str = "FRESH"
     symbol_leverage: Mapping[str, Decimal] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"paper", "testnet", "live"}:
+            raise ValueError("invalid account snapshot mode")
+        if not isinstance(self.captured_at, datetime):
+            raise ValueError("invalid account snapshot captured_at")
+        if self.freshness not in {"FRESH", "STALE", "UNKNOWN"}:
+            raise ValueError("invalid account snapshot freshness")
+        if self.wallet_balance is None or self.available_balance is None:
+            raise ValueError("invalid account snapshot wallet")
+        if not isinstance(self.positions, tuple):
+            raise ValueError("invalid account snapshot positions")
 
     @property
     def fresh(self) -> bool:
@@ -540,9 +558,12 @@ class RiskGate:
                 else "margin type mismatch"
             )
             return self._halt(intent, reason)
+        expected_position_mode = os.environ.get(
+            "FUTURES_POSITION_MODE", "ONE_WAY"
+        ).strip().upper()
         if entry and (
-            context.position_mode.upper() != "ONE_WAY"
-            or intent.position_mode != "ONE_WAY"
+            context.position_mode.upper() != expected_position_mode
+            or intent.position_mode != expected_position_mode
         ):
             return self._halt(intent, "position mode mismatch")
         if entry and (

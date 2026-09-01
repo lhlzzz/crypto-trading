@@ -1063,3 +1063,15 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def create_schema(cursor: Any) -> None:
+    _create_trading_tables(cursor)
+
+
+def migrate_legacy(cursor: Any) -> None:
+    _migrate_futures_columns(cursor)
+
+
+def validate_schema(dsn: str | None = None) -> dict[str, object]:
+    return schema_status(dsn)

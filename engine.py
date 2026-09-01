@@ -73,52 +73,173 @@ def _map_position_action(
     return None
 
 
-CORE_FUTURES_SOURCES = frozenset(
-    {
-        "futures_open_interest",
-        "futures_funding",
-        "futures_trade_flow",
-        "futures_taker_ratio",
-        "futures_mark_price",
-        "futures_index_price",
-        "futures_liquidation",
-        "futures_orderbook",
-        "futures_book_ticker",
-        "futures_force_order",
-    }
+@dataclass(frozen=True)
+class SourceSpec:
+    """Single registry row for runtime health and positioning evidence."""
+
+    name: str
+    runtime_name: str
+    aliases: frozenset[str]
+    required_for_runtime: bool = False
+    required_for_positioning: bool = False
+    auxiliary: bool = False
+    event_driven: bool = False
+    continuous: bool = False
+    ttl_sec: int = 900
+    expected_interval_sec: int | None = None
+
+
+def _source(
+    name: str,
+    runtime_name: str,
+    *aliases: str,
+    required_for_runtime: bool = False,
+    required_for_positioning: bool = False,
+    auxiliary: bool = False,
+    event_driven: bool = False,
+    continuous: bool = False,
+    ttl_sec: int = 900,
+    expected_interval_sec: int | None = None,
+) -> SourceSpec:
+    names = frozenset(
+        {
+            name,
+            runtime_name,
+            runtime_name.lower(),
+            *(alias for alias in aliases),
+            *(alias.lower() for alias in aliases),
+        }
+    )
+    return SourceSpec(
+        name=name,
+        runtime_name=runtime_name,
+        aliases=names,
+        required_for_runtime=required_for_runtime,
+        required_for_positioning=required_for_positioning,
+        auxiliary=auxiliary,
+        event_driven=event_driven,
+        continuous=continuous,
+        ttl_sec=ttl_sec,
+        expected_interval_sec=expected_interval_sec,
+    )
+
+
+_SOURCE_SPECS = (
+    _source(
+        "futures_trade_flow", "FUTURES_TRADE", "futures_trade",
+        required_for_runtime=True, required_for_positioning=True,
+        event_driven=True, continuous=True, ttl_sec=60, expected_interval_sec=5,
+    ),
+    _source(
+        "futures_book_ticker", "FUTURES_BOOK_TICKER",
+        required_for_runtime=True, required_for_positioning=True,
+        event_driven=True, continuous=True, ttl_sec=15, expected_interval_sec=1,
+    ),
+    _source(
+        "futures_orderbook", "FUTURES_DEPTH", "futures_depth",
+        required_for_runtime=True, required_for_positioning=True,
+        event_driven=True, continuous=True, ttl_sec=15, expected_interval_sec=1,
+    ),
+    _source(
+        "futures_mark_price", "FUTURES_MARK_PRICE",
+        required_for_runtime=True, required_for_positioning=True,
+        continuous=True, ttl_sec=15, expected_interval_sec=1,
+    ),
+    _source(
+        "futures_index_price", "FUTURES_INDEX_PRICE",
+        required_for_runtime=True, continuous=True, ttl_sec=15,
+        expected_interval_sec=1,
+    ),
+    _source(
+        "futures_open_interest", "FUTURES_OPEN_INTEREST",
+        required_for_runtime=True, required_for_positioning=True,
+        continuous=True, ttl_sec=30, expected_interval_sec=3,
+    ),
+    _source(
+        "futures_funding", "FUTURES_FUNDING_LIVENESS", "FUTURES_FUNDING",
+        required_for_runtime=True, required_for_positioning=True,
+        continuous=True, ttl_sec=15, expected_interval_sec=1,
+    ),
+    _source(
+        "funding_settlement", "FUNDING_SETTLEMENT",
+        event_driven=True, auxiliary=True, ttl_sec=28800,
+    ),
+    _source(
+        "futures_taker_ratio", "FUTURES_TAKER", "futures_taker",
+        required_for_runtime=True, required_for_positioning=True,
+        continuous=True, ttl_sec=30, expected_interval_sec=5,
+    ),
+    _source(
+        "futures_liquidation", "FUTURES_LIQUIDATION_LIVENESS",
+        "FUTURES_LIQUIDATION",
+        required_for_runtime=True, continuous=True, ttl_sec=15,
+        expected_interval_sec=1,
+    ),
+    _source(
+        "futures_force_order", "FUTURES_FORCE_ORDER",
+        event_driven=True, auxiliary=True, ttl_sec=86400,
+    ),
+    _source("spot_trade", "SPOT_TRADE", "spot", auxiliary=True, event_driven=True),
+    _source("spot_book_ticker", "SPOT_BOOK_TICKER", auxiliary=True, event_driven=True),
+    _source("spot_orderbook", "SPOT_ORDERBOOK", auxiliary=True, event_driven=True),
+    _source("binance_spot_klines", "SPOT_KLINES", auxiliary=True),
 )
-REQUIRED_CORE_FUTURES_SOURCES = frozenset(
-    {
-        "futures_open_interest",
-        "futures_funding",
-        "futures_trade_flow",
-        "futures_taker_ratio",
-    }
-)
-_SOURCE_ALIASES = {
-    "futures_trade_flow": frozenset({"futures_trade_flow", "futures_trade"}),
+SOURCE_REGISTRY: dict[str, SourceSpec] = {spec.name: spec for spec in _SOURCE_SPECS}
+_SOURCE_BY_ALIAS: dict[str, SourceSpec] = {
+    alias.lower(): spec
+    for spec in _SOURCE_SPECS
+    for alias in spec.aliases
 }
-AUXILIARY_SPOT_SOURCES = frozenset(
-    {
-        "spot_trade",
-        "spot_book_ticker",
-        "spot_orderbook",
-        "spot",
-        "binance_spot_klines",
-    }
-)
+POSITIONING_REQUIRED_EVIDENCE: dict[str, str] = {
+    "price": "futures_mark_price",
+    "trade_flow": "futures_trade_flow",
+    "oi": "futures_open_interest",
+    "funding": "futures_funding",
+    "taker": "futures_taker_ratio",
+    "orderbook": "futures_orderbook",
+    "spread": "futures_book_ticker",
+    "liquidity": "futures_orderbook",
+}
+_ORDERBOOK_EVIDENCE = frozenset({"orderbook", "spread", "liquidity"})
+_ORDERBOOK_SAFE_STATUS = frozenset({"VALID", "AVAILABLE", "FRESH"})
+_ORDERBOOK_UNSAFE_STATUS = frozenset({"UNSAFE", "GAP", "ERROR"})
+
+
+def _source_spec(source: str) -> SourceSpec | None:
+    return _SOURCE_BY_ALIAS.get(str(source).lower())
+
+
+def _source_names(source: str) -> tuple[str, ...]:
+    spec = _source_spec(source)
+    if spec is None:
+        return (str(source).lower(),)
+    return tuple(dict.fromkeys(alias.lower() for alias in spec.aliases))
+
+
+def runtime_required_sources() -> frozenset[str]:
+    return frozenset(
+        spec.runtime_name for spec in SOURCE_REGISTRY.values()
+        if spec.required_for_runtime
+    )
+
+
+def positioning_required_sources() -> frozenset[str]:
+    return frozenset(POSITIONING_REQUIRED_EVIDENCE.values())
 
 
 def _is_auxiliary_spot_source(source: str) -> bool:
-    name = source.lower()
-    return name in AUXILIARY_SPOT_SOURCES or name.startswith("spot")
+    spec = _source_spec(source)
+    if spec is not None:
+        return spec.auxiliary
+    return str(source).lower().startswith("spot")
 
 
 def _is_core_futures_source(source: str) -> bool:
-    name = source.lower()
-    if _is_auxiliary_spot_source(name):
-        return False
-    return name in CORE_FUTURES_SOURCES or name.startswith("futures")
+    spec = _source_spec(source)
+    if spec is not None:
+        return not spec.auxiliary
+    name = str(source).lower()
+    return name.startswith("futures") and not _is_auxiliary_spot_source(name)
 
 
 def _sign(value: Decimal | None, threshold: Decimal = Decimal("0")) -> int | None:
@@ -144,14 +265,16 @@ class SourceTimestampValidation:
     required_core: frozenset[str]
 
     def status_for(self, source: str) -> EvidenceStatus:
-        normalized = source.lower()
-        if normalized in self.statuses:
-            return self.statuses[normalized]
-        for canonical, aliases in _SOURCE_ALIASES.items():
-            if normalized == canonical and any(
-                self.statuses.get(alias) == "AVAILABLE" for alias in aliases
-            ):
-                return "AVAILABLE"
+        names = _source_names(source)
+        found = [self.statuses[name] for name in names if name in self.statuses]
+        if any(status == "AVAILABLE" for status in found):
+            return "AVAILABLE"
+        if any(status == "STALE" for status in found):
+            return "STALE"
+        if any(status == "UNSAFE" for status in found):
+            return "UNSAFE"
+        if found:
+            return found[0]
         return "MISSING"
 
     @property
@@ -173,10 +296,12 @@ def validate_source_timestamps(
     source_timestamps: Mapping[str, Mapping[str, Any]],
     now: datetime,
     *,
-    required_core_sources: frozenset[str] = REQUIRED_CORE_FUTURES_SOURCES,
+    required_core_sources: frozenset[str] | None = None,
 ) -> SourceTimestampValidation:
     """Validate normalized clocks once for engine, runners, and runtime gates."""
     evaluation_time = _aware(now)
+    if required_core_sources is None:
+        required_core_sources = positioning_required_sources()
     statuses: dict[str, EvidenceStatus] = {}
     issues: dict[str, str] = {}
     for source_name, timestamps in source_timestamps.items():
@@ -213,10 +338,10 @@ def validate_source_timestamps(
         else:
             statuses[source] = "AVAILABLE"
     for required in required_core_sources:
-        aliases = _SOURCE_ALIASES.get(required, frozenset({required}))
+        aliases = _source_names(required)
         if not any(alias in statuses for alias in aliases):
-            statuses[required] = "MISSING"
-            issues[required] = "MISSING"
+            statuses[str(required).lower()] = "MISSING"
+            issues[str(required).lower()] = "MISSING"
     return SourceTimestampValidation(
         statuses=statuses,
         issues=issues,
@@ -492,6 +617,7 @@ class MarketFrame:
     symbol: str
     closes: tuple[Decimal, ...]
     captured_at: datetime
+    market: Literal["SPOT", "FUTURES"] = "FUTURES"
     bid_price: Decimal | None = None
     ask_price: Decimal | None = None
     quote_volume: Decimal | None = None
@@ -599,6 +725,10 @@ class MarketFrame:
             str(name): str(status).upper()
             for name, status in (inputs.get("evidence_status") or {}).items()
         }
+        datetime_fields = {
+            "funding_timestamp", "funding_settlement_timestamp", "meme_classified_at",
+        }
+        bool_fields = {"price_cvd_divergence", "liquidation_observed", "is_meme"}
         decimal_fields = {
             "bid_price", "ask_price", "quote_volume", "volume",
             "spot_buy_volume", "spot_sell_volume", "net_spot_flow",
@@ -613,7 +743,7 @@ class MarketFrame:
             "oi", "oi_change", "last_price", "mark_price", "index_price",
             "oi_change_1m", "oi_change_3m", "oi_change_5m",
             "oi_change_15m", "oi_change_1h", "oi_change_30m",
-            "funding_rate", "funding_timestamp", "funding_settlement_timestamp",
+            "funding_rate",
             "funding_change", "funding_percentile", "funding_zscore",
             "taker_ratio",
             "basis_bps", "global_long_short_ratio", "top_trader_long_short_ratio",
@@ -628,21 +758,18 @@ class MarketFrame:
             "relative_strength_5m", "relative_strength_15m", "relative_strength_1h",
             "breadth_score", "advance_decline_ratio", "data_quality_score",
         }
-        values = {
-            name: Decimal(str(value))
-            for name in decimal_fields
-            if (value := inputs.get(name)) is not None
-        }
-        if inputs.get("price_cvd_divergence") is not None:
-            values["price_cvd_divergence"] = bool(inputs["price_cvd_divergence"])
-        meme_classified_at = (
-            _aware(datetime.fromisoformat(str(inputs["meme_classified_at"])))
-            if inputs.get("meme_classified_at") is not None
-            else None
-        )
-        for name in ("funding_timestamp", "funding_settlement_timestamp"):
+        values: dict[str, Any] = {}
+        for name in decimal_fields:
+            if (value := inputs.get(name)) is not None:
+                values[name] = Decimal(str(value))
+        for name in datetime_fields:
             if inputs.get(name) is not None:
                 values[name] = _aware(datetime.fromisoformat(str(inputs[name])))
+        for name in bool_fields:
+            if inputs.get(name) is not None:
+                values[name] = bool(inputs[name])
+        meme_classified_at = values.pop("meme_classified_at", None)
+        is_meme = values.pop("is_meme", inputs.get("is_meme"))
         closes = tuple(Decimal(str(value)) for value in inputs.get("closes", ()))
         if not closes:
             raise ValueError("evidence snapshot requires closes")
@@ -675,7 +802,7 @@ class MarketFrame:
             captured_at=captured_at,
             market_regime=market_regime,  # type: ignore[arg-type]
             meme_risk_tier=str(inputs.get("meme_risk_tier", "OBSERVE")),  # type: ignore[arg-type]
-            is_meme=inputs.get("is_meme"),
+            is_meme=is_meme,
             meme_classification_source=inputs.get("meme_classification_source"),
             meme_classification_version=inputs.get("meme_classification_version"),
             meme_classified_at=meme_classified_at,
@@ -787,13 +914,14 @@ class StrategyEngine:
 
     def __init__(self, config: StrategyConfig | None = None) -> None:
         self.config = config or StrategyConfig()
-        self._previous_states: dict[str, PositioningState] = {}
 
     def evaluate(
         self,
         frame: MarketFrame,
         *,
         current_position: CurrentPosition | None = None,
+        previous_state: PositioningState | None = None,
+        now: datetime | None = None,
     ) -> TradeIntent | None:
         current = current_position or CurrentPosition()
         if (
@@ -804,7 +932,9 @@ class StrategyEngine:
         if not self.config.positioning_decision_enabled:
             return None
         return self._intent_from_positioning(
-            self.positioning_decision(frame),
+            self.positioning_decision(
+                frame, now=now, previous_state=previous_state
+            ),
             frame,
             current_position=current,
         )
@@ -842,7 +972,9 @@ class StrategyEngine:
         timestamp = _aware(frame.captured_at)
         evaluation_now = _aware(now or timestamp)
         if timestamp > evaluation_now:
-            return self._unknown_decision(frame, timestamp, "FUTURE_DATA")
+            return self._unknown_decision(
+                frame, timestamp, "FUTURE_DATA", previous_state
+            )
         evidence, quality, reasons, sufficiency = self._evidence(
             frame, evaluation_now
         )
@@ -850,7 +982,7 @@ class StrategyEngine:
         crowding = self._crowding_score(frame)
         liquidity = self._liquidity_score(frame)
         state = self._state(frame, evidence, crowding, quality)
-        prior = previous_state or self._previous_states.get(frame.symbol.upper())
+        prior = previous_state
         transition = f"{prior}->{state}" if prior and prior != state else "NONE"
         edge = long_score - short_score
         directional_strength = min(Decimal("1"), abs(edge) * quality)
@@ -905,7 +1037,6 @@ class StrategyEngine:
             and transition_strength < self.config.minimum_transition_strength
         ):
             reasons.append("STATE_CHANGE_STRENGTH_LOW")
-        self._previous_states[frame.symbol.upper()] = state
         snapshot_id = self._snapshot_id(frame, timestamp, evidence)
         return PositioningDecision(
             symbol=frame.symbol.upper(),
@@ -937,10 +1068,15 @@ class StrategyEngine:
         )
 
     def _unknown_decision(
-        self, frame: MarketFrame, timestamp: datetime, reason: str
+        self,
+        frame: MarketFrame,
+        timestamp: datetime,
+        reason: str,
+        previous_state: PositioningState | None = None,
     ) -> PositioningDecision:
         snapshot_id = self._snapshot_id(frame, timestamp, EvidenceVector())
-        prior = self._previous_states.get(frame.symbol.upper())
+        prior = previous_state
+        required = tuple(POSITIONING_REQUIRED_EVIDENCE)
         return PositioningDecision(
             symbol=frame.symbol.upper(), timestamp=timestamp, direction="FLAT",
             state="UNKNOWN",
@@ -953,14 +1089,8 @@ class StrategyEngine:
             data_quality_score=Decimal("0"), reason_codes=(reason,),
             evidence=EvidenceVector(), evidence_snapshot_id=snapshot_id,
             evidence_sufficiency=EvidenceSufficiency(
-                required=(
-                    "price", "futures_trade_flow", "oi", "funding",
-                    "taker", "orderbook", "spread", "liquidity",
-                ),
-                missing=(
-                    "price", "futures_trade_flow", "oi", "funding",
-                    "taker", "orderbook", "spread", "liquidity",
-                ),
+                required=required,
+                missing=required,
             ),
             market_regime=frame.market_regime,
             source_timestamps=frame.source_timestamps,
@@ -1023,7 +1153,7 @@ class StrategyEngine:
             "relative_strength_1m", "relative_strength_5m",
             "relative_strength_15m", "relative_strength_1h",
             "advance_decline_ratio",
-            "market_regime", "meme_risk_tier", "data_quality_score",
+            "market", "market_regime", "meme_risk_tier", "data_quality_score",
             "evidence_status",
             "is_meme", "meme_classification_source",
             "meme_classification_version", "meme_classified_at",
@@ -1143,7 +1273,7 @@ class StrategyEngine:
         self, frame: MarketFrame, now: datetime
     ) -> tuple[EvidenceVector, Decimal, list[str], EvidenceSufficiency]:
         reasons: list[str] = []
-        if not frame.freshness:
+        if not frame.freshness and not frame.source_timestamps:
             return (
                 EvidenceVector(),
                 Decimal("0"),
@@ -1168,7 +1298,7 @@ class StrategyEngine:
         if aux_fresh_flags and not all(aux_fresh_flags):
             reasons.append("AUXILIARY_SPOT_STALE")
         timestamp_validation = validate_source_timestamps(
-            frame.source_timestamps, now
+            self._merged_source_records(frame), now
         )
         if not timestamp_validation.core_ok:
             reasons.append("TIMESTAMP_INCONSISTENT")
@@ -1275,25 +1405,44 @@ class StrategyEngine:
         ), quality, reasons, sufficiency
 
     @staticmethod
-    def _evidence_sufficiency(
-        frame: MarketFrame, now: datetime
-    ) -> EvidenceSufficiency:
-        source_for = {
-            "price": "futures_mark_price",
-            "futures_trade_flow": "futures_trade_flow",
-            "oi": "futures_open_interest",
-            "funding": "futures_funding",
-            "taker": "futures_taker_ratio",
-            "orderbook": "futures_orderbook",
-            "spread": "futures_book_ticker",
-            "liquidity": "futures_orderbook",
+    def _merged_source_records(
+        frame: MarketFrame,
+    ) -> dict[str, dict[str, Any]]:
+        records = {
+            str(source).lower(): dict(timestamps)
+            for source, timestamps in frame.source_timestamps.items()
         }
-        values = {
+        for item in frame.freshness:
+            records[item.source.lower()] = {
+                "source_timestamp": item.source_timestamp.isoformat(),
+                "received_timestamp": item.received_timestamp.isoformat(),
+                "latency_ms": item.latency_ms,
+                "max_age_sec": item.max_age_sec,
+            }
+        return records
+
+    @staticmethod
+    def _orderbook_is_unsafe(frame: MarketFrame) -> bool:
+        statuses = {
+            str(name).lower(): str(status).upper()
+            for name, status in frame.evidence_status.items()
+        }
+        for key in ("orderbook", "futures_orderbook", "futures_depth"):
+            status = statuses.get(key)
+            if status in _ORDERBOOK_UNSAFE_STATUS:
+                return True
+            if status is not None and status not in _ORDERBOOK_SAFE_STATUS:
+                return True
+        return False
+
+    @staticmethod
+    def _evidence_values(frame: MarketFrame) -> dict[str, Any]:
+        return {
             "price": frame.last_price or frame.mark_price or (
                 frame.closes[-1] if frame.closes else None
             ),
-            "futures_trade_flow": frame.futures_trade_flow,
-            "oi": frame.oi_change,
+            "trade_flow": frame.futures_trade_flow,
+            "oi": frame.oi_change if frame.oi_change is not None else frame.oi,
             "funding": frame.funding_rate,
             "taker": (
                 frame.taker_buy_volume
@@ -1305,33 +1454,57 @@ class StrategyEngine:
             "spread": frame.spread_bps,
             "liquidity": frame.depth_25bps,
         }
-        freshness = {item.source.lower(): item for item in frame.freshness}
+
+    @classmethod
+    def _evidence_sufficiency(
+        cls,
+        frame: MarketFrame, now: datetime
+    ) -> EvidenceSufficiency:
+        validation = validate_source_timestamps(
+            cls._merged_source_records(frame),
+            now,
+            required_core_sources=positioning_required_sources(),
+        )
         statuses = {
-            str(name): str(status).upper()
+            str(name).lower(): str(status).upper()
             for name, status in frame.evidence_status.items()
         }
+        values = cls._evidence_values(frame)
+        orderbook_unsafe = cls._orderbook_is_unsafe(frame)
         available: list[str] = []
         stale: list[str] = []
         unsafe: list[str] = []
         missing: list[str] = []
         conflicting: list[str] = []
-        for name, source in source_for.items():
-            explicit = statuses.get(name) or statuses.get(source)
-            if explicit in {"UNSAFE", "GAP", "ERROR"}:
+        for name, source in POSITIONING_REQUIRED_EVIDENCE.items():
+            explicit = statuses.get(name) or statuses.get(source.lower())
+            if name in _ORDERBOOK_EVIDENCE and orderbook_unsafe:
+                unsafe.append(name)
+                continue
+            if explicit in _ORDERBOOK_UNSAFE_STATUS:
                 unsafe.append(name)
                 continue
             if values[name] is None:
                 missing.append(name)
                 continue
-            item = freshness.get(source.lower())
-            if item is not None and not item.fresh:
+            source_status = validation.status_for(source)
+            if source_status == "MISSING":
+                missing.append(name)
+                continue
+            if source_status == "UNSAFE":
+                unsafe.append(name)
+                continue
+            if source_status == "STALE":
                 stale.append(name)
+                continue
+            if source_status != "AVAILABLE":
+                missing.append(name)
                 continue
             available.append(name)
         if frame.price_cvd_divergence:
-            conflicting.extend(("price", "futures_trade_flow"))
+            conflicting.extend(("price", "trade_flow"))
         return EvidenceSufficiency(
-            required=tuple(source_for),
+            required=tuple(POSITIONING_REQUIRED_EVIDENCE),
             available=tuple(available),
             stale=tuple(stale),
             unsafe=tuple(unsafe),

@@ -41,7 +41,7 @@ def test_market_data_freshness_reports_missing_and_gap_per_required_source():
     by_source = {row["source"]: row for row in rows}
     assert by_source["FUTURES_MARK_PRICE"]["status"] == "FRESH"
     assert by_source["FUTURES_INDEX_PRICE"]["status"] == "FRESH"
-    assert by_source["FUTURES_FUNDING"]["status"] == "FRESH"
+    assert by_source["FUTURES_FUNDING_LIVENESS"]["status"] == "FRESH"
     assert by_source["FUTURES_DEPTH"]["status"] == "GAP"
     assert by_source["FUTURES_TRADE"]["status"] == "MISSING"
     assert by_source["FUTURES_TRADE"]["symbol"] == "BTCUSDT"
@@ -151,3 +151,63 @@ def test_positioning_snapshot_persists_complete_episode_and_evidence_contract():
     evidence_args = cursor.execute.call_args_list[1].args[1]
     assert '"futures_trade_flow"' in evidence_args[4]
     assert '"is_meme"' in evidence_args[11]
+
+
+def test_update_episode_ignores_stale_writer():
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    episode_id = uuid4()
+    started = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    newer = datetime(2026, 8, 26, 12, 5, tzinfo=timezone.utc)
+    older = datetime(2026, 8, 26, 12, 1, tzinfo=timezone.utc)
+    current_row = (
+        str(episode_id), "BTCUSDT", "FUTURES", "LONG", started, None,
+        "LONG_BUILDING", "OPEN", newer, "positioning-v1", "hash", {},
+    )
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [None, current_row]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    with patch("psycopg2.connect", return_value=connection):
+        result = TradingStore("postgresql://test").update_episode(
+            episode_id,
+            state="UNKNOWN",
+            status="UNRESOLVED",
+            observed_at=older,
+            metadata={"stale": True},
+        )
+
+    assert result["status"] == "OPEN"
+    assert result["state"] == "LONG_BUILDING"
+    assert result["last_observed_at"] == str(newer)
+
+
+def test_start_episode_uses_one_active_row_per_symbol_market():
+    cursor = MagicMock()
+    started = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    cursor.fetchone.return_value = (
+        "11111111-1111-1111-1111-111111111111", "BTCUSDT", "FUTURES", "LONG",
+        started, None, "LONG_BUILDING", "OPEN", started, "positioning-v1", "hash", {},
+    )
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+
+    with patch("psycopg2.connect", return_value=connection):
+        first = store.start_episode(
+            symbol="BTCUSDT", direction="LONG", state="LONG_BUILDING",
+            observed_at=started, strategy_version="positioning-v1", config_hash="hash",
+        )
+        second = store.start_episode(
+            symbol="BTCUSDT", direction="LONG", state="LONG_BUILDING",
+            observed_at=started, strategy_version="positioning-v1", config_hash="hash",
+        )
+
+    statement = cursor.execute.call_args_list[0].args[0]
+    assert "ON CONFLICT (symbol, market)" in statement
+    assert "WHERE status IN ('OPEN', 'UNRESOLVED')" in statement
+    assert first["episode_id"] == second["episode_id"]

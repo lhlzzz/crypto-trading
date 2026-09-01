@@ -552,11 +552,6 @@ class PaperExecutor(_BaseExecutor):
         payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
         last = payload.get("last_funding_settlement_timestamp")
         stamp = settlement.isoformat()
-        funding_key = getattr(self.store, "funding_settlement_exists", None)
-        if funding_key is not None and funding_key(
-            mode=self.config.mode, symbol=symbol, settlement_timestamp=settlement
-        ):
-            return Decimal("0")
         if last is not None:
             try:
                 last_timestamp = datetime.fromisoformat(str(last))
@@ -570,6 +565,24 @@ class PaperExecutor(_BaseExecutor):
         notional = quantity * mark
         payment = notional * market.funding_rate
         signed = payment if direction == "LONG" else -payment
+        recorder = getattr(self.store, "record_funding_settlement", None)
+        if recorder is not None:
+            inserted = recorder(
+                mode=self.config.mode,
+                symbol=symbol,
+                settlement_timestamp=settlement,
+                rate=market.funding_rate,
+                notional=notional,
+                payment=-signed,
+                position_side=direction,
+            )
+            if not inserted:
+                return Decimal("0")
+        elif getattr(self.store, "funding_settlement_exists", None) is not None:
+            if self.store.funding_settlement_exists(
+                mode=self.config.mode, symbol=symbol, settlement_timestamp=settlement
+            ):
+                return Decimal("0")
         account = self.account_state()
         wallet = account["wallet_balance"] - signed
         funding_pnl = _decimal_field(position, "funding_pnl") - signed
@@ -611,17 +624,6 @@ class PaperExecutor(_BaseExecutor):
                 "funding_pnl": str(-signed),
             },
         )
-        recorder = getattr(self.store, "record_funding_settlement", None)
-        if recorder is not None:
-            recorder(
-                mode=self.config.mode,
-                symbol=symbol,
-                settlement_timestamp=settlement,
-                rate=market.funding_rate,
-                notional=notional,
-                payment=-signed,
-                position_side=direction,
-            )
         return -signed
 
     def _liquidate(
