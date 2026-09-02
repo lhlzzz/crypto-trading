@@ -847,7 +847,6 @@ async def run_realtime(
         )
     )
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(1.0, float(duration))
     last_tick = loop.time()
     collector_alive = True
     window_complete = False
@@ -913,7 +912,7 @@ async def run_realtime(
 
     try:
         while True:
-            remaining = deadline - loop.time()
+            remaining = max(1.0, float(duration)) - (_now() - started).total_seconds()
             if remaining <= 0:
                 window_complete = True
                 break
@@ -934,6 +933,9 @@ async def run_realtime(
             last_tick = now
             collector_alive = not observer.done()
             _record(_read_health(), elapsed_slice)
+        leftover = max(1.0, float(duration)) - (_now() - started).total_seconds()
+        if leftover > 0 and collector_alive and not observer.done():
+            await asyncio.sleep(leftover)
         if collector_alive and not observer.done():
             _record(_read_health(), 0 if last_health is not None else 1)
             window_complete = True

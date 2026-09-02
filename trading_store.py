@@ -760,6 +760,10 @@ class TradingStore:
                            received_timestamp, latency_ms, metadata
                     FROM market_flow_events
                     WHERE market = 'FUTURES'
+                      AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
+                      AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
+                      AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
+                      AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
                     ORDER BY symbol, event_type, received_timestamp DESC,
                              event_timestamp DESC
                     """
@@ -792,6 +796,16 @@ class TradingStore:
                 continue
             symbols.add(normalized_symbol)
             payload = metadata if isinstance(metadata, dict) else {}
+            nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            marker = str(
+                payload.get("health")
+                or payload.get("health_status")
+                or nested.get("health")
+                or nested.get("health_status")
+                or ""
+            ).upper()
+            if marker == "STALE":
+                continue
             aliases = {
                 **source_events,
                 "FORCE_ORDER": (),

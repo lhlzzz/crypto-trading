@@ -286,3 +286,32 @@ def test_market_data_freshness_includes_metadata_for_lifecycle():
         )
     heartbeat = next(row for row in rows if row["source"] == "FUTURES_LIQUIDATION_LIVENESS")
     assert heartbeat["metadata"]["reconnect_events"][0]["channel"] == "TRADE"
+
+
+def test_market_data_freshness_ignores_synthetic_stale_markers():
+    now = datetime.now(timezone.utc)
+    live_received = now - timedelta(seconds=2)
+    live_source = live_received - timedelta(milliseconds=20)
+    stale_received = now - timedelta(seconds=1)
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            "BTCUSDT", "FUTURES", "BOOK_TICKER", stale_received, stale_received, 0,
+            {"health": "STALE", "health_status": "STALE", "metadata": {"health_status": "STALE"}},
+        ),
+        (
+            "BTCUSDT", "FUTURES", "BOOK_TICKER", live_source, live_received, 20,
+            {"source": "binance_futures_book_ticker"},
+        ),
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection), patch(
+        "trading_store._now", return_value=now
+    ):
+        rows = TradingStore("postgresql://test").market_data_freshness(
+            max_age_sec=60, symbols=["BTCUSDT"]
+        )
+    by_source = {row["source"]: row for row in rows}
+    assert by_source["FUTURES_BOOK_TICKER"]["status"] == "FRESH"
