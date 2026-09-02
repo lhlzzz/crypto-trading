@@ -1,23 +1,22 @@
 # Next Action
 
-Actual blockers are external runtime evidence, not implementation debt:
+30M realtime PASSED. Do not rerun 30M unless freeze-path code changes.
 
-- continuous public observation: 1h, 6h, and 24h gates
-- seven-day shadow with directional samples
-- Testnet USD-M lifecycle, blocked until credentials are supplied
-- Live release gates: observation, shadow, Testnet lifecycle, reconciliation,
-  data health, Meme `TRADEABLE`, and human confirmation
+Next elapsed gate is realtime 2H:
 
-Code verification completed on 2026-08-31: 260 tests pass, compileall passes,
-diff check passes, and PostgreSQL schema/status is healthy. A direct public
-smoke reached `markPrice`, but OI, funding, aggregate trades, ticker
-collection, and Futures WebSocket observation failed with SSL EOF or
-connection-reset errors. External runtime evidence remains uncompleted.
+```bash
+python scripts/validate_runtime.py --stage realtime_2h --duration 7200
+```
 
-Not verified: 30m, 2h, 6h, and 24h realtime; 24h Paper; 7d Shadow; Alpha OOS;
-and Testnet lifecycle.
+Required healthy channels: TRADE, BOOK_TICKER, DEPTH, MARK_INDEX_FUNDING,
+LIQUIDATION_LIVENESS. Dedicated markPrice is NOT_REQUIRED while production
+liveness comes from MARK_INDEX_FUNDING.
 
-`POSITIONING_DECISION_ENABLED=false` and Live remains hard-blocked.
+REAL_DATA_READY stays false until realtime 24H PASSED. Paper 24H cannot start
+before that. Testnet is BLOCKED until BIAN_TESTNET_API_KEY and
+BIAN_TESTNET_API_SECRET are present. Live remains hard-blocked.
+
+`POSITIONING_DECISION_ENABLED=false`.
 
 Positioning decisions now persist episode identity and complete normalized
 evidence metadata. Testnet/Live runtime gate and reconciliation consume the

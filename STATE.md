@@ -188,3 +188,15 @@ research baseline until positioning gates pass.
   `ALPHA_SUPPORTED` is not established, and `LIVE_PREFLIGHT_READY=false`.
 - Testnet is `BLOCKED_BY_EXTERNAL_CREDENTIALS`; no credentials were present.
 - `LIVE=BLOCKED` and `POSITIONING_DECISION_ENABLED=false` remain unchanged.
+
+## Runtime Validation (2026-09-02)
+
+- 30M realtime `PASSED`. Evidence remains valid unless freeze-path code
+  changes (`scripts/bian_market.py`, `binance_client.py`, `runtime_gate.py`,
+  `trading_store.py`).
+- Production mark/index/funding liveness is `MARK_INDEX_FUNDING`. Dedicated
+  markPrice is `NOT_REQUIRED` and is not a second subscribed source.
+- `REAL_DATA_READY=false` until realtime 24H passes. Paper, Shadow, Alpha,
+  Testnet, and Live are not started from 30M.
+- Validation is a persisted session in `runtime_validation_report.json` with
+  stage states `NOT_STARTED`/`RUNNING`/`PASSED`/`FAILED`/`BLOCKED`/`EXPIRED`.
