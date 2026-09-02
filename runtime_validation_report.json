@@ -1,16 +1,25 @@
 {
-  "generated_at": "2026-09-02T12:11:53.646674+00:00",
-  "gate": "realtime_2h",
-  "status": "FAILED",
+  "generated_at": "2026-09-02T15:06:14.916370+00:00",
+  "gate": "realtime_30m",
+  "status": "PASSED",
   "CODE_PASS": true,
-  "RUNTIME_PASS": false,
+  "RUNTIME_PASS": true,
   "stages": {
     "realtime_30m": {
       "status": "PASSED",
       "reason": "OK",
-      "start_time": "2026-09-01T18:51:47.713647+00:00",
-      "end_time": "2026-09-01T19:22:00.814295+00:00",
-      "duration": 1813,
+      "stage": "realtime_30m",
+      "kind": "realtime",
+      "session_id": "983f735b-99a5-4e0f-9cd6-15eae2c60e9b",
+      "commit_sha": "3a462a2e12a41a14b46683130500f9ecb544170f",
+      "config_hash": "1460cd76d17589242299bf5946ebc70bd016898bd9b57a37b9ac72ac3d781543",
+      "start_at": "2026-09-02T14:35:19.016781+00:00",
+      "end_at": "2026-09-02T15:06:14.910069+00:00",
+      "start_time": "2026-09-02T14:35:19.016781+00:00",
+      "end_time": "2026-09-02T15:06:14.910069+00:00",
+      "duration": 1855,
+      "duration_sec": 1855,
+      "process_duration_sec": 1826,
       "requested_duration": 1800,
       "required_sources": [
         "FUTURES_BOOK_TICKER",
@@ -25,513 +34,1148 @@
       ],
       "missing_sources": [],
       "stale_sources": [],
-      "healthy_seconds": 1688,
-      "degraded_seconds": 90,
+      "symbol_set": [
+        "BTCUSDT"
+      ],
+      "universe_version": "19aa16aed07f",
+      "symbol_hash": "19aa16aed07f38e9beb894bb1fa1131d164e72a1fff057b80ed35e55a1ad0334",
+      "universe_locked": true,
+      "channel_status": {
+        "TRADE": "PASS",
+        "BOOK_TICKER": "PASS",
+        "DEPTH": "PASS",
+        "MARK_INDEX_FUNDING": "PASS",
+        "LIQUIDATION_LIVENESS": "PASS",
+        "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+        "ORDERBOOK": "PASS"
+      },
+      "source_kinds": {
+        "FUTURES_TRADE": "continuous_stream",
+        "FUTURES_BOOK_TICKER": "continuous_stream",
+        "FUTURES_DEPTH": "continuous_stream",
+        "FUTURES_MARK_PRICE": "continuous_stream",
+        "FUTURES_INDEX_PRICE": "continuous_stream",
+        "FUTURES_FUNDING_LIVENESS": "continuous_stream",
+        "FUTURES_LIQUIDATION_LIVENESS": "heartbeat_source",
+        "FUTURES_FORCE_ORDER": "event_source",
+        "FUTURES_OPEN_INTEREST": "rest_observation",
+        "FUTURES_TAKER": "rest_observation"
+      },
+      "healthy_seconds": 1784,
+      "degraded_seconds": 42,
       "failure_seconds": 0,
+      "healthy_sec": 1784,
+      "degraded_sec": 42,
+      "failure_sec": 0,
+      "stale_sec": 0,
       "gap_count": 0,
-      "reconnect_count": 0,
+      "reconnect_count": 18,
+      "reconnect_events": [
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 2762,
+          "reconnect_at": "2026-09-02T14:36:51.718960+00:00",
+          "disconnect_at": "2026-09-02T14:36:48.956687+00:00",
+          "new_connection_id": "book_ticker-fbc3677ea9a9",
+          "old_connection_id": "book_ticker-d81748847e83",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 1562,
+          "reconnect_at": "2026-09-02T14:37:20.097255+00:00",
+          "disconnect_at": "2026-09-02T14:37:18.534466+00:00",
+          "new_connection_id": "book_ticker-4973ddd22373",
+          "old_connection_id": "book_ticker-fbc3677ea9a9",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "MARK_PRICE",
+          "recovery_ms": 1816,
+          "reconnect_at": "2026-09-02T14:37:22.805068+00:00",
+          "disconnect_at": "2026-09-02T14:37:20.988168+00:00",
+          "new_connection_id": "mark_price-72eb3f18c433",
+          "old_connection_id": "mark_price-4af96bbb72a2",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 13847,
+          "reconnect_at": "2026-09-02T14:37:53.967343+00:00",
+          "disconnect_at": "2026-09-02T14:37:40.119445+00:00",
+          "new_connection_id": "book_ticker-5df9e048ded1",
+          "old_connection_id": "book_ticker-4973ddd22373",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 10314,
+          "reconnect_at": "2026-09-02T14:38:06.886015+00:00",
+          "disconnect_at": "2026-09-02T14:37:56.571959+00:00",
+          "new_connection_id": "book_ticker-110f13be64fa",
+          "old_connection_id": "book_ticker-5df9e048ded1",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 21737,
+          "reconnect_at": "2026-09-02T14:38:34.594637+00:00",
+          "disconnect_at": "2026-09-02T14:38:12.856732+00:00",
+          "new_connection_id": "book_ticker-3c3db2721cea",
+          "old_connection_id": "book_ticker-110f13be64fa",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 46625,
+          "reconnect_at": "2026-09-02T14:39:58.588174+00:00",
+          "disconnect_at": "2026-09-02T14:39:11.962583+00:00",
+          "new_connection_id": "book_ticker-7e519ab442fa",
+          "old_connection_id": "book_ticker-3c3db2721cea",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 60451,
+          "reconnect_at": "2026-09-02T14:41:09.753986+00:00",
+          "disconnect_at": "2026-09-02T14:40:09.302270+00:00",
+          "new_connection_id": "book_ticker-dd7d0b82b1f3",
+          "old_connection_id": "book_ticker-7e519ab442fa",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 68904,
+          "reconnect_at": "2026-09-02T14:42:27.302484+00:00",
+          "disconnect_at": "2026-09-02T14:41:18.397502+00:00",
+          "new_connection_id": "book_ticker-d3ae5ef0fa5b",
+          "old_connection_id": "book_ticker-dd7d0b82b1f3",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 73335,
+          "reconnect_at": "2026-09-02T14:43:46.222966+00:00",
+          "disconnect_at": "2026-09-02T14:42:32.887056+00:00",
+          "new_connection_id": "book_ticker-041df592d2bd",
+          "old_connection_id": "book_ticker-d3ae5ef0fa5b",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "DEPTH",
+          "recovery_ms": 2285,
+          "reconnect_at": "2026-09-02T14:44:33.394552+00:00",
+          "disconnect_at": "2026-09-02T14:44:31.108819+00:00",
+          "new_connection_id": "depth-c88a685754ac",
+          "old_connection_id": "depth-0491912e7653",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 67110,
+          "reconnect_at": "2026-09-02T14:46:22.425951+00:00",
+          "disconnect_at": "2026-09-02T14:45:15.315312+00:00",
+          "new_connection_id": "book_ticker-bce59f6548b4",
+          "old_connection_id": "book_ticker-041df592d2bd",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 58896,
+          "reconnect_at": "2026-09-02T14:47:40.546011+00:00",
+          "disconnect_at": "2026-09-02T14:46:41.649881+00:00",
+          "new_connection_id": "book_ticker-5b9bab092ba0",
+          "old_connection_id": "book_ticker-bce59f6548b4",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 60176,
+          "reconnect_at": "2026-09-02T14:49:17.449195+00:00",
+          "disconnect_at": "2026-09-02T14:48:17.272827+00:00",
+          "new_connection_id": "book_ticker-830b11d5c7a3",
+          "old_connection_id": "book_ticker-5b9bab092ba0",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 58433,
+          "reconnect_at": "2026-09-02T14:50:36.228796+00:00",
+          "disconnect_at": "2026-09-02T14:49:37.795251+00:00",
+          "new_connection_id": "book_ticker-02b6a23ef81e",
+          "old_connection_id": "book_ticker-830b11d5c7a3",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 75099,
+          "reconnect_at": "2026-09-02T15:01:35.160374+00:00",
+          "disconnect_at": "2026-09-02T15:00:20.061359+00:00",
+          "new_connection_id": "book_ticker-d088ac2eae3c",
+          "old_connection_id": "book_ticker-02b6a23ef81e",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 82911,
+          "reconnect_at": "2026-09-02T15:03:00.650360+00:00",
+          "disconnect_at": "2026-09-02T15:01:37.738869+00:00",
+          "new_connection_id": "book_ticker-bbdd49dabbd9",
+          "old_connection_id": "book_ticker-d088ac2eae3c",
+          "subscriptions_restored": true
+        },
+        {
+          "reason": "BinanceConnectionError",
+          "source": "collector_lifecycle",
+          "channel": "BOOK_TICKER",
+          "recovery_ms": 76406,
+          "reconnect_at": "2026-09-02T15:04:19.736760+00:00",
+          "disconnect_at": "2026-09-02T15:03:03.329874+00:00",
+          "new_connection_id": "book_ticker-c355f818cbde",
+          "old_connection_id": "book_ticker-bbdd49dabbd9",
+          "subscriptions_restored": true
+        }
+      ],
+      "diagnostic_reconnect_events": [],
+      "owner_pid": 277600,
+      "errors": [],
+      "watchdog": "HEALTHY",
+      "rss_mb": 294.72,
       "stale_count": 0,
       "observation_count": 10,
       "samples": [
         {
-          "at": "2026-09-01T18:52:18.541719+00:00",
+          "at": "2026-09-02T14:36:00.471767+00:00",
+          "status": "healthy",
+          "missing_sources": [],
+          "stale_sources": [],
+          "gap_count": 0,
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 206.44,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
+        },
+        {
+          "at": "2026-09-02T14:36:37.186296+00:00",
           "status": "degraded",
           "missing_sources": [],
           "stale_sources": [
             "FUTURES_FUNDING_LIVENESS",
             "FUTURES_INDEX_PRICE",
-            "FUTURES_MARK_PRICE"
+            "FUTURES_MARK_PRICE",
+            "FUTURES_OPEN_INTEREST",
+            "FUTURES_TAKER"
           ],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "DEGRADED",
+          "rss_mb": 206.44,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "FAIL",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:52:49.467103+00:00",
-          "status": "degraded",
-          "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_FUNDING_LIVENESS",
-            "FUTURES_INDEX_PRICE",
-            "FUTURES_MARK_PRICE"
-          ],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T18:53:20.374826+00:00",
-          "status": "degraded",
-          "missing_sources": [],
-          "stale_sources": [
-            "FUTURES_FUNDING_LIVENESS",
-            "FUTURES_INDEX_PRICE",
-            "FUTURES_MARK_PRICE"
-          ],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T18:53:51.500594+00:00",
+          "at": "2026-09-02T14:37:16.717185+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 206.44,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:54:22.671485+00:00",
+          "at": "2026-09-02T14:37:53.180241+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 206.44,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:54:54.111889+00:00",
+          "at": "2026-09-02T14:38:31.423001+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 215.25,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:55:25.185733+00:00",
+          "at": "2026-09-02T14:39:09.891216+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 215.25,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:55:56.172293+00:00",
+          "at": "2026-09-02T14:39:49.854899+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 215.25,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:56:27.330610+00:00",
+          "at": "2026-09-02T14:40:28.679888+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 215.25,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:56:58.506273+00:00",
+          "at": "2026-09-02T14:41:05.952808+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 217.33,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:57:30.209879+00:00",
+          "at": "2026-09-02T14:41:44.789230+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 217.33,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:58:01.926780+00:00",
+          "at": "2026-09-02T14:42:22.585291+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 217.33,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:58:33.208272+00:00",
+          "at": "2026-09-02T14:43:00.842399+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 220.62,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:59:04.291791+00:00",
+          "at": "2026-09-02T14:43:39.678452+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 220.62,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T18:59:35.450676+00:00",
+          "at": "2026-09-02T14:44:19.834268+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 220.62,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:00:06.744847+00:00",
+          "at": "2026-09-02T14:44:58.151297+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 220.62,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:00:38.328719+00:00",
+          "at": "2026-09-02T14:45:39.086436+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 220.62,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:01:09.777285+00:00",
+          "at": "2026-09-02T14:46:18.626838+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:01:41.218843+00:00",
+          "at": "2026-09-02T14:46:58.235145+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:02:12.850277+00:00",
+          "at": "2026-09-02T14:47:36.379616+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:02:44.122200+00:00",
+          "at": "2026-09-02T14:48:14.545838+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:03:15.994878+00:00",
+          "at": "2026-09-02T14:48:54.219114+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:03:47.686820+00:00",
+          "at": "2026-09-02T14:49:34.015072+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:04:19.068939+00:00",
+          "at": "2026-09-02T14:50:12.668910+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:04:50.680525+00:00",
+          "at": "2026-09-02T14:50:52.501028+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:05:22.498733+00:00",
+          "at": "2026-09-02T14:51:31.854338+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:05:54.262779+00:00",
+          "at": "2026-09-02T14:52:11.006424+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 237.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:06:25.933102+00:00",
+          "at": "2026-09-02T14:52:50.084640+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 255.29,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:06:57.465632+00:00",
+          "at": "2026-09-02T14:53:27.827953+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 255.29,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:07:29.247405+00:00",
+          "at": "2026-09-02T14:54:08.554389+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 255.29,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:08:00.907277+00:00",
+          "at": "2026-09-02T14:54:47.654883+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 256.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:08:32.530995+00:00",
+          "at": "2026-09-02T14:55:27.830232+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 256.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:09:04.187192+00:00",
+          "at": "2026-09-02T14:56:06.154915+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 256.73,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:09:35.860349+00:00",
+          "at": "2026-09-02T14:56:46.904223+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 258.71,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:10:07.675742+00:00",
+          "at": "2026-09-02T14:57:25.821382+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 258.71,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:10:39.402945+00:00",
+          "at": "2026-09-02T14:58:05.757478+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 258.71,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:11:11.302332+00:00",
+          "at": "2026-09-02T14:58:45.271303+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 261.2,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:11:43.352454+00:00",
+          "at": "2026-09-02T14:59:26.059215+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 261.2,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:12:15.287860+00:00",
+          "at": "2026-09-02T15:00:05.317339+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 261.2,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:12:47.091666+00:00",
+          "at": "2026-09-02T15:00:47.228665+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 273.07,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:13:18.983948+00:00",
+          "at": "2026-09-02T15:01:26.616893+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 273.07,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:13:50.873097+00:00",
+          "at": "2026-09-02T15:02:05.536810+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 273.07,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:14:22.598898+00:00",
+          "at": "2026-09-02T15:02:46.377110+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 288.86,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:14:54.506717+00:00",
+          "at": "2026-09-02T15:03:26.190385+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 288.86,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:15:26.609997+00:00",
+          "at": "2026-09-02T15:04:08.475897+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 288.86,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:15:58.416013+00:00",
+          "at": "2026-09-02T15:04:48.057044+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 288.86,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:16:30.543570+00:00",
+          "at": "2026-09-02T15:05:27.695601+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 294.72,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         },
         {
-          "at": "2026-09-01T19:17:02.715181+00:00",
+          "at": "2026-09-02T15:05:39.733584+00:00",
           "status": "healthy",
           "missing_sources": [],
           "stale_sources": [],
           "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:17:34.644033+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:18:06.947600+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:18:39.423646+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:19:11.607022+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:19:44.066310+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:20:16.119712+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:20:48.077179+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:21:20.513642+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:21:49.898470+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:21:54.524283+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:21:56.522886+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:21:58.709116+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
-        },
-        {
-          "at": "2026-09-01T19:22:00.802054+00:00",
-          "status": "healthy",
-          "missing_sources": [],
-          "stale_sources": [],
-          "gap_count": 0,
-          "observation_count": 10
+          "observation_count": 10,
+          "watchdog": "HEALTHY",
+          "rss_mb": 294.72,
+          "channel_status": {
+            "TRADE": "PASS",
+            "BOOK_TICKER": "PASS",
+            "DEPTH": "PASS",
+            "MARK_INDEX_FUNDING": "PASS",
+            "LIQUIDATION_LIVENESS": "PASS",
+            "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
+            "ORDERBOOK": "PASS"
+          }
         }
       ],
       "runtime_gate": {
@@ -574,9 +1218,9 @@
         "paper_accounting_ok": true,
         "alpha_gate_status": "INSUFFICIENT_SAMPLE",
         "meme_universe_ready": false,
-        "evaluated_at": "2026-09-01T19:22:14.802349+00:00",
-        "evidence_verified_at": "2026-09-01T16:55:36.226471+00:00",
-        "verification_age_sec": 8798,
+        "evaluated_at": "2026-09-02T15:06:14.909651+00:00",
+        "evidence_verified_at": "2026-09-02T14:35:19.016781+00:00",
+        "verification_age_sec": 10461,
         "verification_source": "persisted_gate_evidence",
         "current_data_health": "BLOCKED",
         "current_account_health": "NOT_APPLICABLE",
@@ -607,6 +1251,21 @@
         "ORDERBOOK_CODE_PASS": true,
         "ORDERBOOK_RUNTIME_PASS": true,
         "REAL_DATA_READY": false,
+        "historical_gate_evidence": {
+          "realtime_24h": "NOT_STARTED",
+          "paper": "NOT_STARTED",
+          "shadow": "NOT_STARTED",
+          "alpha": "INSUFFICIENT_SAMPLE",
+          "testnet": "NOT_STARTED"
+        },
+        "current_runtime_health": {
+          "data_health": "BLOCKED",
+          "account": "NOT_APPLICABLE",
+          "user_stream": "NOT_APPLICABLE",
+          "reconciliation": "OK",
+          "orderbook": "OK",
+          "transport": "DEGRADED"
+        },
         "PAPER_READY": false,
         "SHADOW_READY": false,
         "TESTNET_READY": false,
@@ -624,8 +1283,8 @@
         "PAPER_HEALTH": "NOT_STARTED",
         "TESTNET_HEALTH": "NOT_STARTED",
         "ALPHA_HEALTH": "INSUFFICIENT_SAMPLE",
-        "realtime_30m_status": "FAILED",
-        "realtime_2h_status": "NOT_STARTED",
+        "realtime_30m_status": "RUNNING",
+        "realtime_2h_status": "FAILED",
         "realtime_6h_status": "NOT_STARTED",
         "realtime_24h_status": "NOT_STARTED",
         "orderbook_health": "OK",
@@ -638,39 +1297,38 @@
           "FUTURES_DEPTH_STALE",
           "FUTURES_INDEX_PRICE_STALE",
           "FUTURES_MARK_PRICE_STALE",
+          "FUTURES_OPEN_INTEREST_STALE",
           "FUTURES_TAKER_STALE",
           "FUTURES_TRADE_STALE",
           "DATA_HEALTH_NOT_VERIFIED"
         ]
       },
-      "stage": "realtime_30m",
-      "kind": "realtime",
-      "session_id": null,
-      "commit_sha": null,
-      "start_at": "2026-09-01T18:51:47.713647+00:00",
-      "end_at": "2026-09-01T19:22:00.814295+00:00",
-      "duration_sec": 1813,
-      "process_duration_sec": 1813,
-      "healthy_sec": 1688,
-      "degraded_sec": 90,
-      "failure_sec": 0,
-      "stale_sec": 0,
-      "errors": [],
-      "channel_status": {
-        "TRADE": "PASS",
-        "BOOK_TICKER": "PASS",
-        "DEPTH": "PASS",
-        "MARK_INDEX_FUNDING": "PASS",
-        "LIQUIDATION_LIVENESS": "PASS",
-        "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
-        "ORDERBOOK": "PASS"
-      },
       "freeze_hashes": {
-        "scripts/bian_market.py": "ade303b8b446e611a9d106a531c0fef5d3e48c52dd0449e02024f3ed9df3b17c",
+        "scripts/bian_market.py": "ca4eae641dd71206b1748df51bc77ead3e7bfb431070f5220d6fc7d33f2f1056",
         "binance_client.py": "850ceefcd27282be83e37746f5d29a008efaa32d19dfe3d2c94d09703064de4b",
-        "runtime_gate.py": "d0bc4050fa08bbfa04e2b8428966330a016cfd1a494acaca640e4ba009b2cc7a",
-        "trading_store.py": "1e830f48629aaa16b65679637d410f121bda156651eb4ee471be5cb98fe2a6c4"
-      }
+        "runtime_gate.py": "9e5d38623059fc0758a39dcdc7a62b54cbbb22dad6159ab3b25aadeb7d57d0bf",
+        "trading_store.py": "5d09e72a8f7d463421fd42f93f0d07b2a3a0fb409fbc4f773453e5cd6209d872"
+      },
+      "symbol_health": {
+        "BTCUSDT": "HEALTHY"
+      },
+      "blocked_symbols": [],
+      "global_halt": false,
+      "global_missing": [],
+      "runtime_stage_validated_symbols": [
+        "BTCUSDT"
+      ],
+      "production_target_universe": [],
+      "benchmark_symbols": [
+        "BTCUSDT"
+      ],
+      "meme_universe_validated": false,
+      "qualification_scope": "BENCHMARK_ONLY",
+      "is_meme": false,
+      "SOURCE_HEALTH": "PASS",
+      "CHANNEL_HEALTH": "PASS",
+      "CONNECTION_LIFECYCLE": "PASS",
+      "EVIDENCE_SUFFICIENCY": "PASS"
     },
     "realtime_2h": {
       "status": "FAILED",
@@ -3412,13 +4070,13 @@
   "ALPHA_READY": false,
   "LIVE_PREFLIGHT": false,
   "LIVE_ALLOWED": false,
-  "session_id": "ee198366-73c6-45ee-90c8-bcc0e4ebfd99",
-  "commit_sha": "a9259815e8ca9d6810531b249347ab281a441546",
+  "session_id": "983f735b-99a5-4e0f-9cd6-15eae2c60e9b",
+  "commit_sha": "3a462a2e12a41a14b46683130500f9ecb544170f",
   "ALPHA_STATUS": "INSUFFICIENT_SAMPLE",
-  "stage": "realtime_2h",
-  "start_at": "2026-09-02T10:10:46.074028+00:00",
-  "end_at": "2026-09-02T12:11:53.644556+00:00",
-  "duration_sec": 7267,
+  "stage": "realtime_30m",
+  "start_at": "2026-09-02T14:35:19.016781+00:00",
+  "end_at": "2026-09-02T15:06:14.910069+00:00",
+  "duration_sec": 1855,
   "required_sources": [
     "FUTURES_BOOK_TICKER",
     "FUTURES_DEPTH",
@@ -3435,18 +4093,34 @@
   ],
   "channel_status": {
     "TRADE": "PASS",
-    "BOOK_TICKER": "FAIL",
-    "DEPTH": "FAIL",
+    "BOOK_TICKER": "PASS",
+    "DEPTH": "PASS",
     "MARK_INDEX_FUNDING": "PASS",
     "LIQUIDATION_LIVENESS": "PASS",
     "DEDICATED_MARK_PRICE": "NOT_REQUIRED",
-    "ORDERBOOK": "FAIL"
+    "ORDERBOOK": "PASS"
   },
-  "healthy_sec": 6735,
-  "degraded_sec": 390,
+  "healthy_sec": 1784,
+  "degraded_sec": 42,
   "failure_sec": 0,
-  "stale_sec": 2,
+  "stale_sec": 0,
   "gap_count": 0,
-  "reconnect_count": 3,
-  "errors": []
+  "reconnect_count": 18,
+  "errors": [],
+  "historical_gate_evidence": {
+    "realtime_24h": "NOT_STARTED",
+    "paper_24h": "NOT_STARTED",
+    "shadow_7d": "NOT_STARTED",
+    "alpha_oos": "INSUFFICIENT_SAMPLE",
+    "testnet": "NOT_STARTED"
+  },
+  "SOURCE_HEALTH": "PASS",
+  "CHANNEL_HEALTH": "PASS",
+  "CONNECTION_LIFECYCLE": "PASS",
+  "EVIDENCE_SUFFICIENCY": "PASS",
+  "runtime_stage_validated_symbols": [
+    "BTCUSDT"
+  ],
+  "production_target_universe": [],
+  "qualification_scope": "BENCHMARK_ONLY"
 }
