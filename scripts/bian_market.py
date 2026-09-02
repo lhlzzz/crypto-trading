@@ -3225,6 +3225,10 @@ class FuturesStreamSupervisor:
         try:
             await asyncio.gather(*tasks)
         finally:
+            try:
+                await self.flush_once()
+            except Exception:
+                LOGGER.exception("final futures stream flush failed")
             self._stopped = True
             if reconnect_task is not None:
                 reconnect_task.cancel()

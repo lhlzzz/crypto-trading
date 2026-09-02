@@ -895,6 +895,7 @@ class TradingStore:
                     "gap_duration": gap_duration,
                     "consecutive_gap_count": consecutive_gap_count,
                     "transport_source": payload.get("source"),
+                    "metadata": payload,
                 })
         # Liveness and sparse event existence are separate observations. A
         # quiet force-order channel is healthy when its heartbeat is fresh.
@@ -937,6 +938,32 @@ class TradingStore:
                 "semantics": "observed_liquidation_not_total_market_volume",
             })
         return result
+
+    def collector_lifecycle_events(self) -> list[dict[str, Any]]:
+        """Return canonical websocket reconnect events from the latest heartbeat."""
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT metadata
+                    FROM market_flow_events
+                    WHERE market = 'FUTURES'
+                      AND event_type IN ('LIQUIDATION_HEARTBEAT', 'FUTURES_LIQUIDATION_LIVENESS')
+                    ORDER BY received_timestamp DESC
+                    LIMIT 20
+                    """
+                )
+                rows = cursor.fetchall()
+        for (metadata,) in rows:
+            payload = metadata if isinstance(metadata, dict) else {}
+            nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            found = payload.get("reconnect_events") or nested.get("reconnect_events") or []
+            events = [event for event in found if isinstance(event, dict)]
+            if events:
+                return events
+        return []
 
     @staticmethod
     def _datetime(value: Any) -> datetime:

@@ -606,3 +606,106 @@ def test_testnet_acceptance_requires_full_lifecycle() -> None:
     })
     assert status == "PASSED"
     assert reason == "OK"
+
+
+def test_reconnect_events_from_lifecycle_ignore_health_sample_fallback() -> None:
+    inferred = vr.reconnect_events_from_samples([
+        {"at": "2026-09-02T00:00:00+00:00", "status": "healthy"},
+        {"at": "2026-09-02T00:00:05+00:00", "status": "failure"},
+        {"at": "2026-09-02T00:00:08+00:00", "status": "healthy"},
+    ])
+    health = _health(_required_rows())
+    health["rows"][-1]["metadata"] = {"reconnect_events": inferred}
+    assert vr.reconnect_events_from_lifecycle(health) == []
+
+
+def test_reconnect_events_from_lifecycle_read_collector_metadata() -> None:
+    event = {
+        "old_connection_id": "trade-aaa",
+        "new_connection_id": "trade-bbb",
+        "channel": "TRADE",
+        "disconnect_at": "2026-09-02T00:00:00+00:00",
+        "reconnect_at": "2026-09-02T00:00:02+00:00",
+        "recovery_ms": 2000,
+        "subscriptions_restored": True,
+        "reason": "controlled_reconnect",
+        "source": "collector_lifecycle",
+    }
+    health = _health(_required_rows())
+    health["rows"][-1]["metadata"] = {"reconnect_events": [event]}
+    events = vr.reconnect_events_from_lifecycle(health)
+    assert events == [event]
+    health["rows"][-1]["metadata"] = {}
+    health["reconnect_events"] = [event]
+    assert vr.reconnect_events_from_lifecycle(health) == [event]
+
+
+def test_paper_acceptance_fails_accounting_invariants() -> None:
+    snapshot = {
+        "database_healthy": True,
+        "observation_count": 2,
+        "positioning_count": 2,
+        "evidence_count": 2,
+        "impossible_balance": True,
+        "impossible_equity": False,
+        "invalid_margin": False,
+        "restart_recovery": True,
+    }
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=snapshot,
+    )
+    assert (status, reason) == ("FAILED", "IMPOSSIBLE_BALANCE")
+    snapshot["impossible_balance"] = False
+    snapshot["impossible_equity"] = True
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=snapshot,
+    )
+    assert (status, reason) == ("FAILED", "IMPOSSIBLE_EQUITY")
+
+
+def test_run_realtime_cancels_collector_after_window(monkeypatch) -> None:
+    import asyncio
+
+    calls: dict[str, object] = {}
+
+    async def fake_observe(*args, **kwargs):
+        calls["duration_sec"] = kwargs.get("duration_sec")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            calls["cancelled"] = True
+            raise
+
+    class FakeStore:
+        def market_data_freshness(self, *, max_age_sec=900, symbols=None):
+            return _required_rows()
+
+        def collector_lifecycle_events(self):
+            return [{
+                "old_connection_id": "trade-aaa",
+                "new_connection_id": "trade-bbb",
+                "channel": "TRADE",
+                "disconnect_at": "2026-09-02T00:00:00+00:00",
+                "reconnect_at": "2026-09-02T00:00:02+00:00",
+                "recovery_ms": 2000,
+                "subscriptions_restored": True,
+                "reason": "controlled_reconnect",
+                "source": "collector_lifecycle",
+            }]
+
+    monkeypatch.setattr(vr, "observe", fake_observe)
+    monkeypatch.setattr(vr, "TradingStore", FakeStore)
+    monkeypatch.setattr(vr, "SAMPLE_SEC", 0.05)
+    result = asyncio.run(vr.run_realtime(1, ["BTCUSDT"]))
+    assert calls["duration_sec"] is None
+    assert calls.get("cancelled") is True
+    assert result["collector_alive"] is True
+    assert result["reconnect_events"][0]["channel"] == "TRADE"
+    assert result["reconnect_events"][0]["source"] == "collector_lifecycle"
+    assert all(event.get("proof") is not False for event in result["reconnect_events"])

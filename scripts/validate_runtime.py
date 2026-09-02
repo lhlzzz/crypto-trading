@@ -371,6 +371,9 @@ def canonical_lifecycle_events(events: list[dict[str, Any]]) -> list[dict[str, A
 
 def reconnect_events_from_lifecycle(health: dict[str, Any]) -> list[dict[str, Any]]:
     collected: list[dict[str, Any]] = []
+    for event in health.get("reconnect_events") or []:
+        if isinstance(event, dict):
+            collected.append(event)
     for row in health.get("rows") or []:
         payload = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
@@ -427,12 +430,21 @@ def _health_summary(store: TradingStore, symbols: list[str]) -> dict[str, Any]:
         and str(row.get("status", "")).upper() not in HEALTHY_STATUSES | {"MISSING"}
     ]
     gaps = [row for row in rows if str(row.get("status", "")).upper() in UNSAFE_STATUSES]
+    lifecycle: list[dict[str, Any]] = []
+    getter = getattr(store, "collector_lifecycle_events", None)
+    if callable(getter):
+        try:
+            lifecycle = [event for event in (getter() or []) if isinstance(event, dict)]
+        except Exception:
+            lifecycle = []
+    lifecycle = canonical_lifecycle_events(lifecycle + reconnect_events_from_lifecycle({"rows": rows}))
     return {
         "required_sources": sorted(required),
         "missing_sources": missing,
         "stale_sources": list(dict.fromkeys(stale)),
         "gap_count": len(gaps),
         "rows": rows,
+        "reconnect_events": lifecycle,
     }
 
 
@@ -823,112 +835,137 @@ async def run_realtime(
     stale_periods = 0
     errors: list[str] = []
     persistence_ok = True
+    last_health: dict[str, Any] | None = None
     observer = asyncio.create_task(
         observe(
             symbols,
             candidate_limit=max(1, len(symbols)),
             refresh_sec=min(60.0, float(duration)),
             flush_sec=5.0,
-            duration_sec=float(duration),
+            duration_sec=None,
             controlled_reconnect_after=controlled_reconnect_after,
         )
     )
-    deadline = asyncio.get_running_loop().time() + max(1.0, float(duration))
-    last_tick = asyncio.get_running_loop().time()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, float(duration))
+    last_tick = loop.time()
     collector_alive = True
+    window_complete = False
+
+    def _record(health: dict[str, Any], elapsed_slice: int) -> None:
+        nonlocal healthy_seconds, degraded_seconds, failure_seconds, stale_periods, max_gap, last_health
+        last_health = health
+        status = _sample_status(health)
+        if status == "healthy":
+            healthy_seconds += elapsed_slice
+        elif status == "degraded":
+            degraded_seconds += elapsed_slice
+            stale_periods += 1
+        else:
+            failure_seconds += elapsed_slice
+        max_gap = max(max_gap, int(health.get("gap_count") or 0))
+        samples.append({
+            "at": _iso(),
+            "status": status,
+            "missing_sources": health.get("missing_sources"),
+            "stale_sources": health.get("stale_sources"),
+            "gap_count": health.get("gap_count"),
+            "observation_count": len(health.get("rows") or []),
+            "watchdog": watchdog_state(
+                collector_alive=collector_alive,
+                health=health,
+                persistence_ok=persistence_ok,
+            ),
+            "rss_mb": rss_mb(),
+            "channel_status": channel_status(health),
+        })
+        if on_sample is not None:
+            on_sample({
+                "health": health,
+                "samples": samples,
+                "healthy_seconds": healthy_seconds,
+                "degraded_seconds": degraded_seconds,
+                "failure_seconds": failure_seconds,
+                "collector_alive": collector_alive,
+                "persistence_ok": persistence_ok,
+                "errors": list(errors),
+                "started": started,
+            })
+
+    def _read_health() -> dict[str, Any]:
+        nonlocal persistence_ok
+        try:
+            health = _health_summary(store, compact)
+            persistence_ok = True
+            return health
+        except Exception as exc:
+            persistence_ok = False
+            errors.append(type(exc).__name__)
+            return {
+                "required_sources": sorted(runtime_required_sources()),
+                "missing_sources": ["STORE"],
+                "stale_sources": [],
+                "gap_count": 0,
+                "rows": [],
+                "reconnect_events": [],
+                "error": type(exc).__name__,
+            }
+
     try:
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0 and observer.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                window_complete = True
+                break
+            if observer.done():
+                collector_alive = False
+                errors.append("COLLECTOR_EXIT")
                 break
             wait_for = SAMPLE_SEC if remaining > SAMPLE_SEC else max(0.1, remaining)
             try:
                 await asyncio.wait_for(asyncio.shield(observer), timeout=wait_for)
+                collector_alive = False
+                errors.append("COLLECTOR_EXIT")
                 break
             except asyncio.TimeoutError:
                 pass
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
             elapsed_slice = max(1, int(now - last_tick))
             last_tick = now
-            try:
-                health = _health_summary(store, compact)
-                persistence_ok = True
-            except Exception as exc:
-                persistence_ok = False
-                errors.append(type(exc).__name__)
-                health = {
-                    "required_sources": sorted(runtime_required_sources()),
-                    "missing_sources": ["STORE"],
-                    "stale_sources": [],
-                    "gap_count": 0,
-                    "rows": [],
-                    "error": type(exc).__name__,
-                }
-            status = _sample_status(health)
-            if status == "healthy":
-                healthy_seconds += elapsed_slice
-            elif status == "degraded":
-                degraded_seconds += elapsed_slice
-                stale_periods += 1
-            else:
-                failure_seconds += elapsed_slice
-            max_gap = max(max_gap, int(health.get("gap_count") or 0))
-            collector_alive = not observer.done() or observer.exception() is None
-            samples.append({
-                "at": _iso(),
-                "status": status,
-                "missing_sources": health.get("missing_sources"),
-                "stale_sources": health.get("stale_sources"),
-                "gap_count": health.get("gap_count"),
-                "observation_count": len(health.get("rows") or []),
-                "watchdog": watchdog_state(
-                    collector_alive=collector_alive,
-                    health=health,
-                    persistence_ok=persistence_ok,
-                ),
-                "rss_mb": rss_mb(),
-                "channel_status": channel_status(health),
-            })
-            if on_sample is not None:
-                on_sample({
-                    "health": health,
-                    "samples": samples,
-                    "healthy_seconds": healthy_seconds,
-                    "degraded_seconds": degraded_seconds,
-                    "failure_seconds": failure_seconds,
-                    "collector_alive": collector_alive,
-                    "persistence_ok": persistence_ok,
-                    "errors": list(errors),
-                    "started": started,
-                })
-            if observer.done() and remaining <= 0:
-                break
-        if not observer.done():
-            await observer
-        else:
-            observer.result()
-        collector_alive = True
+            collector_alive = not observer.done()
+            _record(_read_health(), elapsed_slice)
+        if collector_alive and not observer.done():
+            _record(_read_health(), 0 if last_health is not None else 1)
+            window_complete = True
     except Exception as exc:
         collector_alive = False
         errors.append(type(exc).__name__)
         observer.cancel()
         await asyncio.gather(observer, return_exceptions=True)
         raise
+    else:
+        if not observer.done():
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
+        collector_alive = window_complete and "COLLECTOR_EXIT" not in errors
     ended = _now()
-    try:
-        final_health = _health_summary(store, compact)
-        persistence_ok = True
-    except Exception as exc:
-        persistence_ok = False
-        errors.append(type(exc).__name__)
-        final_health = {
-            "required_sources": sorted(runtime_required_sources()),
-            "missing_sources": ["STORE"],
-            "stale_sources": [],
-            "gap_count": 0,
-            "rows": [],
-        }
+    final_health = last_health or {
+        "required_sources": sorted(runtime_required_sources()),
+        "missing_sources": ["COLLECTOR"],
+        "stale_sources": [],
+        "gap_count": 0,
+        "rows": [],
+        "reconnect_events": [],
+    }
     reconnect_events = reconnect_events_from_lifecycle(final_health)
+    getter = getattr(store, "collector_lifecycle_events", None)
+    if callable(getter):
+        try:
+            reconnect_events = canonical_lifecycle_events(
+                reconnect_events + [event for event in (getter() or []) if isinstance(event, dict)]
+            )
+        except Exception:
+            pass
     diagnostic_reconnect_events = reconnect_events_from_samples(samples)
     return {
         "start_time": started.isoformat(),
@@ -954,6 +991,7 @@ async def run_realtime(
             for row in final_health.get("rows") or []
         ),
     }
+
 
 
 def _count(store: Any, name: str, default: int = 0) -> int:

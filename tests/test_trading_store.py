@@ -240,3 +240,49 @@ def test_market_data_freshness_reads_nested_health_status():
         )
     by_source = {row["source"]: row for row in result}
     assert by_source["FUTURES_DEPTH"]["status"] == "GAP"
+
+
+def test_collector_lifecycle_events_reads_latest_heartbeat():
+    event = {
+        "old_connection_id": "trade-aaa",
+        "new_connection_id": "trade-bbb",
+        "channel": "TRADE",
+        "disconnect_at": "2026-09-02T00:00:00+00:00",
+        "reconnect_at": "2026-09-02T00:00:02+00:00",
+        "recovery_ms": 2000,
+        "subscriptions_restored": True,
+        "reason": "controlled_reconnect",
+        "source": "collector_lifecycle",
+    }
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [({"reconnect_events": [event]},)]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection):
+        rows = TradingStore("postgresql://test").collector_lifecycle_events()
+    assert rows == [event]
+
+
+def test_market_data_freshness_includes_metadata_for_lifecycle():
+    now = datetime.now(timezone.utc)
+    received = now - timedelta(seconds=1)
+    timestamp = received - timedelta(milliseconds=20)
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            "BTCUSDT", "FUTURES", "LIQUIDATION_HEARTBEAT", timestamp, received, 20,
+            {"reconnect_events": [{"source": "collector_lifecycle", "channel": "TRADE"}]},
+        ),
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection), patch(
+        "trading_store._now", return_value=now
+    ):
+        rows = TradingStore("postgresql://test").market_data_freshness(
+            max_age_sec=60, symbols=["BTCUSDT"]
+        )
+    heartbeat = next(row for row in rows if row["source"] == "FUTURES_LIQUIDATION_LIVENESS")
+    assert heartbeat["metadata"]["reconnect_events"][0]["channel"] == "TRADE"
