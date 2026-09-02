@@ -468,7 +468,11 @@ class PaperExecutor(_BaseExecutor):
         entry_price: Decimal,
         leverage: Decimal,
     ) -> Decimal:
-        """Return the paper model price used for pre-trade liquidation checks."""
+        """Return the paper model price used for pre-trade liquidation checks.
+
+        PAPER_ONLY / SIMPLIFIED / NOT_BINANCE_PARITY: this is not Binance
+        liquidation engine parity.
+        """
         if direction == "FLAT":
             raise ValueError("FLAT has no liquidation price")
         return self._liquidation_price(
@@ -670,7 +674,14 @@ class PaperExecutor(_BaseExecutor):
             event_type="LIQUIDATED",
             severity="CRITICAL",
             message=f"{symbol} paper position liquidated at mark {mark_price}",
-            payload={"mode": self.config.mode, "symbol": symbol, "mark_price": str(mark_price)},
+            payload={
+                "mode": self.config.mode,
+                "symbol": symbol,
+                "mark_price": str(mark_price),
+                "scope": "PAPER_ONLY",
+                "model": "SIMPLIFIED",
+                "binance_parity": "NOT_BINANCE_PARITY",
+            },
         )
         setter = getattr(self.store, "set_halt", None)
         if setter is not None:

@@ -39,8 +39,8 @@ STAGE_SPECS = {
     "realtime_24h": {"duration": 86400, "prior": "realtime_6h", "kind": "realtime"},
     "paper_24h": {"duration": 86400, "prior": "realtime_24h", "kind": "paper"},
     "shadow_7d": {"duration": 604800, "prior": "paper_24h", "kind": "shadow"},
-    "alpha_oos": {"duration": 0, "prior": None, "kind": "alpha"},
-    "testnet": {"duration": 0, "prior": None, "kind": "testnet"},
+    "alpha_oos": {"duration": 0, "prior": "shadow_7d", "kind": "alpha"},
+    "testnet": {"duration": 0, "prior": "alpha_oos", "kind": "testnet"},
     "live_preflight": {"duration": 0, "prior": None, "kind": "live"},
 }
 DURATION_GATES = {
@@ -49,6 +49,8 @@ DURATION_GATES = {
     if spec["kind"] == "realtime"
 }
 LADDER = ("realtime_30m", "realtime_2h", "realtime_6h", "realtime_24h")
+BENCHMARK_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
+PAPER_RESTART_EXIT = 75
 STAGE_STATES = {
     "NOT_STARTED", "RUNNING", "PASSED", "FAILED", "BLOCKED", "EXPIRED",
 }
@@ -157,7 +159,7 @@ def prior_passed(stages: dict[str, Any], gate: str) -> bool:
 def expire_realtime_if_code_changed(stages: dict[str, Any]) -> list[str]:
     expired: list[str] = []
     current = _freeze_hashes()
-    for name in LADDER:
+    for name in STAGE_SPECS:
         stage = dict(stages.get(name) or {})
         if stage_status(stage) != "PASSED":
             continue
@@ -166,12 +168,49 @@ def expire_realtime_if_code_changed(stages: dict[str, Any]) -> list[str]:
             stage["freeze_hashes"] = current
             stages[name] = stage
             continue
-        if recorded != current:
+        identity_changed = recorded != current
+        symbols = [str(item) for item in (stage.get("symbol_set") or [])]
+        if symbols:
+            universe = _universe_snapshot(symbols)
+            if stage.get("universe_version") and stage.get("universe_version") != universe["universe_version"]:
+                identity_changed = True
+            if stage.get("symbol_hash") and stage.get("symbol_hash") != universe["symbol_hash"]:
+                identity_changed = True
+        requested = int(stage.get("requested_duration") or STAGE_SPECS[name]["duration"])
+        if stage.get("config_hash") and symbols:
+            expected = _config_hash(name, requested, symbols)
+            if stage.get("config_hash") != expected:
+                identity_changed = True
+        if identity_changed:
             stage["status"] = "EXPIRED"
             stage["reason"] = "CODE_CHANGE_INVALIDATED"
             stages[name] = stage
             expired.append(name)
     return expired
+
+
+def session_owner_alive(stage: dict[str, Any] | None) -> bool:
+    pid = (stage or {}).get("owner_pid")
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def recover_orphaned_sessions(stages: dict[str, Any]) -> list[str]:
+    recovered: list[str] = []
+    for name, current in list(stages.items()):
+        stage = dict(current or {})
+        if stage_status(stage) != "RUNNING":
+            continue
+        if session_owner_alive(stage):
+            continue
+        stage["status"] = "FAILED"
+        stage["reason"] = "SESSION_OWNER_DEAD"
+        stages[name] = stage
+        recovered.append(name)
+    return recovered
 
 
 def channel_status(health: dict[str, Any]) -> dict[str, str]:
@@ -299,7 +338,50 @@ def reconnect_events_from_samples(samples: list[dict[str, Any]]) -> list[dict[st
             })
             disconnect_at = None
         previous = status
+    for event in events:
+        event.setdefault("channel", None)
+        event.setdefault("reason", "health_sample_transition")
+        event["source"] = "health_sample_fallback"
+        event["proof"] = False
     return events
+
+
+def canonical_lifecycle_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    canonical: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for event in events:
+        if event.get("source") != "collector_lifecycle":
+            continue
+        if not event.get("old_connection_id") or not event.get("new_connection_id"):
+            continue
+        if not event.get("channel"):
+            continue
+        key = (
+            event.get("old_connection_id"),
+            event.get("new_connection_id"),
+            event.get("channel"),
+            event.get("reconnect_at"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        canonical.append(dict(event))
+    return canonical
+
+
+def reconnect_events_from_lifecycle(health: dict[str, Any]) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    for row in health.get("rows") or []:
+        payload = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        for event in (
+            payload.get("reconnect_events")
+            or nested.get("reconnect_events")
+            or []
+        ):
+            if isinstance(event, dict):
+                collected.append(event)
+    return canonical_lifecycle_events(collected)
 
 
 def reconnect_count_from_health(health: dict[str, Any]) -> int:
@@ -379,8 +461,9 @@ def evaluate_realtime_acceptance(
     channels = channel_status(health)
     sampled = max(1, healthy_seconds + degraded_seconds + failure_seconds)
     healthy_ratio = healthy_seconds / sampled
-    recovered = (not reconnect_events) or all(
-        event.get("subscriptions_restored") for event in reconnect_events
+    lifecycle_events = canonical_lifecycle_events(reconnect_events)
+    recovered = (not lifecycle_events) or all(
+        event.get("subscriptions_restored") for event in lifecycle_events
     )
     persistent_failure = (
         healthy_ratio < 0.8
@@ -401,9 +484,9 @@ def evaluate_realtime_acceptance(
         return "FAILED", "CHANNEL_UNHEALTHY"
     if persistent_failure:
         return "FAILED", "SOURCE_OUTAGE"
-    if stage == "realtime_24h" and not reconnect_events:
+    if stage == "realtime_24h" and not lifecycle_events:
         return "FAILED", "NO_CONTROLLED_RECONNECT"
-    if reconnect_events and not recovered:
+    if lifecycle_events and not recovered:
         return "FAILED", "RECONNECT_UNRECOVERED"
     return "PASSED", "OK"
 
@@ -428,6 +511,7 @@ def empty_stage(name: str) -> dict[str, Any]:
         "stale_sec": 0,
         "gap_count": 0,
         "reconnect_count": 0,
+        "owner_pid": None,
         "errors": [],
         "channel_status": {
             **{channel: "NOT_STARTED" for channel in REQUIRED_CHANNELS},
@@ -483,6 +567,7 @@ def migrate_report(payload: dict[str, Any]) -> dict[str, Any]:
             current["channel_status"] = _infer_channel_status(current)
         stages[name] = current
     expire_realtime_if_code_changed(stages)
+    recover_orphaned_sessions(stages)
     payload["stages"] = stages
     payload.setdefault("session_id", payload.get("session_id") or str(uuid.uuid4()))
     payload.setdefault("commit_sha", _commit_sha())
@@ -524,11 +609,64 @@ def readiness_from_stages(stages: dict[str, Any]) -> dict[str, Any]:
         "TESTNET_READY": stage_status(stages.get("testnet")) == "PASSED",
         "LIVE_PREFLIGHT": stage_status(stages.get("live_preflight")) == "PASSED",
         "LIVE_ALLOWED": False,
+        "historical_gate_evidence": {
+            "realtime_24h": stage_status(stages.get("realtime_24h")),
+            "paper_24h": stage_status(stages.get("paper_24h")),
+            "shadow_7d": stage_status(stages.get("shadow_7d")),
+            "alpha_oos": alpha_status,
+            "testnet": stage_status(stages.get("testnet")),
+        },
     }
 
 
 def store_status(status: str) -> str:
     return status if status in STORE_STATES else "FAILED"
+
+
+
+def universe_qualification(symbols: list[str]) -> dict[str, Any]:
+    compact = [item.replace("-", "").upper() for item in symbols]
+    benchmark = [item for item in compact if item in BENCHMARK_SYMBOLS]
+    production = [item for item in compact if item not in BENCHMARK_SYMBOLS]
+    benchmark_only = bool(compact) and set(compact) <= BENCHMARK_SYMBOLS
+    return {
+        "runtime_stage_validated_symbols": compact,
+        "production_target_universe": production,
+        "benchmark_symbols": benchmark,
+        "meme_universe_validated": bool(production) and not benchmark_only,
+        "qualification_scope": (
+            "BENCHMARK_ONLY" if benchmark_only else "MEME" if production and not benchmark else "MIXED"
+        ),
+        "is_meme": False if benchmark_only else bool(production),
+    }
+
+
+def evidence_planes(
+    *,
+    health: dict[str, Any],
+    channels: dict[str, str],
+    reconnect_events: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+    collector_alive: bool,
+    persistence_ok: bool,
+) -> dict[str, str]:
+    missing = bool(health.get("missing_sources") or health.get("stale_sources"))
+    source_health = "FAIL" if missing else "PASS"
+    channel_health = "PASS" if required_channels_healthy(channels) else "FAIL"
+    lifecycle = canonical_lifecycle_events(reconnect_events)
+    if lifecycle:
+        connection_lifecycle = (
+            "PASS" if all(event.get("subscriptions_restored") for event in lifecycle) else "FAIL"
+        )
+    else:
+        connection_lifecycle = "INSUFFICIENT"
+    evidence = "PASS" if (samples or health.get("rows")) and collector_alive and persistence_ok else "FAIL"
+    return {
+        "SOURCE_HEALTH": source_health,
+        "CHANNEL_HEALTH": channel_health,
+        "CONNECTION_LIFECYCLE": connection_lifecycle,
+        "EVIDENCE_SUFFICIENCY": evidence,
+    }
 
 
 def persist_store_gate(store: TradingStore | None, gate: str, status: str, detail: dict[str, Any]) -> None:
@@ -598,8 +736,12 @@ def build_session_stage(
         "failure_sec": failure_sec,
         "stale_sec": len(health.get("stale_sources") or []),
         "gap_count": int(health.get("gap_count") or 0),
-        "reconnect_count": len(reconnect_events),
-        "reconnect_events": reconnect_events,
+        "reconnect_count": len(canonical_lifecycle_events(reconnect_events)),
+        "reconnect_events": canonical_lifecycle_events(reconnect_events),
+        "diagnostic_reconnect_events": [
+            event for event in reconnect_events if event.get("source") != "collector_lifecycle"
+        ],
+        "owner_pid": os.getpid(),
         "errors": errors,
         "watchdog": watchdog,
         "rss_mb": rss_mb(),
@@ -609,6 +751,15 @@ def build_session_stage(
         "runtime_gate": runtime_gate or {},
         "freeze_hashes": _freeze_hashes(),
         **symbol_and_global_health(health),
+        **universe_qualification(symbols),
+        **evidence_planes(
+            health=health,
+            channels=channels if isinstance(channels, dict) else {},
+            reconnect_events=reconnect_events,
+            samples=samples,
+            collector_alive=watchdog != "HALT",
+            persistence_ok="STORE" not in (health.get("missing_sources") or []),
+        ),
     }
     if extra:
         stage.update(extra)
@@ -637,6 +788,13 @@ def write_session(report: dict[str, Any], stage: dict[str, Any], *, path: Path |
         "gap_count": stage.get("gap_count") or 0,
         "reconnect_count": stage.get("reconnect_count") or 0,
         "errors": stage.get("errors") or [],
+        "SOURCE_HEALTH": stage.get("SOURCE_HEALTH"),
+        "CHANNEL_HEALTH": stage.get("CHANNEL_HEALTH"),
+        "CONNECTION_LIFECYCLE": stage.get("CONNECTION_LIFECYCLE"),
+        "EVIDENCE_SUFFICIENCY": stage.get("EVIDENCE_SUFFICIENCY"),
+        "runtime_stage_validated_symbols": stage.get("runtime_stage_validated_symbols"),
+        "production_target_universe": stage.get("production_target_universe"),
+        "qualification_scope": stage.get("qualification_scope"),
         "status": stage.get("status"),
         "gate": stage["stage"],
         "stages": stages,
@@ -652,6 +810,7 @@ async def run_realtime(
     symbols: list[str],
     *,
     on_sample: Callable[[dict[str, Any]], None] | None = None,
+    controlled_reconnect_after: float | None = None,
 ) -> dict[str, Any]:
     started = _now()
     store = TradingStore()
@@ -671,6 +830,7 @@ async def run_realtime(
             refresh_sec=min(60.0, float(duration)),
             flush_sec=5.0,
             duration_sec=float(duration),
+            controlled_reconnect_after=controlled_reconnect_after,
         )
     )
     deadline = asyncio.get_running_loop().time() + max(1.0, float(duration))
@@ -768,20 +928,8 @@ async def run_realtime(
             "gap_count": 0,
             "rows": [],
         }
-    reconnect_events = reconnect_events_from_samples(samples)
-    stored_reconnects = reconnect_count_from_health(final_health)
-    if stored_reconnects > len(reconnect_events):
-        reconnect_events.extend(
-            {
-                "old_connection_id": f"ws-stored-{index}",
-                "new_connection_id": f"ws-stored-{index + 1}",
-                "disconnect_at": None,
-                "reconnect_at": None,
-                "recovery_ms": None,
-                "subscriptions_restored": not final_health.get("missing_sources"),
-            }
-            for index in range(stored_reconnects - len(reconnect_events))
-        )
+    reconnect_events = reconnect_events_from_lifecycle(final_health)
+    diagnostic_reconnect_events = reconnect_events_from_samples(samples)
     return {
         "start_time": started.isoformat(),
         "end_time": ended.isoformat(),
@@ -797,6 +945,7 @@ async def run_realtime(
         "samples": samples[-120:],
         "health": final_health,
         "reconnect_events": reconnect_events,
+        "diagnostic_reconnect_events": diagnostic_reconnect_events,
         "collector_alive": collector_alive,
         "persistence_ok": persistence_ok,
         "errors": errors,
@@ -807,18 +956,185 @@ async def run_realtime(
     }
 
 
-def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
+def _count(store: Any, name: str, default: int = 0) -> int:
+    getter = getattr(store, name, None)
+    if getter is None:
+        return default
+    try:
+        value = getter()
+    except Exception:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        return int(value.get("count") or len(value))
+    return default
+
+
+def runtime_acceptance_snapshot(store: Any, *, mode: str = "paper") -> dict[str, Any]:
+    getter = getattr(store, "runtime_acceptance_snapshot", None)
+    if getter is not None:
+        try:
+            snapshot = getter(mode=mode)
+            if isinstance(snapshot, dict):
+                return snapshot
+        except TypeError:
+            snapshot = getter()
+            if isinstance(snapshot, dict):
+                return snapshot
+        except Exception as exc:
+            return {"database_healthy": False, "error": type(exc).__name__}
+    return {
+        "database_healthy": store is not None,
+        "observation_count": _count(store, "market_observation_count"),
+        "positioning_count": _count(store, "positioning_snapshot_count"),
+        "evidence_count": _count(store, "evidence_snapshot_count"),
+        "episode_count": _count(store, "positioning_episode_count"),
+        "intent_count": _count(store, "trade_intent_count"),
+        "risk_decision_count": _count(store, "risk_event_count"),
+        "order_count": _count(store, "order_count"),
+        "fill_count": _count(store, "trade_count"),
+        "funding_count": _count(store, "funding_settlement_count"),
+        "long_count": _count(store, "long_positioning_count"),
+        "short_count": _count(store, "short_positioning_count"),
+        "long_building_count": _count(store, "long_building_count"),
+        "short_building_count": _count(store, "short_building_count"),
+        "duplicate_trades": 0,
+        "duplicate_funding": 0,
+        "invalid_positions": 0,
+        "impossible_balance": False,
+        "impossible_equity": False,
+        "invalid_margin": False,
+        "stale_open": 0,
+        "unsafe_open": 0,
+        "accounting": {},
+        "restart_recovery": True,
+        "episode_split": False,
+        "error": None,
+    }
+
+
+def _strategy_path_present(snapshot: dict[str, Any]) -> bool:
+    return all(
+        (
+            int(snapshot.get("observation_count") or 0) > 0,
+            int(snapshot.get("positioning_count") or 0) > 0,
+            int(snapshot.get("evidence_count") or 0) > 0,
+        )
+    )
+
+
+def paper_acceptance(
+    *,
+    requested_duration: int,
+    duration_sec: int,
+    process_completed: bool,
+    snapshot: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    detail = {
+        "observations": int(snapshot.get("observation_count") or 0),
+        "positioning snapshots": int(snapshot.get("positioning_count") or 0),
+        "evidence snapshots": int(snapshot.get("evidence_count") or 0),
+        "episodes": int(snapshot.get("episode_count") or 0),
+        "intents": int(snapshot.get("intent_count") or 0),
+        "risk decisions": int(snapshot.get("risk_decision_count") or 0),
+        "orders": int(snapshot.get("order_count") or 0),
+        "fills": int(snapshot.get("fill_count") or 0),
+        "funding events": int(snapshot.get("funding_count") or 0),
+        "restart recovery": bool(snapshot.get("restart_recovery", True)),
+        "duplicate accounting": int(snapshot.get("duplicate_trades") or 0)
+        + int(snapshot.get("duplicate_funding") or 0),
+        "equity invariant": not bool(snapshot.get("impossible_equity")),
+        "margin invariant": not bool(snapshot.get("invalid_margin") or snapshot.get("impossible_balance")),
+        "LONG_BUILDING observations": int(snapshot.get("long_building_count") or 0),
+        "SHORT_BUILDING observations": int(snapshot.get("short_building_count") or 0),
+        "DIRECTIONAL_SAMPLE_INSUFFICIENT": (
+            int(snapshot.get("long_building_count") or 0) == 0
+            or int(snapshot.get("short_building_count") or 0) == 0
+        ),
+        "liquidation_model": {
+            "scope": "PAPER_ONLY",
+            "model": "SIMPLIFIED",
+            "binance_parity": "NOT_BINANCE_PARITY",
+        },
+    }
+    if not process_completed:
+        return "FAILED", "PAPER_PROCESS_INCOMPLETE", detail
+    if not snapshot.get("database_healthy", True):
+        return "FAILED", "PAPER_DATABASE_UNHEALTHY", detail
+    if duration_sec < requested_duration:
+        return "FAILED", "DURATION_SHORT", detail
+    if not _strategy_path_present(snapshot):
+        return "FAILED", "PAPER_EVIDENCE_MISSING", detail
+    if int(snapshot.get("duplicate_trades") or 0) or int(snapshot.get("duplicate_funding") or 0):
+        return "FAILED", "DUPLICATE_ACCOUNTING", detail
+    if int(snapshot.get("invalid_positions") or 0):
+        return "FAILED", "INVALID_POSITION", detail
+    if snapshot.get("impossible_balance") or snapshot.get("invalid_margin"):
+        return "FAILED", "IMPOSSIBLE_BALANCE", detail
+    if snapshot.get("impossible_equity"):
+        return "FAILED", "IMPOSSIBLE_EQUITY", detail
+    if int(snapshot.get("stale_open") or 0):
+        return "FAILED", "STALE_OPEN", detail
+    if int(snapshot.get("unsafe_open") or 0):
+        return "FAILED", "UNSAFE_OPEN", detail
+    if not snapshot.get("restart_recovery", True):
+        return "FAILED", "PAPER_RESTART_RECOVERY_FAILED", detail
+    return "PASSED", "OK", detail
+
+
+def shadow_acceptance(
+    *,
+    requested_duration: int,
+    duration_sec: int,
+    snapshot: dict[str, Any],
+    real_order_delta: int | None,
+) -> tuple[str, str, dict[str, Any]]:
+    detail = {
+        "observation_count": int(snapshot.get("observation_count") or 0),
+        "positioning_count": int(snapshot.get("positioning_count") or 0),
+        "evidence_count": int(snapshot.get("evidence_count") or 0),
+        "episode_count": int(snapshot.get("episode_count") or 0),
+        "LONG_count": int(snapshot.get("long_count") or 0),
+        "SHORT_count": int(snapshot.get("short_count") or 0),
+        "real_orders": 0 if real_order_delta is None else int(real_order_delta),
+        "real_order_proof": (
+            "NOT_CHECKABLE_EXTERNALLY"
+            if real_order_delta is None
+            else "REAL_ORDER_ZERO_VERIFIED" if real_order_delta == 0 else "REAL_ORDER_DELTA"
+        ),
+        "restart_recovery": bool(snapshot.get("restart_recovery", True)),
+        "episode_split": bool(snapshot.get("episode_split")),
+    }
+    if duration_sec < requested_duration:
+        return "FAILED", "DURATION_SHORT", detail
+    if not _strategy_path_present(snapshot) or int(snapshot.get("episode_count") or 0) <= 0:
+        return "FAILED", "SHADOW_EVIDENCE_MISSING", detail
+    if real_order_delta not in {None, 0}:
+        return "FAILED", "SHADOW_REAL_ORDER_DELTA", detail
+    if snapshot.get("episode_split"):
+        return "FAILED", "SHADOW_EPISODE_SPLIT", detail
+    if not snapshot.get("restart_recovery", True):
+        return "FAILED", "SHADOW_RESTART_RECOVERY_FAILED", detail
+    return "PASSED", "OK", detail
+
+
+def _paper_command(duration: int, symbols: list[str], *, mode: str, planned_restart_after: int | None = None) -> list[str]:
     command = [
         sys.executable,
         str(Path(PROJECT_ROOT) / "paper_runner.py"),
-        "--mode", "paper",
+        "--mode", mode,
         "--duration", str(duration),
-        "--planned-restart-after", str(max(1, duration // 2)),
         "--symbols", ",".join(item.replace("-", "") for item in symbols),
     ]
-    env = dict(os.environ)
-    env["BIAN_MODE"] = "paper"
-    env["BIAN_MARKET"] = "FUTURES"
+    if planned_restart_after is not None:
+        command.extend(["--planned-restart-after", str(planned_restart_after)])
+    return command
+
+
+def _run_child(command: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
     completed = subprocess.run(
         command, cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, check=False
     )
@@ -827,88 +1143,266 @@ def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
         "returncode": completed.returncode,
         "stdout": completed.stdout[-4000:],
         "stderr": completed.stderr[-4000:],
-        "status": "PASSED" if completed.returncode == 0 else "FAILED",
-        "reason": "OK" if completed.returncode == 0 else f"PAPER_EXIT_{completed.returncode}",
+    }
+
+
+def exchange_open_order_count() -> int | None:
+    if not os.environ.get("BIAN_TESTNET_API_KEY") and not os.environ.get("BIAN_LIVE_API_KEY"):
+        return None
+    try:
+        from binance_client import ClientConfig, FuturesPrivateClient
+
+        mode = "testnet" if os.environ.get("BIAN_TESTNET_API_KEY") else "live"
+        client = FuturesPrivateClient(ClientConfig.from_env(mode))
+        getter = getattr(client, "open_orders", None) or getattr(client, "get_open_orders", None)
+        if getter is None:
+            return None
+        orders = getter()
+        return len(orders or [])
+    except Exception:
+        return None
+
+
+def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
+    env = dict(os.environ)
+    env["BIAN_MODE"] = "paper"
+    env["BIAN_MARKET"] = "FUTURES"
+    restart_after = max(1, duration // 2)
+    remaining = max(1, duration - restart_after)
+    first = _run_child(
+        _paper_command(duration, symbols, mode="paper", planned_restart_after=restart_after),
+        env,
+    )
+    second = _run_child(_paper_command(remaining, symbols, mode="paper"), env)
+    process_completed = first["returncode"] == PAPER_RESTART_EXIT and second["returncode"] == 0
+    try:
+        store = TradingStore()
+        snapshot = runtime_acceptance_snapshot(store, mode="paper")
+    except Exception as exc:
+        snapshot = {"database_healthy": False, "error": type(exc).__name__}
+    snapshot["restart_recovery"] = bool(
+        process_completed
+        and not snapshot.get("episode_split")
+        and not int(snapshot.get("duplicate_trades") or 0)
+        and not int(snapshot.get("duplicate_funding") or 0)
+    )
+    duration_sec = duration if process_completed else 0
+    status, reason, detail = paper_acceptance(
+        requested_duration=duration,
+        duration_sec=duration_sec if process_completed else 0,
+        process_completed=process_completed,
+        snapshot=snapshot,
+    )
+    return {
+        "status": status,
+        "reason": reason,
+        "first_child": first,
+        "second_child": second,
+        "paper_acceptance": detail,
+        "snapshot": snapshot,
+        "process_completed": process_completed,
     }
 
 
 def run_shadow_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
-    command = [
-        sys.executable,
-        str(Path(PROJECT_ROOT) / "paper_runner.py"),
-        "--mode", "shadow",
-        "--duration", str(duration),
-        "--symbols", ",".join(item.replace("-", "") for item in symbols),
-    ]
-    completed = subprocess.run(
-        command, cwd=PROJECT_ROOT, capture_output=True, text=True, check=False
+    before = exchange_open_order_count()
+    restart_after = max(1, duration // 2)
+    remaining = max(1, duration - restart_after)
+    first = _run_child(
+        _paper_command(duration, symbols, mode="shadow", planned_restart_after=restart_after),
+    )
+    second = _run_child(_paper_command(remaining, symbols, mode="shadow"))
+    after = exchange_open_order_count()
+    real_order_delta = None if before is None or after is None else after - before
+    try:
+        store = TradingStore()
+        snapshot = runtime_acceptance_snapshot(store, mode="shadow")
+    except Exception as exc:
+        snapshot = {"database_healthy": False, "error": type(exc).__name__}
+    process_completed = first["returncode"] == PAPER_RESTART_EXIT and second["returncode"] == 0
+    snapshot["restart_recovery"] = bool(
+        process_completed
+        and not snapshot.get("episode_split")
+        and not int(snapshot.get("duplicate_trades") or 0)
+        and not int(snapshot.get("duplicate_funding") or 0)
+    )
+    status, reason, detail = shadow_acceptance(
+        requested_duration=duration,
+        duration_sec=duration if process_completed else 0,
+        snapshot=snapshot,
+        real_order_delta=real_order_delta,
     )
     return {
-        "command": command,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout[-4000:],
-        "stderr": completed.stderr[-4000:],
-        "status": "PASSED" if completed.returncode == 0 else "FAILED",
-        "reason": "OK" if completed.returncode == 0 else f"SHADOW_EXIT_{completed.returncode}",
+        "status": status,
+        "reason": reason,
+        "first_child": first,
+        "second_child": second,
+        "shadow_acceptance": detail,
+        "snapshot": snapshot,
+        "real_order_delta": real_order_delta,
+        "process_completed": process_completed,
     }
+
+
+def _load_alpha_frames() -> list[Any]:
+    store = TradingStore()
+    getter = getattr(store, "positioning_replay_frames", None)
+    if getter is None:
+        return []
+    try:
+        return list(getter())
+    except TypeError:
+        symbols = []
+        lister = getattr(store, "positioning_symbols", None)
+        if lister is not None:
+            symbols = list(lister() or [])
+        frames: list[Any] = []
+        for symbol in symbols:
+            frames.extend(list(getter(symbol)))
+        return frames
 
 
 def run_alpha_stage() -> dict[str, Any]:
     from backtesting import evaluate_alpha_gate
 
-    result = evaluate_alpha_gate([])
+    try:
+        frames = _load_alpha_frames()
+    except Exception as exc:
+        return {
+            "status": "FAILED",
+            "reason": f"ALPHA_PERSISTENCE_UNAVAILABLE:{type(exc).__name__}",
+            "alpha_status": "INSUFFICIENT_SAMPLE",
+        }
+    result = evaluate_alpha_gate(frames)
+    long_episodes = int(result.oos_metrics.get("long_episodes") or getattr(result, "long_episodes", 0) or 0)
+    short_episodes = int(result.oos_metrics.get("short_episodes") or getattr(result, "short_episodes", 0) or 0)
+    alpha_status = result.status
+    reason = result.reason
+    if alpha_status == "ALPHA_SUPPORTED" and min(long_episodes, short_episodes) == 0:
+        alpha_status = "ALPHA_NOT_SUPPORTED"
+        reason = "DIRECTIONAL_SAMPLE_INSUFFICIENT"
     return {
-        "status": "PASSED" if result.status in {
+        "status": "PASSED" if alpha_status in {
             "INSUFFICIENT_SAMPLE", "ALPHA_NOT_SUPPORTED", "ALPHA_SUPPORTED",
         } else "FAILED",
-        "reason": result.reason,
-        "alpha_status": result.status,
+        "reason": reason,
+        "alpha_status": alpha_status,
         "strategy_version": result.strategy_version,
         "config_hash": result.config_hash,
         "parameter_hash": result.parameter_version,
+        "code_commit": _commit_sha(),
+        "universe_version": getattr(result, "universe_version", None),
+        "train_samples": result.train_samples,
+        "validation_samples": result.validation_samples,
+        "oos_samples": result.oos_samples,
+        "independent_episodes": (result.oos_metrics or {}).get("independent_episodes"),
+        "long_episodes": long_episodes,
+        "short_episodes": short_episodes,
+        "baseline": {key: (result.oos_metrics or {}).get(key) for key in ("expectancy", "net_return", "max_drawdown", "profit_factor")},
+        "cost_stress": (result.oos_metrics or {}).get("cost_stress"),
         "oos_metrics": result.oos_metrics,
+        "frame_count": len(frames),
     }
+
+
+def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    required = {
+        "account": bool(snapshot.get("account")),
+        "ONE_WAY": bool(snapshot.get("one_way")),
+        "ISOLATED": bool(snapshot.get("isolated")),
+        "LONG lifecycle": bool(snapshot.get("long_lifecycle")),
+        "SHORT lifecycle": bool(snapshot.get("short_lifecycle")),
+        "partial fill": bool(snapshot.get("partial_fill")),
+        "cancel": bool(snapshot.get("cancel")),
+        "UNKNOWN resolution": bool(snapshot.get("unknown_resolution")),
+        "USER_STREAM": bool(snapshot.get("user_stream")),
+        "listenKey": bool(snapshot.get("listen_key")),
+        "reconciliation": bool(snapshot.get("reconciliation")),
+        "restart": bool(snapshot.get("restart")),
+    }
+    missing = [name for name, ok in required.items() if not ok]
+    status = "PASSED" if not missing else "FAILED"
+    return status, "OK" if not missing else "TESTNET_LIFECYCLE_INCOMPLETE", required
 
 
 def run_testnet_stage() -> dict[str, Any]:
     if not os.environ.get("BIAN_TESTNET_API_KEY") or not os.environ.get("BIAN_TESTNET_API_SECRET"):
         return {
             "status": "BLOCKED",
-            "reason": "TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS",
+            "reason": "BLOCKED_BY_EXTERNAL_CREDENTIALS",
             "credentials": False,
         }
-    completed = subprocess.run(
-        [str(Path(PROJECT_ROOT) / "start_testnet.sh"), "--once"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        store = TradingStore()
+        snapshot = getattr(store, "testnet_lifecycle_snapshot", lambda: {})()
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+    except Exception as exc:
+        snapshot = {"error": type(exc).__name__}
+    status, reason, detail = testnet_acceptance(snapshot)
     return {
-        "status": "PASSED" if completed.returncode == 0 else "FAILED",
-        "reason": "OK" if completed.returncode == 0 else "TESTNET_PREFLIGHT_FAILED",
-        "returncode": completed.returncode,
-        "stdout": completed.stdout[-4000:],
-        "stderr": completed.stderr[-4000:],
+        "status": status,
+        "reason": reason,
+        "credentials": True,
+        "testnet_acceptance": detail,
+        "snapshot": snapshot,
     }
 
 
 def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
     stages = stages if stages is not None else load_report().get("stages") or {}
     required = {
-        "CODE_READY": True,
         "REAL_DATA_READY": stage_status(stages.get("realtime_24h")) == "PASSED",
         "PAPER_READY": stage_status(stages.get("paper_24h")) == "PASSED",
         "SHADOW_READY": stage_status(stages.get("shadow_7d")) == "PASSED",
         "ALPHA_READY": str((stages.get("alpha_oos") or {}).get("alpha_status")) == "ALPHA_SUPPORTED",
         "TESTNET_READY": stage_status(stages.get("testnet")) == "PASSED",
+        "DATABASE_HEALTHY": True,
+        "ACCOUNT_HEALTHY": True,
+        "USER_STREAM_HEALTHY": True,
+        "RECONCILIATION_HEALTHY": True,
+        "RISK_HEALTHY": True,
+        "MEME_UNIVERSE_HEALTHY": True,
     }
+    current_health: dict[str, Any] = {}
+    try:
+        store = TradingStore()
+        gate = evaluate_runtime_gate(mode="paper", store=store, symbols=["BTCUSDT"]).as_dict()
+        current_health = {
+            "current_runtime_health": gate.get("MARKET_HEALTH"),
+            "current_account_health": gate.get("ACCOUNT_HEALTH"),
+            "current_user_stream": gate.get("USER_STREAM_HEALTH"),
+            "current_reconciliation": gate.get("RECONCILIATION_HEALTH"),
+            "global_transport_health": gate.get("global_transport_health"),
+            "risk_health": gate.get("RISK_HEALTH"),
+            "meme_universe": gate.get("meme_universe"),
+        }
+        required["DATABASE_HEALTHY"] = True
+        required["ACCOUNT_HEALTHY"] = gate.get("ACCOUNT_HEALTH") in {"OK", "NOT_APPLICABLE"}
+        required["USER_STREAM_HEALTHY"] = gate.get("USER_STREAM_HEALTH") in {"OK", "NOT_APPLICABLE"}
+        required["RECONCILIATION_HEALTHY"] = gate.get("RECONCILIATION_HEALTH") == "OK"
+        required["RISK_HEALTHY"] = gate.get("RISK_HEALTH") == "SAFE"
+        required["MEME_UNIVERSE_HEALTHY"] = bool(gate.get("meme_universe"))
+        if gate.get("global_transport_health") in {"HALT", "FAILED", "BLOCKED"}:
+            required["REAL_DATA_READY"] = False
+    except Exception as exc:
+        required["DATABASE_HEALTHY"] = False
+        current_health["error"] = type(exc).__name__
     missing = [name for name, ready in required.items() if not ready]
     return {
-        "status": "FAILED",
-        "reason": "LIVE_RELEASE_GATES_PENDING" if missing else "LIVE_CONFIRMATION_REQUIRED",
+        "status": "FAILED" if missing else "PASSED",
+        "reason": "LIVE_RELEASE_GATES_PENDING" if missing else "OK",
         "missing": missing,
         "LIVE_ALLOWED": False,
+        "historical_gate_evidence": {
+            "realtime_24h": stage_status(stages.get("realtime_24h")),
+            "paper_24h": stage_status(stages.get("paper_24h")),
+            "shadow_7d": stage_status(stages.get("shadow_7d")),
+            "alpha_oos": str((stages.get("alpha_oos") or {}).get("alpha_status")),
+            "testnet": stage_status(stages.get("testnet")),
+        },
+        "current_runtime_health": current_health,
+        **required,
     }
 
 
@@ -1027,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
                     healthy_sec=snapshot["healthy_seconds"],
                     degraded_sec=snapshot["degraded_seconds"],
                     failure_sec=snapshot["failure_seconds"],
-                    reconnect_events=reconnect_events_from_samples(snapshot["samples"]),
+                    reconnect_events=reconnect_events_from_lifecycle(snapshot["health"]),
                     errors=snapshot["errors"],
                     samples=snapshot["samples"],
                     watchdog=watchdog_state(
@@ -1038,7 +1532,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 write_session(report, current)
 
-            elapsed = asyncio.run(run_realtime(duration, symbols, on_sample=_persist_sample))
+            elapsed = asyncio.run(
+                run_realtime(
+                    duration,
+                    symbols,
+                    on_sample=_persist_sample,
+                    controlled_reconnect_after=300.0 if gate == "realtime_24h" else None,
+                )
+            )
             health = elapsed["health"]
             healthy_sec = int(elapsed.get("healthy_seconds") or 0)
             degraded_sec = int(elapsed.get("degraded_seconds") or 0)

@@ -611,6 +611,10 @@ def test_paper_liquidation_halts() -> None:
     assert store.halted is True
     assert store.get_position("BTCUSDT")["position_side"] == "FLAT"
     assert any(event.get("event_type") == "LIQUIDATED" for event in store.system_events)
+    liquidated = next(event for event in store.system_events if event.get("event_type") == "LIQUIDATED")
+    assert liquidated["payload"]["scope"] == "PAPER_ONLY"
+    assert liquidated["payload"]["model"] == "SIMPLIFIED"
+    assert liquidated["payload"]["binance_parity"] == "NOT_BINANCE_PARITY"
 
 
 def test_paper_fees_are_deducted() -> None:

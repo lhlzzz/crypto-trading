@@ -776,6 +776,67 @@ def _migrate_futures_columns(cursor: Any) -> None:
         )
         cursor.execute("ALTER TABLE orders DROP COLUMN IF EXISTS quote_quantity")
     cursor.execute("DROP INDEX IF EXISTS positions_market_symbol_side_uidx")
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_quantity_nonnegative CHECK (quantity >= 0);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
+    )
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_active_entry_price_positive
+                CHECK (quantity = 0 OR entry_price > 0);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
+    )
+    cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_active_leverage_positive")
+    cursor.execute("UPDATE positions SET leverage = 1 WHERE quantity > 0 AND COALESCE(leverage, 0) <= 0")
+    cursor.execute(
+        """
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_active_leverage_positive
+            CHECK (quantity = 0 OR leverage > 0)
+        """
+    )
+    cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_active_liquidation_positive")
+    cursor.execute(
+        """
+        UPDATE positions
+        SET liquidation_price = entry_price
+        WHERE quantity > 0
+          AND (liquidation_price IS NULL OR liquidation_price <= 0)
+          AND COALESCE(entry_price, 0) > 0
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_active_liquidation_positive
+            CHECK (quantity = 0 OR (liquidation_price IS NOT NULL AND liquidation_price > 0))
+        """
+    )
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_direction_valid
+                CHECK (
+                    position_side IS NULL
+                    OR position_side IN ('LONG', 'SHORT', 'FLAT')
+                );
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
+    )
 
 
 def schema_status(dsn: str | None = None) -> dict[str, object]:

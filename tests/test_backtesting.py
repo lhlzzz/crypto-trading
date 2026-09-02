@@ -210,7 +210,8 @@ def test_alpha_gate_true_oos_and_does_not_tune_oos(monkeypatch) -> None:
     monkeypatch.setattr("backtesting.run_backtest", fake_backtest)
     result = evaluate_alpha_gate(frames, min_samples=1)
 
-    assert result.status == "ALPHA_SUPPORTED"
+    assert result.status == "ALPHA_NOT_SUPPORTED"
+    assert result.reason == "DIRECTIONAL_SAMPLE_INSUFFICIENT"
     assert result.train_samples == 8
     assert result.validation_samples == 4
     assert result.oos_samples == result.oos_metrics["independent_episodes"]

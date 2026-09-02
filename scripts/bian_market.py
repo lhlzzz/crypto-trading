@@ -149,6 +149,7 @@ class ChannelSession:
     proxy_mode: str = "DIRECT"
     subscribed: bool = False
     connection_attempts: int = 0
+    connection_id: str | None = None
 
     def __post_init__(self) -> None:
         self.channel = str(self.channel).upper()
@@ -175,6 +176,7 @@ class ChannelSession:
             "time_to_recover_ms": self.time_to_recover_ms,
             "proxy_mode": self.proxy_mode,
             "consecutive_failures": self.consecutive_failures,
+            "connection_id": self.connection_id,
         }
 
 
@@ -2624,6 +2626,7 @@ class FuturesStreamSupervisor:
         sleep: Callable[[float], Any] | None = None,
         now: Callable[[], datetime] | None = None,
         max_reconnects: int | None = None,
+        controlled_reconnect_after: float | None = None,
     ) -> None:
         if not symbols:
             raise ValueError("at least one Futures public stream symbol is required")
@@ -2664,6 +2667,10 @@ class FuturesStreamSupervisor:
         self._seen_event_ids: set[str] = set()
         self.global_transport_health = "OK"
         self._recover_started: dict[str, datetime] = {}
+        self.lifecycle_events: list[dict[str, Any]] = []
+        self._sockets: dict[str, Any] = {}
+        self._reconnect_reasons: dict[str, str] = {}
+        self._controlled_reconnect_after = controlled_reconnect_after
 
     def start(self) -> None:
         self._stopped = False
@@ -2678,6 +2685,60 @@ class FuturesStreamSupervisor:
 
     def channel_health(self) -> dict[str, dict[str, Any]]:
         return {name: session.as_health() for name, session in self.sessions.items()}
+
+    def reconnect_events(self) -> list[dict[str, Any]]:
+        """Canonical websocket lifecycle events from ChannelSession reconnects."""
+        return [dict(event) for event in self.lifecycle_events]
+
+    async def request_reconnect(self, channel: str, reason: str = "controlled_reconnect") -> None:
+        session = self.sessions.get(channel)
+        if session is None:
+            return
+        self._reconnect_reasons[channel] = reason
+        session.last_error = reason
+        ws = self._sockets.get(channel)
+        closer = getattr(ws, "close", None)
+        if closer is None:
+            return
+        result = closer()
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _new_connection_id(self, session: ChannelSession) -> str:
+        return f"{session.channel.lower()}-{uuid.uuid4().hex[:12]}"
+
+    def _mark_subscribed(self, session: ChannelSession) -> None:
+        now = self._now()
+        new_id = self._new_connection_id(session)
+        disconnected = session.last_disconnect_at is not None
+        reconnecting = session.reconnect_count > 0 or session.state == "RECONNECTING"
+        if disconnected or reconnecting:
+            started = session.last_disconnect_at or self._recover_started.get(session.channel)
+            recovery_ms = (
+                max(0, int((now - started).total_seconds() * 1000))
+                if started is not None
+                else 0
+            )
+            self.lifecycle_events.append({
+                "old_connection_id": session.connection_id or f"{session.channel.lower()}-none",
+                "new_connection_id": new_id,
+                "channel": session.channel,
+                "disconnect_at": (
+                    session.last_disconnect_at.isoformat()
+                    if session.last_disconnect_at is not None
+                    else None
+                ),
+                "reconnect_at": now.isoformat(),
+                "recovery_ms": recovery_ms,
+                "subscriptions_restored": True,
+                "reason": session.last_error or "disconnect",
+                "source": "collector_lifecycle",
+            })
+            session.time_to_recover_ms = recovery_ms
+        session.connection_id = new_id
+        session.subscribed = True
+        if session.channel == "LIQUIDATION":
+            session.state = "LIVE"
 
     def transport_health(self) -> dict[str, Any]:
         sessions = self.channel_health()
@@ -2717,10 +2778,15 @@ class FuturesStreamSupervisor:
             if liquidation is not None and liquidation.state == "LIVE"
             else (liquidation.state if liquidation is not None else "LIVE")
         )
-        reconnects = sum(session.reconnect_count for session in self.sessions.values())
+        lifecycle = self.reconnect_events()
+        reconnects = len(lifecycle)
+        attempts = sum(session.reconnect_count for session in self.sessions.values())
         for symbol in self.storage_symbols:
             event = liquidation_heartbeat_event(symbol, now, health=health)
             event["metadata"]["reconnect_count"] = reconnects
+            event["metadata"]["session_reconnect_attempts"] = attempts
+            event["metadata"]["reconnect_events"] = lifecycle
+            event["metadata"]["lifecycle_source"] = "collector_lifecycle"
             event["metadata"]["channel_health"] = self.channel_health()
             events.append(event)
         return events
@@ -2855,6 +2921,9 @@ class FuturesStreamSupervisor:
         session.consecutive_failures += 1
         session.subscribed = False
         self._recover_started.setdefault(session.channel, now)
+        pending = self._reconnect_reasons.pop(session.channel, None)
+        if pending:
+            session.last_error = pending
 
     def _handle_depth(
         self, payload: dict[str, Any], received_at: datetime
@@ -3072,6 +3141,7 @@ class FuturesStreamSupervisor:
 
         ws = await self._connect(futures_public_ws_url())
         try:
+            self._sockets[session.channel] = ws
             session.connected_at = session.connected_at or self._now()
             session.proxy_mode = "CONFIGURED" if _http_proxy() else "DIRECT"
             self._request_id += 1
@@ -3095,10 +3165,7 @@ class FuturesStreamSupervisor:
                     if payload.get("error"):
                         session.state = "FAILED"
                         raise BinanceConnectionError("subscribe_failed")
-                    subscribed = True
-                    session.subscribed = True
-                    if session.channel == "LIQUIDATION":
-                        session.state = "LIVE"
+                    self._mark_subscribed(session)
                     break
                 if payload.get("data") or payload.get("e"):
                     pre_ack.append(payload)
@@ -3134,6 +3201,7 @@ class FuturesStreamSupervisor:
                     continue
                 self.handle_payload(session.channel, data)
         finally:
+            self._sockets.pop(session.channel, None)
             closer = getattr(ws, "close", None)
             if closer is not None:
                 try:
@@ -3151,12 +3219,25 @@ class FuturesStreamSupervisor:
             for channel, session in self.sessions.items()
         ]
         flush_task = asyncio.create_task(self._flush_loop())
+        reconnect_task = None
+        if self._controlled_reconnect_after is not None:
+            reconnect_task = asyncio.create_task(self._controlled_reconnect_once())
         try:
             await asyncio.gather(*tasks)
         finally:
             self._stopped = True
+            if reconnect_task is not None:
+                reconnect_task.cancel()
             flush_task.cancel()
-            await asyncio.gather(flush_task, *tasks, return_exceptions=True)
+            await asyncio.gather(flush_task, *tasks, *((reconnect_task,) if reconnect_task is not None else ()), return_exceptions=True)
+
+    async def _controlled_reconnect_once(self) -> None:
+        await self._sleep(float(self._controlled_reconnect_after or 0))
+        if self._stopped:
+            return
+        channel = "TRADE" if "TRADE" in self.sessions else next(iter(self.sessions), None)
+        if channel:
+            await self.request_reconnect(channel, reason="controlled_reconnect")
 
 
 
@@ -3172,6 +3253,7 @@ async def stream(
     flush_sec: float,
     dsn: str | None = None,
     market: str = "SPOT",
+    controlled_reconnect_after: float | None = None,
 ) -> None:
     """Maintain a public ticker stream and persist the latest batch per interval."""
     if market.upper() == "FUTURES":
@@ -3179,6 +3261,7 @@ async def stream(
             list(symbols),
             flush_sec=flush_sec,
             dsn=dsn,
+            controlled_reconnect_after=controlled_reconnect_after,
         ).run()
         return
     pending: dict[str, dict[str, Any]] = {}
@@ -3564,6 +3647,7 @@ async def observe(
     flush_sec: float,
     dsn: str | None = None,
     duration_sec: float | None = None,
+    controlled_reconnect_after: float | None = None,
 ) -> None:
     """Continuously observe candidates without enabling any trading decision.
 
@@ -3573,15 +3657,20 @@ async def observe(
     """
     fallback = list(dict.fromkeys(fallback_symbols))
     active_symbols: tuple[str, ...] = tuple(fallback)
-    stream_tasks: list[asyncio.Task[None]] = [
-        asyncio.create_task(
+
+    def _spawn_stream(target: tuple[str, ...]) -> asyncio.Task[None]:
+        return asyncio.create_task(
             stream(
-                active_symbols,
+                target,
                 flush_sec=flush_sec,
                 dsn=dsn,
                 market="FUTURES",
+                controlled_reconnect_after=controlled_reconnect_after,
             )
         )
+
+    stream_tasks: list[asyncio.Task[None]] = [
+        _spawn_stream(active_symbols)
     ]
     deadline = (
         None
@@ -3612,14 +3701,7 @@ async def observe(
                     if streams_failed:
                         await _stop_observation_streams(stream_tasks)
                         stream_tasks = [
-                            asyncio.create_task(
-                                stream(
-                                    active_symbols,
-                                    flush_sec=flush_sec,
-                                    dsn=dsn,
-                                    market="FUTURES",
-                                )
-                            )
+                            _spawn_stream(active_symbols)
                         ]
                     done, _pending = await asyncio.wait(
                         {collect_task},
@@ -3643,14 +3725,7 @@ async def observe(
             if candidate_set != active_symbols or streams_failed:
                 await _stop_observation_streams(stream_tasks)
                 stream_tasks = [
-                    asyncio.create_task(
-                        stream(
-                            candidate_set,
-                            flush_sec=flush_sec,
-                            dsn=dsn,
-                            market="FUTURES",
-                        )
-                    ),
+                    _spawn_stream(candidate_set),
                 ]
                 active_symbols = candidate_set
             sleep_for = max(1.0, refresh_sec)
@@ -3664,14 +3739,7 @@ async def observe(
                 if any(task.done() for task in stream_tasks):
                     await _stop_observation_streams(stream_tasks)
                     stream_tasks = [
-                        asyncio.create_task(
-                            stream(
-                                active_symbols,
-                                flush_sec=flush_sec,
-                                dsn=dsn,
-                                market="FUTURES",
-                            )
-                        )
+                        _spawn_stream(active_symbols)
                     ]
                 slice_sec = min(5.0, sleep_for - slept)
                 await asyncio.sleep(slice_sec)

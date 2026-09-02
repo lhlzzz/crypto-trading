@@ -1410,8 +1410,48 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             self.assertEqual(supervisor.sessions["TRADE"].state, "LIVE")
             self.assertEqual(supervisor.sessions["TRADE"].consecutive_failures, 0)
             self.assertGreaterEqual(supervisor.sessions["TRADE"].reconnect_count, 1)
+            events = supervisor.reconnect_events()
+            self.assertTrue(events)
+            self.assertEqual(events[0]["source"], "collector_lifecycle")
+            self.assertEqual(events[0]["channel"], "TRADE")
+            self.assertTrue(events[0]["subscriptions_restored"])
+            self.assertNotEqual(events[0]["old_connection_id"], events[0]["new_connection_id"])
+            heartbeat = supervisor.build_flush_events()
+            lifecycle_rows = [
+                event for event in heartbeat
+                if (event.get("metadata") or {}).get("lifecycle_source") == "collector_lifecycle"
+            ]
+            self.assertTrue(lifecycle_rows)
+            self.assertEqual(lifecycle_rows[0]["metadata"]["reconnect_events"], events)
+            self.assertEqual(lifecycle_rows[0]["metadata"]["reconnect_count"], 1)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    def test_request_reconnect_closes_socket_with_controlled_reason(self):
+        class FakeWS:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        async def scenario() -> None:
+            socket = FakeWS()
+            supervisor = bian_market.FuturesStreamSupervisor(
+                ["BTCUSDT"],
+                flush_sec=1,
+                persist_fn=lambda report, dsn=None: None,
+                websocket_connect=lambda url: socket,
+                sleep=lambda delay: asyncio.sleep(0),
+                channels=("TRADE",),
+            )
+            supervisor._sockets["TRADE"] = socket
+            await supervisor.request_reconnect("TRADE", reason="controlled_reconnect")
+            self.assertTrue(socket.closed)
+            self.assertEqual(supervisor._reconnect_reasons["TRADE"], "controlled_reconnect")
+            self.assertEqual(supervisor.sessions["TRADE"].last_error, "controlled_reconnect")
 
         asyncio.run(scenario())
 

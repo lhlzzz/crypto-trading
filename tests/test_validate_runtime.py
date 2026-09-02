@@ -135,10 +135,13 @@ def test_24h_reconnect_pass_when_subscriptions_restored() -> None:
     events = [{
         "old_connection_id": "ws-0",
         "new_connection_id": "ws-1",
+        "channel": "TRADE",
         "disconnect_at": "2026-09-02T00:00:00+00:00",
         "reconnect_at": "2026-09-02T00:00:02+00:00",
         "recovery_ms": 2000,
         "subscriptions_restored": True,
+        "reason": "disconnect",
+        "source": "collector_lifecycle",
     }]
     status, reason = vr.evaluate_realtime_acceptance(
         stage="realtime_24h",
@@ -279,7 +282,7 @@ def test_testnet_without_credentials_is_blocked(monkeypatch) -> None:
     monkeypatch.delenv("BIAN_TESTNET_API_SECRET", raising=False)
     result = vr.run_testnet_stage()
     assert result["status"] == "BLOCKED"
-    assert result["reason"] == "TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS"
+    assert result["reason"] == "BLOCKED_BY_EXTERNAL_CREDENTIALS"
 
 
 def test_live_preflight_stays_blocked_until_release_gates_pass() -> None:
@@ -295,7 +298,8 @@ def test_live_preflight_stays_blocked_until_release_gates_pass() -> None:
     assert "REAL_DATA_READY" in result["missing"]
 
 
-def test_alpha_empty_frames_are_insufficient_sample() -> None:
+def test_alpha_empty_frames_are_insufficient_sample(monkeypatch) -> None:
+    monkeypatch.setattr(vr, "_load_alpha_frames", lambda: [])
     result = vr.run_alpha_stage()
     assert result["alpha_status"] == "INSUFFICIENT_SAMPLE"
     assert result["status"] == "PASSED"
@@ -304,9 +308,10 @@ def test_alpha_empty_frames_are_insufficient_sample() -> None:
 def test_paper_runner_accepts_duration_and_shadow_mode(monkeypatch) -> None:
     captured = {}
 
-    def fake_shadow(symbols, *, duration_sec=None):
+    def fake_shadow(symbols, *, duration_sec=None, planned_restart_after=None):
         captured["symbols"] = symbols
         captured["duration_sec"] = duration_sec
+        captured["planned_restart_after"] = planned_restart_after
 
     monkeypatch.setattr("paper_runner.run_shadow_forever", fake_shadow)
     assert paper_main(["--mode", "shadow", "--duration", "604800", "--symbols", "BTCUSDT"]) == 0
@@ -343,3 +348,261 @@ def test_session_fields_are_persisted(tmp_path: Path) -> None:
     assert payload["degraded_sec"] == 2
     assert payload["channel_status"]["DEDICATED_MARK_PRICE"] == "NOT_REQUIRED"
     assert payload["REAL_DATA_READY"] is False
+
+
+def test_inferred_reconnect_is_not_24h_proof() -> None:
+    samples = [
+        {"at": "2026-09-02T00:00:00+00:00", "status": "healthy"},
+        {"at": "2026-09-02T00:00:05+00:00", "status": "failure", "missing_sources": ["FUTURES_TRADE"]},
+        {"at": "2026-09-02T00:00:08+00:00", "status": "healthy", "missing_sources": [], "stale_sources": []},
+    ]
+    inferred = vr.reconnect_events_from_samples(samples)
+    assert inferred and inferred[0]["source"] == "health_sample_fallback"
+    health = _health(_required_rows())
+    status, reason = vr.evaluate_realtime_acceptance(
+        stage="realtime_24h",
+        duration=86400,
+        requested_duration=86400,
+        health=health,
+        healthy_seconds=86000,
+        degraded_seconds=20,
+        failure_seconds=0,
+        reconnect_events=inferred,
+        collector_alive=True,
+        persistence_ok=True,
+        unsafe_at_end=False,
+    )
+    assert status == "FAILED"
+    assert reason == "NO_CONTROLLED_RECONNECT"
+
+
+def test_orphaned_running_session_is_failed() -> None:
+    stages = {
+        "realtime_2h": {
+            "status": "RUNNING",
+            "owner_pid": 99999999,
+            "session_id": "dead",
+        }
+    }
+    recovered = vr.recover_orphaned_sessions(stages)
+    assert recovered == ["realtime_2h"]
+    assert stages["realtime_2h"]["status"] == "FAILED"
+    assert stages["realtime_2h"]["reason"] == "SESSION_OWNER_DEAD"
+
+
+def test_universe_qualification_does_not_treat_btc_as_meme_universe() -> None:
+    payload = vr.universe_qualification(["BTC-USDT"])
+    assert payload["qualification_scope"] == "BENCHMARK_ONLY"
+    assert payload["meme_universe_validated"] is False
+    assert payload["is_meme"] is False
+    assert payload["runtime_stage_validated_symbols"] == ["BTCUSDT"]
+    assert payload["production_target_universe"] == []
+
+
+def test_paper_acceptance_requires_evidence_not_returncode() -> None:
+    status, reason, detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot={
+            "database_healthy": True,
+            "observation_count": 0,
+            "positioning_count": 0,
+            "evidence_count": 0,
+        },
+    )
+    assert status == "FAILED"
+    assert reason == "PAPER_EVIDENCE_MISSING"
+    status, reason, detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot={
+            "database_healthy": True,
+            "observation_count": 4,
+            "positioning_count": 4,
+            "evidence_count": 4,
+            "episode_count": 1,
+            "intent_count": 0,
+            "risk_decision_count": 2,
+            "order_count": 0,
+            "fill_count": 0,
+            "funding_count": 0,
+            "long_building_count": 2,
+            "short_building_count": 0,
+            "duplicate_trades": 0,
+            "duplicate_funding": 0,
+            "invalid_positions": 0,
+            "impossible_balance": False,
+            "impossible_equity": False,
+            "invalid_margin": False,
+            "stale_open": 0,
+            "unsafe_open": 0,
+            "restart_recovery": True,
+        },
+    )
+    assert status == "PASSED"
+    assert detail["DIRECTIONAL_SAMPLE_INSUFFICIENT"] is True
+    assert detail["liquidation_model"]["binance_parity"] == "NOT_BINANCE_PARITY"
+
+
+def test_shadow_acceptance_requires_evidence_and_does_not_claim_uncheckable_orders() -> None:
+    snapshot = {
+        "observation_count": 3,
+        "positioning_count": 3,
+        "evidence_count": 3,
+        "episode_count": 1,
+        "long_count": 2,
+        "short_count": 0,
+        "restart_recovery": True,
+        "episode_split": False,
+    }
+    status, reason, detail = vr.shadow_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        snapshot=snapshot,
+        real_order_delta=None,
+    )
+    assert status == "PASSED"
+    assert detail["real_order_proof"] == "NOT_CHECKABLE_EXTERNALLY"
+    status, reason, detail = vr.shadow_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        snapshot=snapshot,
+        real_order_delta=1,
+    )
+    assert status == "FAILED"
+    assert reason == "SHADOW_REAL_ORDER_DELTA"
+
+
+def test_paper_stage_uses_two_child_processes(monkeypatch) -> None:
+    calls = []
+
+    def fake_child(command, env=None):
+        calls.append(command)
+        return {"command": command, "returncode": 75 if len(calls) == 1 else 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(vr, "_run_child", fake_child)
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="paper": {
+        "database_healthy": True,
+        "observation_count": 2,
+        "positioning_count": 2,
+        "evidence_count": 2,
+        "restart_recovery": True,
+    })
+    monkeypatch.setattr(vr, "TradingStore", lambda: object())
+    result = vr.run_paper_stage(10, ["BTCUSDT"])
+    assert len(calls) == 2
+    assert "--planned-restart-after" in calls[0]
+    assert result["process_completed"] is True
+
+
+def test_alpha_stage_loads_persisted_frames(monkeypatch) -> None:
+    from backtesting import AlphaGateResult
+
+    monkeypatch.setattr(vr, "_load_alpha_frames", lambda: ["frame"])
+
+    def fake_gate(frames, **kwargs):
+        assert frames == ["frame"]
+        return AlphaGateResult(
+            status="INSUFFICIENT_SAMPLE",
+            train_samples=0,
+            validation_samples=0,
+            oos_samples=0,
+            train_metrics={},
+            validation_metrics={},
+            oos_metrics={"independent_episodes": 0, "long_episodes": 0, "short_episodes": 0},
+            strategy_version="positioning-v1",
+            parameter_version="abc",
+            config_hash="abc",
+            reason="no historical frames",
+        )
+
+    monkeypatch.setattr("backtesting.evaluate_alpha_gate", fake_gate)
+    result = vr.run_alpha_stage()
+    assert result["alpha_status"] == "INSUFFICIENT_SAMPLE"
+    assert result["frame_count"] == 1
+
+
+def test_testnet_with_credentials_does_not_pass_preflight_only(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "k")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "s")
+    monkeypatch.setattr(vr, "TradingStore", lambda: type("S", (), {"testnet_lifecycle_snapshot": lambda self: {}})())
+    result = vr.run_testnet_stage()
+    assert result["status"] == "FAILED"
+    assert result["reason"] == "TESTNET_LIFECYCLE_INCOMPLETE"
+
+
+def test_evidence_planes_are_separated() -> None:
+    health = _health(_required_rows())
+    planes = vr.evidence_planes(
+        health=health,
+        channels=vr.channel_status(health),
+        reconnect_events=[],
+        samples=[{"at": "x", "status": "healthy"}],
+        collector_alive=True,
+        persistence_ok=True,
+    )
+    assert planes["SOURCE_HEALTH"] == "PASS"
+    assert planes["CHANNEL_HEALTH"] == "PASS"
+    assert planes["CONNECTION_LIFECYCLE"] == "INSUFFICIENT"
+    assert planes["EVIDENCE_SUFFICIENCY"] == "PASS"
+
+
+def test_alpha_and_testnet_cannot_skip_prior_gates(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(vr, "REPORT_PATH", tmp_path / "runtime_validation_report.json")
+    assert vr.main(["--stage", "alpha_oos"]) == 1
+    payload = json.loads((tmp_path / "runtime_validation_report.json").read_text())
+    assert payload["stages"]["alpha_oos"]["reason"] == "LADDER_SKIPPED"
+    assert vr.main(["--stage", "testnet"]) == 1
+    payload = json.loads((tmp_path / "runtime_validation_report.json").read_text())
+    assert payload["stages"]["testnet"]["reason"] == "LADDER_SKIPPED"
+
+
+def test_shadow_stage_uses_two_child_processes(monkeypatch) -> None:
+    calls = []
+
+    def fake_child(command, env=None):
+        calls.append(command)
+        return {"command": command, "returncode": 75 if len(calls) == 1 else 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(vr, "_run_child", fake_child)
+    monkeypatch.setattr(vr, "exchange_open_order_count", lambda: None)
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="shadow": {
+        "database_healthy": True,
+        "observation_count": 2,
+        "positioning_count": 2,
+        "evidence_count": 2,
+        "episode_count": 1,
+        "restart_recovery": True,
+    })
+    monkeypatch.setattr(vr, "TradingStore", lambda: object())
+    result = vr.run_shadow_stage(10, ["BTCUSDT"])
+    assert len(calls) == 2
+    assert "--planned-restart-after" in calls[0]
+    assert result["process_completed"] is True
+    assert result["shadow_acceptance"]["real_order_proof"] == "NOT_CHECKABLE_EXTERNALLY"
+
+
+def test_testnet_acceptance_requires_full_lifecycle() -> None:
+    status, reason, detail = vr.testnet_acceptance({})
+    assert status == "FAILED"
+    assert reason == "TESTNET_LIFECYCLE_INCOMPLETE"
+    assert detail["LONG lifecycle"] is False
+    assert detail["SHORT lifecycle"] is False
+    status, reason, _detail = vr.testnet_acceptance({
+        "account": True,
+        "one_way": True,
+        "isolated": True,
+        "long_lifecycle": True,
+        "short_lifecycle": True,
+        "partial_fill": True,
+        "cancel": True,
+        "unknown_resolution": True,
+        "user_stream": True,
+        "listen_key": True,
+        "reconciliation": True,
+        "restart": True,
+    })
+    assert status == "PASSED"
+    assert reason == "OK"

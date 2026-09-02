@@ -842,9 +842,7 @@ def run_forever(
                     message="planned paper restart",
                     payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
                 )
-                remaining = None if deadline is None else max(1, int(deadline - time.monotonic()))
-                run_forever(symbols, mode=resolved_mode, duration_sec=remaining)
-                return
+                raise SystemExit(75)
             time.sleep(interval)
         return
     asyncio.run(
@@ -859,13 +857,23 @@ def run_forever(
     )
 
 
-def run_shadow_forever(symbols: list[str], *, duration_sec: int | None = None) -> None:
+def run_shadow_forever(
+    symbols: list[str],
+    *,
+    duration_sec: int | None = None,
+    planned_restart_after: int | None = None,
+) -> None:
     """Record public positioning comparisons without entering the trade loop."""
     store = TradingStore()
     store.initialize()
     engine = StrategyEngine(StrategyConfig.from_env())
     interval = _int_env("POSITIONING_SHADOW_POLL_SEC", 60, minimum=1)
     deadline = None if duration_sec is None else time.monotonic() + max(1, int(duration_sec))
+    restart_at = (
+        None
+        if planned_restart_after is None
+        else time.monotonic() + max(1, int(planned_restart_after))
+    )
     while deadline is None or time.monotonic() < deadline:
         for symbol in symbols:
             try:
@@ -878,6 +886,14 @@ def run_shadow_forever(symbols: list[str], *, duration_sec: int | None = None) -
                     payload={"symbol": symbol, "error": str(exc)},
                 )
                 raise
+        if restart_at is not None and time.monotonic() >= restart_at:
+            store.record_system_event(
+                event_type="SHADOW_PLANNED_RESTART",
+                severity="INFO",
+                message="planned shadow restart",
+                payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
+            )
+            raise SystemExit(75)
         time.sleep(interval)
 
 
@@ -915,7 +931,11 @@ def main(argv: list[str] | None = None) -> int:
     symbols = _symbols(args.symbols)
     duration_sec = args.duration
     if args.mode.strip().lower() == "shadow":
-        run_shadow_forever(symbols, duration_sec=duration_sec)
+        run_shadow_forever(
+            symbols,
+            duration_sec=duration_sec,
+            planned_restart_after=args.planned_restart_after,
+        )
         return 0
     if args.attribution:
         store = TradingStore()
@@ -931,7 +951,11 @@ def main(argv: list[str] | None = None) -> int:
             print(run_shadow_cycle(symbol, store=store, engine=strategy), flush=True)
         return 0
     if args.shadow_forever:
-        run_shadow_forever(symbols, duration_sec=duration_sec)
+        run_shadow_forever(
+            symbols,
+            duration_sec=duration_sec,
+            planned_restart_after=args.planned_restart_after,
+        )
         return 0
     if args.once:
         store = TradingStore()

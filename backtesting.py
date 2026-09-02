@@ -1,6 +1,8 @@
 """Research-only backtesting entry point using the single strategy engine."""
 from __future__ import annotations
 
+import os
+
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -156,6 +158,10 @@ class AlphaGateResult:
     parameter_version: str
     config_hash: str
     reason: str
+    code_commit: str = "UNKNOWN"
+    universe_version: str = ""
+    long_episodes: int = 0
+    short_episodes: int = 0
 
     @property
     def out_of_sample_samples(self) -> int:
@@ -184,6 +190,10 @@ class AlphaGateResult:
             "config_hash": self.config_hash,
             "strategy_config_hash": self.config_hash,
             "reason": self.reason,
+            "code_commit": self.code_commit,
+            "universe_version": self.universe_version,
+            "long_episodes": self.long_episodes,
+            "short_episodes": self.short_episodes,
         }
 
 
@@ -844,6 +854,7 @@ def evaluate_alpha_gate(
             if oos_metrics is not None and "independent_episodes" in oos_metrics
             else len(oos)
         )
+        metrics = dict(oos_metrics or {})
         return AlphaGateResult(
             status=status,
             train_samples=len(train),
@@ -851,11 +862,14 @@ def evaluate_alpha_gate(
             oos_samples=resolved_oos_samples,
             train_metrics=train_metrics or {},
             validation_metrics=validation_metrics or {},
-            oos_metrics=oos_metrics or {},
+            oos_metrics=metrics,
             strategy_version=strategy_version,
             parameter_version=parameter_version,
             config_hash=config_hash,
             reason=reason,
+            code_commit=os.environ.get("GIT_COMMIT", "UNKNOWN"),
+            long_episodes=int(metrics.get("long_episodes") or 0),
+            short_episodes=int(metrics.get("short_episodes") or 0),
         )
 
     ordered = list(frames)
@@ -887,6 +901,17 @@ def evaluate_alpha_gate(
     validation_metrics = validation_forward.as_dict() if validation_forward else {}
     observation_samples = oos_forward.samples if oos_forward else 0
     episode_samples = oos_replay.independent_episodes
+    long_episodes = 0
+    short_episodes = 0
+    previous_direction = "FLAT"
+    for record in oos_replay.records:
+        direction = record.positioning.direction
+        if direction != "FLAT" and direction != previous_direction:
+            if direction == "LONG":
+                long_episodes += 1
+            elif direction == "SHORT":
+                short_episodes += 1
+        previous_direction = direction
     if episode_samples < min_samples:
         return result(
             "INSUFFICIENT_SAMPLE", train, validation, out_of_sample,
@@ -897,6 +922,8 @@ def evaluate_alpha_gate(
                 **(oos_forward.as_dict() if oos_forward else {}),
                 "observation_samples": observation_samples,
                 "independent_episodes": episode_samples,
+                "long_episodes": long_episodes,
+                "short_episodes": short_episodes,
             },
         )
     try:
@@ -925,7 +952,12 @@ def evaluate_alpha_gate(
             "cost-adjusted OOS execution could not be evaluated",
             train_metrics=train_metrics,
             validation_metrics=validation_metrics,
-            oos_metrics={"observation_samples": observation_samples, "independent_episodes": episode_samples},
+            oos_metrics={
+                "observation_samples": observation_samples,
+                "independent_episodes": episode_samples,
+                "long_episodes": long_episodes,
+                "short_episodes": short_episodes,
+            },
         )
     oos_metrics = {
         **baseline.as_dict(),
@@ -937,7 +969,11 @@ def evaluate_alpha_gate(
             "funding_multiplier": "1.50",
             "net_expectancy": str(stressed.expectancy),
             "net_return": str(stressed.net_return),
+            "max_drawdown": str(stressed.max_drawdown),
+            "profit_factor": str(stressed.profit_factor),
         },
+        "long_episodes": long_episodes,
+        "short_episodes": short_episodes,
     }
     supported = all(
         (
@@ -948,10 +984,15 @@ def evaluate_alpha_gate(
         )
     )
     return result(
-        "ALPHA_SUPPORTED" if supported else "ALPHA_NOT_SUPPORTED",
+        "ALPHA_SUPPORTED" if supported and min(long_episodes, short_episodes) > 0 else "ALPHA_NOT_SUPPORTED",
         train, validation, out_of_sample,
         "frozen OOS metrics and cost stress passed"
-        if supported else "frozen OOS metrics or cost stress failed",
+        if supported and min(long_episodes, short_episodes) > 0
+        else (
+            "DIRECTIONAL_SAMPLE_INSUFFICIENT"
+            if supported and min(long_episodes, short_episodes) == 0
+            else "frozen OOS metrics or cost stress failed"
+        ),
         train_metrics=train_metrics,
         validation_metrics=validation_metrics,
         oos_metrics=oos_metrics,

@@ -367,11 +367,22 @@ class GateResult:
             "CODE_PASS": True,
             "ORDERBOOK_CODE_PASS": True,
             "ORDERBOOK_RUNTIME_PASS": self.current_orderbook == "OK",
-            "REAL_DATA_READY": (
-                self.data_health_ok
-                and self.current_orderbook == "OK"
-                and self.global_transport_health in {"OK", "LIVE"}
-            ),
+            "REAL_DATA_READY": self.realtime_24h_status == "PASSED",
+            "historical_gate_evidence": {
+                "realtime_24h": self.realtime_24h_status,
+                "paper": self.paper_gate_status,
+                "shadow": self.shadow_gate_status,
+                "alpha": self.alpha_gate_status,
+                "testnet": self.testnet_gate_status,
+            },
+            "current_runtime_health": {
+                "data_health": self.current_data_health,
+                "account": self.current_account_health,
+                "user_stream": self.current_user_stream,
+                "reconciliation": self.current_reconciliation,
+                "orderbook": self.current_orderbook,
+                "transport": self.global_transport_health,
+            },
             "PAPER_READY": self.paper_ready,
             "SHADOW_READY": self.shadow_gate_status == "PASSED",
             "TESTNET_READY": self.testnet_ready,

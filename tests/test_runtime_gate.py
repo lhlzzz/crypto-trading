@@ -104,6 +104,18 @@ def test_paper_gate_requires_24h_acceptance_evidence() -> None:
     assert gate.paper_gate_status == "NOT_STARTED"
 
 
+def test_real_data_ready_requires_realtime_24h_not_current_freshness() -> None:
+    gate = evaluate_runtime_gate(
+        mode="paper",
+        store=RequiredFreshStore(),
+        reconciliation_ok=True,
+    )
+    payload = gate.as_dict()
+    assert payload["REAL_DATA_READY"] is False
+    assert payload["historical_gate_evidence"]["realtime_24h"] != "PASSED"
+    assert "data_health" in payload["current_runtime_health"]
+
+
 def test_missing_required_source_blocks_data_health() -> None:
     gate = evaluate_runtime_gate(
         mode="paper",

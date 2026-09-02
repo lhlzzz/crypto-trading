@@ -1223,7 +1223,7 @@ class TradingStore:
 
     def positioning_replay_frames(
         self,
-        symbol: str,
+        symbol: str | None = None,
         *,
         limit: int = 10_000,
         source_ttl_sec: int = 900,
@@ -1235,17 +1235,28 @@ class TradingStore:
         bounded_limit = max(1, min(int(limit), 100_000))
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT payload
-                    FROM positioning_snapshots
-                    WHERE symbol = %s
-                    ORDER BY observed_at, snapshot_id
-                    LIMIT %s
-                    """,
-                    (symbol.upper(), bounded_limit),
-                )
-                payloads = [dict(row[0]) for row in cursor.fetchall()]
+                if symbol:
+                    cursor.execute(
+                        """
+                        SELECT payload
+                        FROM positioning_snapshots
+                        WHERE symbol = %s
+                        ORDER BY observed_at, snapshot_id
+                        LIMIT %s
+                        """,
+                        (symbol.upper(), bounded_limit),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT payload
+                        FROM positioning_snapshots
+                        ORDER BY observed_at, snapshot_id
+                        LIMIT %s
+                        """,
+                        (bounded_limit,),
+                    )
+                payloads = [dict(row[0]) for row in cursor.fetchall() if isinstance(row[0], dict)]
         return [
             MarketFrame.from_evidence_snapshot(payload, source_ttl_sec=source_ttl_sec)
             for payload in payloads
@@ -1914,6 +1925,159 @@ class TradingStore:
                 rows = cursor.fetchall()
         columns = ("event_id", "event_type", "severity", "message", "event_at", "mode", "market")
         return [_row_dict(columns, row) for row in rows]
+
+    def runtime_acceptance_snapshot(self, *, mode: str = "paper") -> dict[str, Any]:
+        """Read canonical paper/shadow acceptance counts from PostgreSQL."""
+        import psycopg2
+
+        resolved = str(mode or "paper").strip().lower()
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                def count(sql: str, params: tuple[Any, ...] = ()) -> int:
+                    cursor.execute(sql, params)
+                    row = cursor.fetchone()
+                    return int(row[0] or 0)
+
+                observation_count = count("SELECT COUNT(*) FROM market_flow_events WHERE market = 'FUTURES'")
+                positioning_count = count("SELECT COUNT(*) FROM positioning_snapshots")
+                evidence_count = count("SELECT COUNT(*) FROM evidence_snapshots")
+                episode_count = count("SELECT COUNT(*) FROM positioning_episodes")
+                intent_count = count("SELECT COUNT(*) FROM trade_intents")
+                risk_decision_count = count("SELECT COUNT(*) FROM risk_events")
+                order_count = count("SELECT COUNT(*) FROM orders WHERE mode = %s", (resolved,))
+                fill_count = count("SELECT COUNT(*) FROM trades WHERE mode = %s", (resolved,))
+                funding_count = count("SELECT COUNT(*) FROM funding_settlements WHERE mode = %s", (resolved,))
+                long_count = count(
+                    "SELECT COUNT(*) FROM positioning_snapshots WHERE direction = 'LONG'"
+                )
+                short_count = count(
+                    "SELECT COUNT(*) FROM positioning_snapshots WHERE direction = 'SHORT'"
+                )
+                long_building_count = count(
+                    "SELECT COUNT(*) FROM positioning_snapshots WHERE state = 'LONG_BUILDING'"
+                )
+                short_building_count = count(
+                    "SELECT COUNT(*) FROM positioning_snapshots WHERE state = 'SHORT_BUILDING'"
+                )
+                duplicate_trades = count(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT source_event_id FROM trades
+                        WHERE source_event_id IS NOT NULL
+                        GROUP BY source_event_id HAVING COUNT(*) > 1
+                    ) duplicated
+                    """
+                )
+                duplicate_funding = count(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT mode, symbol, settlement_timestamp
+                        FROM funding_settlements
+                        GROUP BY mode, symbol, settlement_timestamp
+                        HAVING COUNT(*) > 1
+                    ) duplicated
+                    """
+                )
+                invalid_positions = count(
+                    """
+                    SELECT COUNT(*) FROM positions
+                    WHERE quantity < 0
+                       OR (quantity > 0 AND COALESCE(entry_price, 0) <= 0)
+                       OR (quantity > 0 AND COALESCE(leverage, 0) <= 0)
+                       OR COALESCE(position_side, 'FLAT') NOT IN ('LONG', 'SHORT', 'FLAT')
+                    """
+                )
+                stale_open = count(
+                    "SELECT COUNT(*) FROM orders WHERE status = 'OPEN' AND updated_at < NOW() - INTERVAL '1 hour'"
+                )
+                unsafe_open = count(
+                    "SELECT COUNT(*) FROM orders WHERE status IN ('UNKNOWN', 'UNSAFE')"
+                )
+                cursor.execute(
+                    """
+                    SELECT wallet_balance, used_margin, available_balance, unrealized_pnl, margin_balance, payload
+                    FROM balances
+                    WHERE mode = %s AND asset = 'USDT'
+                    """,
+                    (resolved,),
+                )
+                balance = cursor.fetchone()
+                impossible_balance = False
+                impossible_equity = False
+                invalid_margin = False
+                accounting: dict[str, str] = {}
+                if balance is not None:
+                    wallet, used, available, unrealized = (
+                        Decimal(str(balance[0] or 0)),
+                        Decimal(str(balance[1] or 0)),
+                        Decimal(str(balance[2] or 0)),
+                        Decimal(str(balance[3] or 0)),
+                    )
+                    stored_equity = Decimal(str(balance[4])) if balance[4] is not None else wallet + unrealized
+                    payload = balance[5] if isinstance(balance[5], dict) else {}
+                    realized = Decimal(str(payload.get("realized_pnl") or 0))
+                    funding = Decimal(str(payload.get("funding_pnl") or 0))
+                    fee = Decimal(str(payload.get("fee_pnl") or 0))
+                    accounting = {
+                        "wallet_balance": str(wallet),
+                        "used_margin": str(used),
+                        "available_balance": str(available),
+                        "unrealized_pnl": str(unrealized),
+                        "equity": str(wallet + unrealized),
+                        "realized_pnl": str(realized),
+                        "funding_pnl": str(funding),
+                        "fee_pnl": str(fee),
+                        "net_pnl": str(realized + unrealized + funding + fee),
+                        "formula": {
+                            "available_balance": "wallet_balance - used_margin",
+                            "equity": "wallet_balance + unrealized_pnl",
+                            "net_pnl": "realized_pnl + unrealized_pnl + funding_pnl + fee_pnl",
+                        },
+                    }
+                    impossible_balance = available != wallet - used
+                    impossible_equity = stored_equity != wallet + unrealized
+                    invalid_margin = used < 0 or wallet < 0 or available < 0
+                episode_split = count(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT symbol, market FROM positioning_episodes
+                        WHERE status IN ('OPEN', 'UNRESOLVED')
+                        GROUP BY symbol, market HAVING COUNT(*) > 1
+                    ) split_rows
+                    """
+                ) > 0
+                restart_recovery = (
+                    not episode_split
+                    and duplicate_trades == 0
+                    and duplicate_funding == 0
+                )
+        return {
+            "database_healthy": True,
+            "observation_count": observation_count,
+            "positioning_count": positioning_count,
+            "evidence_count": evidence_count,
+            "episode_count": episode_count,
+            "intent_count": intent_count,
+            "risk_decision_count": risk_decision_count,
+            "order_count": order_count,
+            "fill_count": fill_count,
+            "funding_count": funding_count,
+            "long_count": long_count,
+            "short_count": short_count,
+            "long_building_count": long_building_count,
+            "short_building_count": short_building_count,
+            "duplicate_trades": duplicate_trades,
+            "duplicate_funding": duplicate_funding,
+            "invalid_positions": invalid_positions,
+            "impossible_balance": impossible_balance,
+            "impossible_equity": impossible_equity,
+            "invalid_margin": invalid_margin,
+            "stale_open": stale_open,
+            "unsafe_open": unsafe_open,
+            "accounting": accounting,
+            "restart_recovery": restart_recovery,
+            "episode_split": episode_split,
+        }
 
     def record_runtime_gate_status(self, gate: str, status: str, *, detail: dict[str, Any] | None = None) -> UUID:
         """Persist externally verified readiness evidence for one gate."""
