@@ -611,3 +611,22 @@ def test_record_trade_uses_canonical_mode_not_payload():
         )
     args = cursor.execute.call_args.args[1]
     assert args[11] == "testnet"
+
+
+def test_list_reconciliation_orders_uses_explicit_mode_and_includes_filled():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection), patch.dict(
+        "os.environ", {"BIAN_MODE": "live"}, clear=False
+    ):
+        store.list_reconciliation_orders(mode="testnet")
+    sql, params = cursor.execute.call_args.args
+    assert "WHERE mode = %s AND market = %s" in sql
+    assert "LIMIT" not in sql
+    assert params[0] == "testnet"
+    assert "PENDING" not in sql
+    assert "FILLED" not in sql

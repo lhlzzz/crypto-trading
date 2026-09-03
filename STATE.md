@@ -199,10 +199,10 @@ research baseline until positioning gates pass.
 
 ## Current verification (2026-09-03)
 
-Final commit: `e5f673fe743a76eaff6ed10028388bc866751fa8`.
-Base: `20c06aadfb99be1932da7350bf4e33ff5278303a`.
+Final commit: `d1fd55dde97cab5cf7f0ce22475ca46205119b63`.
+Base: `c35379a38f8d6defd613ac66e4618f7553cc8867`.
 
-This round closed Futures runtime safety and evidence boundaries. `402` pytest
+This round closed remaining exchange-trade reconciliation gaps. `409` pytest
 tests passed. `compileall` PASS. `git diff --check` PASS.
 `LIVE_ALLOWED=false`. `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`.
 
@@ -219,6 +219,9 @@ P0/P1 results:
 - Live preflight constructs TradingStore + FuturesPrivateClient; missing
   credentials are BLOCKED, not PASS.
 - Canonical symbols: `trading_symbols_for_mode(mode)`.
+- Unknown Binance exchange trades HALT; they are never ignored.
+- Trade recovery includes FILLED canonical orders, not only pending rows.
+- Reconciler queries pass explicit `mode=self.mode` and do not follow `BIAN_MODE`.
 
 Realtime/paper/shadow evidence is not current:
 

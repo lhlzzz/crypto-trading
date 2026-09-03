@@ -23,11 +23,36 @@ class StoreStub:
     def is_halted(self) -> bool:
         return self.halted
 
-    def list_open_local_orders(self):
-        return self.orders
+    def list_open_local_orders(self, *, mode=None, market="FUTURES"):
+        rows = self.orders
+        if mode is not None:
+            rows = [row for row in rows if row.get("mode") in {None, mode}]
+        pending = {
+            "CREATED", "RISK_APPROVED", "SUBMITTED", "ACKNOWLEDGED",
+            "NEW", "PENDING", "PARTIALLY_FILLED", "UNKNOWN",
+        }
+        return [row for row in rows if row.get("status") in pending or row.get("status") is None]
 
-    def list_balances(self):
-        return self.balances
+    def list_reconciliation_orders(self, *, mode, market="FUTURES", session_id=None):
+        return [row for row in self.orders if row.get("mode") in {None, mode}]
+
+    def list_orders(self, limit=50, *, mode=None, market="FUTURES"):
+        rows = self.orders
+        if mode is not None:
+            rows = [row for row in rows if row.get("mode") in {None, mode}]
+        return rows
+
+    def list_trades(self, limit=50, *, mode=None, market="FUTURES"):
+        rows = self.trades
+        if mode is not None:
+            rows = [row for row in rows if row.get("mode") in {None, mode}]
+        return rows
+
+    def list_balances(self, *args, **kwargs):
+        mode = kwargs.get("mode")
+        if mode is None:
+            return self.balances
+        return [row for row in self.balances if row.get("mode") in {None, mode}]
 
     def list_positions(self, **kwargs):
         return self.positions
@@ -49,6 +74,11 @@ class StoreStub:
         self.positions.append({"symbol": symbol, **fields})
 
     def record_trade(self, order_id, **fields):
+        exchange_trade_id = fields.get("exchange_trade_id")
+        if exchange_trade_id is not None:
+            for existing in self.trades:
+                if str(existing.get("exchange_trade_id")) == str(exchange_trade_id):
+                    return existing.get("order_id", order_id)
         self.trades.append({"order_id": order_id, **fields})
         return order_id
 
@@ -181,6 +211,7 @@ def test_rest_user_trade_preserves_binance_trade_id() -> None:
             "symbol": "BTCUSDT",
             "side": "BUY",
             "status": "FILLED",
+            "mode": "testnet",
         }],
     )
     client = ClientStub(
@@ -396,3 +427,196 @@ def test_short_position_uses_position_side_not_negative_quantity() -> None:
     )
     result = Reconciler(store, client=client, mode="testnet").recover()
     assert result.status == "SAFE"
+
+
+def _safe_account_store(**kwargs):
+    store_kwargs = {
+        "balances": [{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
+        "positions": [{
+            "symbol": "BTCUSDT",
+            "quantity": "0.1",
+            "position_side": "LONG",
+            "entry_price": "100",
+            "average_price": "100",
+        }],
+    }
+    store_kwargs.update(kwargs)
+    return StoreStub(**store_kwargs)
+
+
+def _trade_client(trades):
+    client = ClientStub(
+        positions=[{"symbol": "BTCUSDT", "positionAmt": "0.1", "entryPrice": "100", "leverage": "2"}],
+    )
+    client.get_user_trades = lambda symbol, limit=None: trades  # type: ignore[method-assign]
+    return client
+
+
+def test_unknown_exchange_trade_halts() -> None:
+    store = _safe_account_store()
+    client = _trade_client([
+        {
+            "id": 999,
+            "orderId": 888,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.safe_to_trade is False
+    assert result.status == "HALT"
+    assert store.halt_calls
+    assert "unknown exchange trade" in result.differences[0]
+    assert "exchange_trade_id=999" in result.differences[0]
+    assert "exchange_order_id=888" in result.differences[0]
+    assert store.trades == []
+
+
+def test_filled_local_order_recovers_binance_trade() -> None:
+    store = _safe_account_store(orders=[{
+        "order_id": "X",
+        "client_order_id": "c-1",
+        "exchange_order_id": "9",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "status": "FILLED",
+        "mode": "testnet",
+    }])
+    client = _trade_client([
+        {
+            "id": 88,
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+        }
+    ])
+    reconciler = Reconciler(store, client=client, mode="testnet")
+    result = reconciler.recover()
+    assert result.status == "SAFE"
+    assert result.safe_to_trade is True
+    trade = next(item for item in store.trades if item.get("exchange_trade_id") == "88")
+    assert trade["exchange_trade_id"] == "88"
+    assert trade["order_id"] == "X"
+
+
+def test_duplicate_reconciliation_does_not_duplicate_exchange_trade() -> None:
+    store = _safe_account_store(orders=[{
+        "order_id": "X",
+        "client_order_id": "c-1",
+        "exchange_order_id": "9",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "status": "FILLED",
+        "mode": "testnet",
+    }])
+    client = _trade_client([
+        {
+            "id": 88,
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    reconciler = Reconciler(store, client=client, mode="testnet")
+    first = reconciler.recover()
+    second = reconciler.recover()
+    assert first.status == "SAFE"
+    assert second.status == "SAFE"
+    trades = [item for item in store.trades if item.get("exchange_trade_id") == "88"]
+    assert len(trades) == 1
+
+
+def test_reconciler_mode_overrides_environment_mode(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_MODE", "live")
+    store = _safe_account_store(orders=[
+        {
+            "order_id": "live-1",
+            "client_order_id": "live-c",
+            "exchange_order_id": "9",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "FILLED",
+            "mode": "live",
+        },
+        {
+            "order_id": "tn-1",
+            "client_order_id": "tn-c",
+            "exchange_order_id": "9",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "FILLED",
+            "mode": "testnet",
+        },
+    ])
+    client = _trade_client([
+        {
+            "id": 88,
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "SAFE"
+    assert [item["order_id"] for item in store.trades] == ["tn-1"]
+    assert all(item.get("mode") == "testnet" for item in store.trades)
+
+
+def test_unknown_exchange_trade_is_not_swallowed_by_missing_loader() -> None:
+    store = _safe_account_store()
+    store.list_reconciliation_orders = None  # type: ignore[assignment]
+    store.list_orders = None  # type: ignore[assignment]
+    client = _trade_client([
+        {
+            "id": 999,
+            "orderId": 888,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "HALT"
+    assert result.safe_to_trade is False
+    assert store.halt_calls
+    assert "unknown exchange trade" in result.differences[0]
+    mismatch = [item for item in store.events if item.get("event_type") == "RECONCILIATION_MISMATCH"]
+    assert mismatch
+
+
+def test_missing_exchange_trade_id_fails_closed() -> None:
+    store = _safe_account_store(orders=[{
+        "order_id": "X",
+        "client_order_id": "c-1",
+        "exchange_order_id": "9",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "status": "FILLED",
+        "mode": "testnet",
+    }])
+    client = _trade_client([
+        {
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "HALT"
+    assert result.safe_to_trade is False
+    assert "missing exchange_trade_id" in result.differences[0]
+    assert store.trades == []

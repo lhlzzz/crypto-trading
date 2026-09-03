@@ -31,15 +31,15 @@ calling Risk, Execution, TradeIntent creation, or order submission.
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
 
-Current validation status on 2026-09-03, commit `e5f673fe743a76eaff6ed10028388bc866751fa8`:
-code checks are `402` pytest tests passed, `compileall` PASS, `git diff --check`
+Current validation status on 2026-09-03, commit `d1fd55dde97cab5cf7f0ce22475ca46205119b63`:
+code checks are `409` pytest tests passed, `compileall` PASS, `git diff --check`
 PASS. PostgreSQL schema/status remains healthy. `LIVE_ALLOWED=false`.
 `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`. UserStream failure blocks OPEN;
 REDUCE/CLOSE remains available under current risk/reconciliation rules.
 Gate evidence is current-session scoped. `exchange_trade_id` is persisted.
 Positions are isolated by `(mode, market, symbol)`. Validation episodes are
 session-scoped. Startup recomputes the canonical gate after reconciliation.
-Canonical symbols come from `trading_symbols_for_mode()`. Freeze-path and
+Canonical symbols come from `trading_symbols_for_mode()`. Unknown Binance exchange trades HALT. FILLED local orders remain visible to trade recovery. Reconciler queries use explicit `mode=self.mode`. Freeze-path and
 runtime-safety files changed, so prior realtime evidence remains `EXPIRED`
 and must not be reused: `REALTIME_30M=EXPIRED`, `REALTIME_2H=EXPIRED`,
 `REALTIME_6H=NOT_STARTED`, `REALTIME_24H=NOT_STARTED`. `PAPER_24H=NOT_STARTED`,

@@ -2895,6 +2895,55 @@ class TradingStore:
             if row["status"] in PENDING_ORDER_STATES
         ]
 
+    def list_reconciliation_orders(
+        self,
+        *,
+        mode: str,
+        market: str = "FUTURES",
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load canonical Futures orders for one explicit runtime mode.
+
+        Recovery must see FILLED/CANCELLED/EXPIRED identities, not only pending
+        rows. Session filtering is opt-in so historical canonical orders remain
+        visible to exchange truth.
+        """
+        import psycopg2
+
+        resolved_mode = str(mode).strip().lower()
+        if resolved_mode not in {"paper", "testnet", "live"}:
+            raise ValueError("reconciliation orders require a canonical mode")
+        params: list[Any] = [resolved_mode, market.upper()]
+        session_sql = ""
+        if session_id:
+            session_sql = " AND validation_session_id = %s"
+            params.append(str(session_id))
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT order_id, intent_id, symbol, side, order_type,
+                           client_order_id, exchange_order_id, quantity,
+                           price, executed_quantity, status,
+                           mode, created_at, updated_at, expires_at,
+                           position_side, position_action, reduce_only, leverage
+                    FROM orders
+                    WHERE mode = %s AND market = %s
+                    """ + session_sql + """
+                    ORDER BY created_at DESC
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        columns = (
+            "order_id", "intent_id", "symbol", "side", "order_type",
+            "client_order_id", "exchange_order_id", "quantity",
+            "price", "executed_quantity", "status",
+            "mode", "created_at", "updated_at", "expires_at",
+            "position_side", "position_action", "reduce_only", "leverage",
+        )
+        return [_row_dict(columns, row) for row in rows]
+
     def list_trades(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
         import psycopg2
 

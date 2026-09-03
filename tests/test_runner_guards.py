@@ -41,7 +41,7 @@ class StoreStub:
     def is_halted(self):
         return self.halted
 
-    def list_open_local_orders(self):
+    def list_open_local_orders(self, *args, **kwargs):
         return []
 
 

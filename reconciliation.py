@@ -63,7 +63,7 @@ class Reconciler:
             return self._fail(f"reconciliation failed: {exc}")
 
     def _recover_paper(self) -> ReconciliationResult:
-        for order in self.store.list_open_local_orders():
+        for order in self.store.list_open_local_orders(mode=self.mode):
             if order["status"] == "UNKNOWN":
                 return self._fail(
                     f"paper order {order['client_order_id']} remains UNKNOWN"
@@ -164,7 +164,7 @@ class Reconciler:
         }
         local_balances = {
             str(row["asset"]): row
-            for row in self.store.list_balances()
+            for row in self.store.list_balances(mode=self.mode)
             if row.get("mode") == self.mode
         }
         if snapshot.mode not in {"testnet", "live"}:
@@ -277,7 +277,7 @@ class Reconciler:
             for row in broker_orders
             if row.get("clientOrderId") or row.get("origClientOrderId")
         }
-        local_orders = self.store.list_open_local_orders()
+        local_orders = self.store.list_open_local_orders(mode=self.mode)
         local_client_ids = {str(row["client_order_id"]) for row in local_orders}
         recovered_orders = 0
         for order in local_orders:
@@ -303,25 +303,96 @@ class Reconciler:
         )
         return recovered_orders
 
+    def _reconciliation_orders(self) -> list[dict[str, Any]]:
+        """Load canonical Futures orders for this reconciler mode, including FILLED."""
+        for name in ("list_reconciliation_orders", "list_orders"):
+            lister = getattr(self.store, name, None)
+            if not callable(lister):
+                continue
+            try:
+                rows = lister(mode=self.mode, market="FUTURES")
+            except TypeError:
+                try:
+                    rows = lister(mode=self.mode)
+                except TypeError:
+                    continue
+            return [row for row in list(rows or []) if isinstance(row, dict)]
+        lister = getattr(self.store, "list_open_local_orders", None)
+        if not callable(lister):
+            raise RuntimeError("canonical order loader is unavailable")
+        try:
+            rows = lister(mode=self.mode)
+        except TypeError:
+            rows = lister()
+        return [row for row in list(rows or []) if isinstance(row, dict)]
+
+    def _trade_reconciliation_symbols(self, local_orders: list[dict[str, Any]]) -> list[str]:
+        symbols: set[str] = set()
+        for order in local_orders:
+            symbol = str(order.get("symbol") or "").strip().upper()
+            if symbol:
+                symbols.add(symbol)
+        lister = getattr(self.store, "list_positions", None)
+        if callable(lister):
+            try:
+                rows = lister(mode=self.mode)
+            except TypeError:
+                rows = lister()
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol") or "").strip().upper()
+                if symbol:
+                    symbols.add(symbol)
+        try:
+            from runtime_gate import trading_symbols_for_mode
+
+            symbols.update(str(item).strip().upper() for item in trading_symbols_for_mode(self.mode) if str(item).strip())
+        except Exception:
+            pass
+        return sorted(symbols)
+
+    def _existing_exchange_trade_ids(self) -> set[str]:
+        lister = getattr(self.store, "list_trades", None)
+        rows: list[Any]
+        if callable(lister):
+            try:
+                rows = list(lister(mode=self.mode) or [])
+            except TypeError:
+                rows = list(lister() or [])
+        else:
+            rows = list(getattr(self.store, "trades", None) or [])
+        found: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            trade_id = row.get("exchange_trade_id")
+            if trade_id is None or str(trade_id).strip() == "":
+                continue
+            found.add(str(trade_id))
+        return found
+
     def _reconcile_user_trades(self, differences: list[str]) -> int:
         getter = getattr(self.client, "get_user_trades", None)
         recorder = getattr(self.store, "record_trade", None)
-        if not callable(getter) or not callable(recorder):
+        if not callable(getter):
+            return 0
+        local_orders = self._reconciliation_orders()
+        symbols = self._trade_reconciliation_symbols(local_orders)
+        if not symbols:
+            return 0
+        if not callable(recorder):
+            differences.append("trade persistence is unavailable")
             return 0
         recovered = 0
         seen: set[str] = set()
-        local_orders = list(self.store.list_open_local_orders())
-        symbols = sorted(
-            {
-                str(order.get("symbol") or "")
-                for order in local_orders
-                if order.get("symbol")
-            }
-        )
+        existing = self._existing_exchange_trade_ids()
         by_exchange_id = {
             str(order.get("exchange_order_id")): order
             for order in local_orders
-            if order.get("exchange_order_id")
+            if order.get("exchange_order_id") is not None
+            and str(order.get("exchange_order_id")).strip() != ""
+            and str(order.get("mode") or self.mode) == self.mode
         }
         for symbol in symbols:
             try:
@@ -329,19 +400,37 @@ class Reconciler:
             except Exception as exc:
                 differences.append(f"user trade lookup failed: {symbol}: {exc}")
                 continue
+            if not rows:
+                continue
             for row in rows:
                 if not isinstance(row, dict):
                     continue
+                exchange_order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
                 exchange_trade_id = row.get("id")
-                if exchange_trade_id is None:
+                if exchange_trade_id is None or str(exchange_trade_id).strip() == "":
+                    differences.append(
+                        "unknown exchange trade: missing exchange_trade_id, "
+                        f"exchange_order_id={exchange_order_id or '<missing>'}, symbol={symbol}"
+                    )
                     continue
                 trade_key = str(exchange_trade_id)
                 if trade_key in seen:
                     continue
                 seen.add(trade_key)
-                exchange_order_id = str(row.get("orderId") or "")
+                if not exchange_order_id:
+                    differences.append(
+                        "unknown exchange trade: "
+                        f"exchange_trade_id={trade_key}, exchange_order_id=<missing>, symbol={symbol}"
+                    )
+                    continue
                 local = by_exchange_id.get(exchange_order_id)
                 if local is None:
+                    differences.append(
+                        "unknown exchange trade: "
+                        f"exchange_trade_id={trade_key}, exchange_order_id={exchange_order_id}, symbol={symbol}"
+                    )
+                    continue
+                if trade_key in existing:
                     continue
                 recorder(
                     local["order_id"],
@@ -355,12 +444,14 @@ class Reconciler:
                     market="FUTURES",
                     position_side=str(row.get("positionSide") or local.get("position_side") or "").upper() or None,
                     exchange_trade_id=trade_key,
+                    mode=self.mode,
                     payload={
                         "source": "binance_rest",
                         "exchange_trade_id": trade_key,
                         "mode": self.mode,
                     },
                 )
+                existing.add(trade_key)
                 recovered += 1
         return recovered
 
