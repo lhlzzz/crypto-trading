@@ -85,12 +85,53 @@ class Reconciler:
         if differences:
             self._record_differences(differences)
             return self._fail("; ".join(differences))
+        record_system = getattr(self.store, "record_system_event", None)
+        if callable(record_system):
+            exchange_positions = []
+            getter = getattr(self.client, "get_positions", None)
+            if callable(getter):
+                for row in getter() or []:
+                    if not row.get("symbol"):
+                        continue
+                    direction, quantity = _exchange_position(row)
+                    exchange_positions.append(
+                        {
+                            "symbol": str(row.get("symbol")),
+                            "position_side": direction,
+                            "quantity": str(quantity),
+                        }
+                    )
+            exchange_flat = all(
+                Decimal(str(item.get("quantity") or 0)) == 0
+                or str(item.get("position_side") or "FLAT").upper() == "FLAT"
+                for item in exchange_positions
+            )
+            record_system(
+                event_type="RECONCILIATION_OK",
+                severity="INFO",
+                message="local and exchange state match",
+                payload={
+                    "mode": self.mode,
+                    "ok": True,
+                    "open_matches": True,
+                    "recovered_orders": recovered_orders,
+                    "recovered_balances": recovered_balances,
+                    "recovered_positions": recovered_positions,
+                    "exchange_positions": exchange_positions,
+                    "exchange_flat": exchange_flat,
+                    "local_flat": all(
+                        Decimal(str(row.get("quantity") or 0)) == 0
+                        or str(row.get("position_side") or "FLAT").upper() == "FLAT"
+                        for row in (getattr(self.store, "list_positions", lambda: [])() or [])
+                    ),
+                },
+            )
         return ReconciliationResult(
             "SAFE",
             True,
             recovered_orders=recovered_orders,
-            recovered_balances=recovered_balances,
             recovered_positions=recovered_positions,
+            recovered_balances=recovered_balances,
         )
 
     def _reconcile_balances(
@@ -371,6 +412,38 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                     **(current.get("payload") or {}),
                     "source": getattr(event, "source", "USER_STREAM"),
                     "completeness": getattr(event, "completeness", "PARTIAL"),
+                },
+            )
+        record_system = getattr(store, "record_system_event", None)
+        if callable(record_system):
+            symbol = next(
+                (
+                    str(position.get("symbol") or "")
+                    for position in getattr(event, "position_updates", ())
+                    if position.get("symbol")
+                ),
+                "USDT",
+            )
+            record_system(
+                event_type="USER_STREAM_ACCOUNT_UPDATE",
+                severity="INFO",
+                message="user stream ACCOUNT_UPDATE observed",
+                payload={
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "event_time": getattr(event, "event_time_ms", None),
+                    "execution_type": getattr(event, "execution_type", None) or "ACCOUNT_UPDATE",
+                    "symbol": symbol,
+                    "exchange_order_id": getattr(event, "exchange_order_id", None),
+                    "position_updates": [
+                        {
+                            "symbol": str(position.get("symbol") or ""),
+                            "position_side": position.get("position_side"),
+                            "quantity": str(position.get("quantity") or "0"),
+                        }
+                        for position in getattr(event, "position_updates", ())
+                        if position.get("symbol")
+                    ],
                 },
             )
         return

@@ -190,6 +190,7 @@ class UserStreamClient:
         on_event: EventCallback | None = None,
         on_reconcile: ReconcileCallback | None = None,
         on_halt: HaltCallback | None = None,
+        on_listen_key: Callable[[str], Awaitable[None] | None] | None = None,
         rest_client: Any | None = None,
         websocket_connect: Callable[[str], Any] | None = None,
         reconnect_delay_sec: float = 2,
@@ -203,6 +204,7 @@ class UserStreamClient:
         self.on_event = on_event
         self.on_reconcile = on_reconcile
         self.on_halt = on_halt
+        self.on_listen_key = on_listen_key
         self._rest = rest_client
         self._websocket_connect = websocket_connect or _default_websocket_connect
         self._stopped = False
@@ -250,6 +252,7 @@ class UserStreamClient:
         self.connection_attempts += 1
         listen_key = self._client().create_listen_key()
         self._listen_key = listen_key
+        _dispatch(self.on_listen_key, listen_key)
         websocket = await _maybe_await(self._websocket_connect(self._ws_url(listen_key)))
         self._websocket = websocket
         self.state = "LIVE"

@@ -600,8 +600,8 @@ def test_shadow_stage_uses_two_child_processes(monkeypatch) -> None:
     assert len(calls) == 2
     assert "--planned-restart-after" in calls[0]
     assert result["process_completed"] is True
-    assert result["status"] == "BLOCKED"
-    assert result["shadow_acceptance"]["real_order_proof"] == "INSUFFICIENT_EVIDENCE"
+    assert result["status"] != "PASSED"
+    assert result["actual_duration_sec"] < 10
 
 
 def test_testnet_acceptance_requires_full_lifecycle() -> None:
@@ -915,6 +915,7 @@ def test_live_preflight_rejects_not_applicable_account_health(monkeypatch) -> No
 
 def _testnet_evidence(**overrides):
     evidence = {
+        "source": "database",
         "session_id": "tn-1",
         "start_time": "2026-09-03T00:00:00+00:00",
         "end_time": "2026-09-03T00:10:00+00:00",
@@ -925,7 +926,7 @@ def _testnet_evidence(**overrides):
             "user_stream_observed": True,
             "local_state_updated": True,
             "reconciliation_matches": True,
-            "close": {"status": "FILLED", "reconciled_flat": True},
+            "close": {"status": "FILLED", "exchange_order_id": "104", "reconciled_flat": True},
         },
         "short": {
             "order": {"client_order_id": "S-1", "exchange_order_id": "101"},
@@ -933,19 +934,57 @@ def _testnet_evidence(**overrides):
             "user_stream_observed": True,
             "local_state_updated": True,
             "reconciliation_matches": True,
-            "close": {"status": "FILLED", "reconciled_flat": True},
+            "close": {"status": "FILLED", "exchange_order_id": "105", "reconciled_flat": True},
         },
-        "partial_fill": {"status": "PARTIALLY_FILLED", "exchange_order_id": "102"},
-        "cancel": {"status": "CANCELLED", "exchange_order_id": "103"},
+        "partial_fill": {
+            "status": "PARTIALLY_FILLED",
+            "order_id": "p-1",
+            "exchange_order_id": "102",
+            "event_type": "USER_STREAM_ORDER_UPDATE",
+            "event_id": "ev-partial",
+        },
+        "cancel": {
+            "status": "CANCELLED",
+            "order_id": "c-1",
+            "exchange_order_id": "103",
+            "event_type": "ORDER_CANCELLED",
+            "event_id": "ev-cancel",
+        },
         "unknown_order": {
             "status": "UNKNOWN",
             "resolved_by": "client_order_id",
             "resubmitted": False,
             "resolved_status": "FILLED",
+            "halted": False,
         },
-        "user_stream": {"events": 4},
-        "listen_key": {"created": True},
-        "reconciliation": {"ok": True, "open_matches": True},
+        "user_stream": {
+            "events": [
+                {
+                    "event_id": "ev-trade",
+                    "exchange_order_id": "100",
+                    "symbol": "BTCUSDT",
+                    "event_time": "2026-09-03T00:01:00+00:00",
+                    "execution_type": "TRADE",
+                    "event_type": "ORDER_TRADE_UPDATE",
+                },
+                {
+                    "event_id": "ev-account",
+                    "symbol": "BTCUSDT",
+                    "event_time": "2026-09-03T00:01:01+00:00",
+                    "execution_type": "ACCOUNT_UPDATE",
+                    "event_type": "ACCOUNT_UPDATE",
+                },
+            ]
+        },
+        "listen_key": {"created": True, "listen_key": "lk-1"},
+        "reconciliation": {
+            "ok": True,
+            "open_matches": True,
+            "orders": [{"local_order_id": "L-1", "exchange_order_id": "100", "match": True}],
+            "fills": [{"trade_id": "1", "exchange_trade_id": "t-1", "match": True}],
+            "local_flat": True,
+            "exchange_flat": True,
+        },
         "restart": {"ok": True},
     }
     evidence.update(overrides)
@@ -1044,3 +1083,315 @@ def test_pending_and_terminal_order_states_are_canonical() -> None:
                 snapshot=_paper_ok_snapshot(stale_pending_order=1),
             )
             assert (status_name, reason) == ("FAILED", "STALE_PENDING_ORDER")
+
+
+def _session_times(start, pre, post, end, requested=10):
+    return {
+        "started_at": start,
+        "pre_restart_at": pre,
+        "post_restart_at": post,
+        "ended_at": end,
+        "pre_restart_snapshot": {"positions": []},
+        "post_restart_snapshot": {"positions": []},
+        "requested_duration": requested,
+    }
+
+
+def test_session_wall_clock_short_fails() -> None:
+    proof = vr.session_wall_clock_proof(
+        _session_times(
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T00:00:04+00:00",
+            "2026-09-03T00:00:05+00:00",
+            "2026-09-03T00:00:09+00:00",
+        ),
+        requested_duration=10,
+    )
+    assert proof["ok"] is False
+    assert proof["reason"] == "DURATION_SHORT"
+    assert proof["actual_duration_sec"] == 9
+
+
+def test_session_wall_clock_exact_and_long_pass() -> None:
+    exact = vr.session_wall_clock_proof(
+        _session_times(
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T00:00:04+00:00",
+            "2026-09-03T00:00:05+00:00",
+            "2026-09-03T00:00:10+00:00",
+        ),
+        requested_duration=10,
+    )
+    assert exact["ok"] is True
+    assert exact["actual_duration_sec"] == 10
+    long = vr.session_wall_clock_proof(
+        _session_times(
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T00:00:04+00:00",
+            "2026-09-03T00:00:05+00:00",
+            "2026-09-03T00:00:11+00:00",
+        ),
+        requested_duration=10,
+    )
+    assert long["ok"] is True
+    assert long["actual_duration_sec"] == 11
+
+
+def test_session_wall_clock_does_not_round_down_to_pass() -> None:
+    proof = vr.session_wall_clock_proof(
+        _session_times(
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T12:00:00+00:00",
+            "2026-09-03T12:00:01+00:00",
+            "2026-09-03T23:59:59+00:00",
+        ),
+        requested_duration=86400,
+    )
+    assert proof["ok"] is False
+    assert proof["actual_duration_sec"] == 86399
+    assert proof["reason"] == "DURATION_SHORT"
+
+
+def test_restart_total_wall_clock_can_pass() -> None:
+    proof = vr.session_wall_clock_proof(
+        _session_times(
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T12:00:00+00:00",
+            "2026-09-03T12:00:01+00:00",
+            "2026-09-04T00:00:00+00:00",
+        ),
+        requested_duration=86400,
+    )
+    assert proof["ok"] is True
+    assert proof["actual_duration_sec"] == 86400
+
+
+def test_paper_stage_correct_returncodes_with_short_wall_clock_fail(monkeypatch) -> None:
+    calls = []
+
+    def fake_child(command, env=None):
+        calls.append(command)
+        return {"command": command, "returncode": 75 if len(calls) == 1 else 0, "stdout": "", "stderr": ""}
+
+    class Store:
+        def bind_validation_session(self, *args, **kwargs):
+            return None
+
+        def expire_stale_validation_sessions(self, **kwargs):
+            return 0
+
+        def finish_validation_session(self, *args, **kwargs):
+            return None
+
+        def load_validation_session(self, session_id):
+            return _session_times(
+                "2026-09-03T00:00:00+00:00",
+                "2026-09-03T00:00:01+00:00",
+                "2026-09-03T00:00:02+00:00",
+                "2026-09-03T00:00:03+00:00",
+            )
+
+        def compare_restart_snapshots(self, pre, post):
+            return {"ok": True, "reason": "OK"}
+
+    monkeypatch.setattr(vr, "_run_child", fake_child)
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="paper", session_id=None: {
+        **_paper_ok_snapshot(session_id=session_id or "paper-sess", mode=mode),
+        "restart_recovery": True,
+    })
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    result = vr.run_paper_stage(10, ["BTCUSDT"])
+    assert result["process_completed"] is True
+    assert result["status"] == "FAILED"
+    assert result["reason"] == "DURATION_SHORT"
+    assert result["actual_duration_sec"] == 3
+
+
+def test_paper_stage_restart_total_duration_can_pass(monkeypatch) -> None:
+    calls = []
+
+    def fake_child(command, env=None):
+        calls.append(command)
+        return {"command": command, "returncode": 75 if len(calls) == 1 else 0, "stdout": "", "stderr": ""}
+
+    class Store:
+        def bind_validation_session(self, *args, **kwargs):
+            return None
+
+        def expire_stale_validation_sessions(self, **kwargs):
+            return 0
+
+        def finish_validation_session(self, *args, **kwargs):
+            return None
+
+        def load_validation_session(self, session_id):
+            return _session_times(
+                "2026-09-03T00:00:00+00:00",
+                "2026-09-03T00:00:05+00:00",
+                "2026-09-03T00:00:06+00:00",
+                "2026-09-03T00:00:10+00:00",
+            )
+
+        def compare_restart_snapshots(self, pre, post):
+            return {"ok": True, "reason": "OK"}
+
+    monkeypatch.setattr(vr, "_run_child", fake_child)
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="paper", session_id=None: {
+        **_paper_ok_snapshot(session_id=session_id or "paper-sess", mode=mode),
+        "restart_recovery": True,
+        "long_building_count": 1,
+        "short_building_count": 1,
+    })
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    result = vr.run_paper_stage(10, ["BTCUSDT"])
+    assert result["process_completed"] is True
+    assert result["status"] == "PASSED"
+    assert result["actual_duration_sec"] == 10
+    assert "--planned-restart-after" in calls[0]
+
+
+def test_testnet_json_only_evidence_cannot_pass_runtime(monkeypatch) -> None:
+    class Store:
+        def bind_validation_session(self, *args, **kwargs):
+            return None
+
+        def expire_stale_validation_sessions(self, **kwargs):
+            return 0
+
+        def testnet_lifecycle_evidence(self, session_id=None):
+            return {"session_id": session_id, "source": "database"}
+
+        def record_testnet_lifecycle_evidence(self, evidence):
+            return None
+
+        def finish_validation_session(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "k")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "s")
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    result = vr.run_testnet_stage(session_id="new-session")
+    assert result["status"] == "FAILED"
+    assert result["reason"] == "TESTNET_LIFECYCLE_INCOMPLETE"
+    assert result["source"] == "database"
+
+
+def test_testnet_missing_real_facts_fail() -> None:
+    cases = {
+        "missing real order": _testnet_evidence(long={"order": {}, "fills": [], "close": {}}),
+        "missing exchange_order_id": _testnet_evidence(long={
+            "order": {"client_order_id": "L-1"},
+            "fills": [{"trade_id": "1"}],
+            "user_stream_observed": True,
+            "local_state_updated": True,
+            "reconciliation_matches": True,
+            "close": {"status": "FILLED", "exchange_order_id": "104", "reconciled_flat": True},
+        }),
+        "missing UserStream event": _testnet_evidence(user_stream={"observed": True}),
+        "missing reconciliation": _testnet_evidence(reconciliation={"ok": True}),
+        "not flat after close": _testnet_evidence(reconciliation={
+            "ok": True,
+            "open_matches": True,
+            "orders": [{"local_order_id": "L-1", "exchange_order_id": "100", "match": True}],
+            "local_flat": False,
+            "exchange_flat": False,
+        }),
+        "exchange not flat": _testnet_evidence(reconciliation={
+            "ok": True,
+            "open_matches": True,
+            "orders": [{"local_order_id": "L-1", "exchange_order_id": "100", "match": True}],
+            "local_flat": True,
+            "exchange_flat": False,
+        }),
+        "partial fill missing": _testnet_evidence(partial_fill={}),
+        "cancel missing": _testnet_evidence(cancel={}),
+    }
+    for name, evidence in cases.items():
+        status, reason, detail = vr.testnet_acceptance(evidence)
+        assert status == "FAILED", name
+        assert reason == "TESTNET_LIFECYCLE_INCOMPLETE", name
+
+
+def test_testnet_unknown_resubmit_and_unresolved_fail() -> None:
+    status, reason, _detail = vr.testnet_acceptance(_testnet_evidence(unknown_order={
+        "status": "UNKNOWN",
+        "resolved_by": "client_order_id",
+        "resubmitted": True,
+        "resolved_status": "FILLED",
+        "halted": False,
+    }))
+    assert (status, reason) == ("FAILED", "TESTNET_UNKNOWN_RESUBMITTED")
+    status, reason, _detail = vr.testnet_acceptance(_testnet_evidence(unknown_order={
+        "status": "UNKNOWN",
+        "resolved_by": "client_order_id",
+        "resubmitted": False,
+        "resolved_status": None,
+        "halted": True,
+    }))
+    assert (status, reason) == ("FAILED", "TESTNET_UNKNOWN_UNRESOLVED")
+
+
+def test_old_session_facts_cannot_pass_new_session() -> None:
+    from trading_store import derive_testnet_lifecycle_facts
+
+    old_facts = derive_testnet_lifecycle_facts(
+        session={"session_id": "old", "started_at": "2026-01-01T00:00:00+00:00", "ended_at": "2026-01-01T00:10:00+00:00"},
+        orders=[{
+            "order_id": "o1",
+            "client_order_id": "L-1",
+            "exchange_order_id": "100",
+            "symbol": "BTCUSDT",
+            "status": "FILLED",
+            "position_side": "LONG",
+            "position_action": "OPEN",
+        }],
+        order_events=[],
+        trades=[{"trade_id": "1", "order_id": "o1", "quantity": "0.01"}],
+        positions=[{"symbol": "BTCUSDT", "position_side": "FLAT", "quantity": "0"}],
+        system_events=[],
+    )
+    new_facts = derive_testnet_lifecycle_facts(
+        session={"session_id": "new", "started_at": "2026-09-03T00:00:00+00:00", "ended_at": "2026-09-03T00:10:00+00:00"},
+        orders=[],
+        order_events=[],
+        trades=[],
+        positions=[{"symbol": "BTCUSDT", "position_side": "FLAT", "quantity": "0"}],
+        system_events=[],
+    )
+    assert old_facts["session_id"] == "old"
+    assert new_facts["session_id"] == "new"
+    status, reason, _detail = vr.testnet_acceptance(new_facts)
+    assert status == "FAILED"
+    assert reason in {"TESTNET_LIFECYCLE_INCOMPLETE", "TESTNET_UNKNOWN_UNRESOLVED"}
+
+
+def test_acceptance_path_files_are_freeze_paths() -> None:
+    assert "scripts/validate_runtime.py" in vr.FREEZE_PATHS
+    assert "scripts/database.py" in vr.FREEZE_PATHS
+    stages = {
+        "realtime_30m": {
+            "status": "PASSED",
+            "freeze_hashes": {path: "old" for path in vr.FREEZE_PATHS},
+        }
+    }
+    expired = vr.expire_realtime_if_code_changed(stages)
+    assert expired == ["realtime_30m"]
+
+
+def test_db_expired_session_cannot_keep_report_passed(monkeypatch) -> None:
+    class Store:
+        def expire_stale_validation_sessions(self, **kwargs):
+            return 1
+
+        def load_validation_session(self, session_id):
+            return {"session_id": session_id, "status": "EXPIRED"}
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {
+        "paper_24h": {"status": "PASSED", "session_id": "sess-expired"},
+        "shadow_7d": {"status": "NOT_STARTED"},
+    }
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert mismatched == ["paper_24h"]
+    assert stages["paper_24h"]["status"] == "EXPIRED"
+    assert vr.prior_passed(stages, "shadow_7d") is False

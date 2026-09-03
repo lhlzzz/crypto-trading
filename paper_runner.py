@@ -38,6 +38,26 @@ from trade_intent import TradeIntent
 from trading_store import TradingStore
 
 
+def _session_deadline_monotonic(duration_sec: int | None) -> float | None:
+    started_raw = os.environ.get("BIAN_VALIDATION_STARTED_AT", "").strip()
+    requested_raw = os.environ.get("BIAN_VALIDATION_REQUESTED_DURATION", "").strip()
+    if started_raw and requested_raw:
+        started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        remaining = int(requested_raw) - (datetime.now(timezone.utc) - started).total_seconds()
+        return time.monotonic() + max(0.0, remaining)
+    if duration_sec is None:
+        return None
+    return time.monotonic() + max(1, int(duration_sec))
+
+
+def _heartbeat(store: TradingStore) -> None:
+    beater = getattr(store, "heartbeat_validation_session", None)
+    if callable(beater):
+        beater()
+
+
 def _record_restart_snapshot(store: TradingStore, phase: str, *, mode: str, symbols: list[str]) -> None:
     recorder = getattr(store, "record_restart_snapshot", None)
     snapshotter = getattr(store, "account_continuity_snapshot", None)
@@ -760,11 +780,18 @@ async def _run_private_forever(
         ClientConfig.from_env(mode),
         on_event=lambda event: apply_user_stream_event(store, event),
         on_reconcile=lambda: reconciler.recover(),
+        on_listen_key=lambda key: store.record_system_event(
+            event_type="LISTEN_KEY_CREATED",
+            severity="INFO",
+            message="user stream listenKey created",
+            payload={"listen_key": key, "created": True},
+        ),
     )
     stream_task = asyncio.create_task(stream.run_forever())
     interval = max(1, int(os.environ.get("BIAN_PAPER_POLL_SEC", "60")))
     try:
         while True:
+            _heartbeat(store)
             for symbol in symbols:
                 try:
                     result = await asyncio.to_thread(
@@ -818,13 +845,14 @@ def run_forever(
     )
     if resolved_mode == "paper":
         interval = max(1, int(os.environ.get("BIAN_PAPER_POLL_SEC", "60")))
-        deadline = None if duration_sec is None else time.monotonic() + max(1, int(duration_sec))
+        deadline = _session_deadline_monotonic(duration_sec)
         restart_at = (
             None
             if planned_restart_after is None
             else time.monotonic() + max(1, int(planned_restart_after))
         )
         while deadline is None or time.monotonic() < deadline:
+            _heartbeat(store)
             for symbol in symbols:
                 try:
                     print(
@@ -884,13 +912,14 @@ def run_shadow_forever(
         _record_restart_snapshot(store, "post_restart", mode="shadow", symbols=symbols)
     engine = StrategyEngine(StrategyConfig.from_env())
     interval = _int_env("POSITIONING_SHADOW_POLL_SEC", 60, minimum=1)
-    deadline = None if duration_sec is None else time.monotonic() + max(1, int(duration_sec))
+    deadline = _session_deadline_monotonic(duration_sec)
     restart_at = (
         None
         if planned_restart_after is None
         else time.monotonic() + max(1, int(planned_restart_after))
     )
     while deadline is None or time.monotonic() < deadline:
+        _heartbeat(store)
         for symbol in symbols:
             try:
                 print(run_shadow_cycle(symbol, store=store, engine=engine), flush=True)

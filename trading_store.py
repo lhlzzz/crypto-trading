@@ -40,6 +40,18 @@ def _as_utc(value: Any) -> datetime:
     return result if result.tzinfo is not None else result.replace(tzinfo=timezone.utc)
 
 
+def _json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def empty_runtime_acceptance(
     *,
     mode: str,
@@ -60,6 +72,17 @@ def empty_runtime_acceptance(
         "scoped_end": scoped_end,
         "commit_sha": commit_sha,
         "observation_count": 0,
+        "session_market_flow_count": 0,
+        "evidence_scope": {
+            "orders": "session",
+            "trades": "session",
+            "observations": "session",
+            "market_flow_events": "session",
+            "balances": "current_exchange_truth",
+            "positions": "current_exchange_truth",
+        },
+        "balance_scope": "current_exchange_truth",
+        "position_scope": "current_exchange_truth",
         "positioning_count": 0,
         "evidence_count": 0,
         "episode_count": 0,
@@ -90,6 +113,295 @@ def empty_runtime_acceptance(
     }
 
 
+def derive_testnet_lifecycle_facts(
+    *,
+    session: dict[str, Any] | None,
+    orders: list[dict[str, Any]],
+    order_events: list[dict[str, Any]],
+    trades: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    system_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive Testnet acceptance facts from session-scoped database rows."""
+    row = session if isinstance(session, dict) else {}
+    session_id = str(row.get("session_id") or "")
+    events_by_order: dict[str, list[dict[str, Any]]] = {}
+    for event in order_events:
+        order_id = str(event.get("order_id") or "")
+        events_by_order.setdefault(order_id, []).append(event)
+    trades_by_order: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        trades_by_order.setdefault(str(trade.get("order_id") or ""), []).append(trade)
+
+    def _direction(order: dict[str, Any]) -> str:
+        return str(order.get("position_side") or "").upper()
+
+    def _action(order: dict[str, Any]) -> str:
+        return str(order.get("position_action") or "").upper()
+
+    def _fills(order: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "trade_id": str(trade.get("trade_id") or ""),
+                "quantity": str(trade.get("quantity") or "0"),
+                "source_event_id": trade.get("source_event_id"),
+            }
+            for trade in trades_by_order.get(str(order.get("order_id") or ""), [])
+        ]
+
+    def _user_stream_for(order: dict[str, Any]) -> list[dict[str, Any]]:
+        observed = []
+        for event in events_by_order.get(str(order.get("order_id") or ""), []):
+            if str(event.get("event_type") or "") != "USER_STREAM_ORDER_UPDATE":
+                continue
+            payload = _json_obj(event.get("payload"))
+            observed.append(
+                {
+                    "event_id": event.get("event_id") or payload.get("event_id"),
+                    "exchange_order_id": order.get("exchange_order_id") or payload.get("exchange_order_id"),
+                    "symbol": order.get("symbol") or payload.get("symbol"),
+                    "event_time": str(event.get("event_at") or payload.get("event_time") or ""),
+                    "execution_type": payload.get("execution_type") or payload.get("x") or event.get("status"),
+                    "event_type": payload.get("e") or payload.get("event_type") or "ORDER_TRADE_UPDATE",
+                }
+            )
+        return observed
+
+    def _reconciled(order: dict[str, Any]) -> bool:
+        return any(
+            str(event.get("event_type") or "") in {"ORDER_RECONCILED", "ORDER_RECONCILED_AFTER_UNKNOWN"}
+            for event in events_by_order.get(str(order.get("order_id") or ""), [])
+        )
+
+    def _leg(direction: str) -> dict[str, Any]:
+        opens = [
+            order for order in orders
+            if _direction(order) == direction and _action(order) == "OPEN"
+        ]
+        closes = [
+            order for order in orders
+            if _direction(order) == direction and _action(order) in {"CLOSE", "REDUCE"}
+        ]
+        open_order = next((order for order in opens if order.get("exchange_order_id")), opens[0] if opens else {})
+        close_order = next((order for order in closes if order.get("exchange_order_id")), closes[0] if closes else {})
+        stream = _user_stream_for(open_order) + _user_stream_for(close_order)
+        fills = _fills(open_order)
+        local_flat = all(
+            Decimal(str(position.get("quantity") or 0)) == 0
+            or str(position.get("position_side") or "FLAT").upper() == "FLAT"
+            for position in positions
+        )
+        return {
+            "order": {
+                "order_id": open_order.get("order_id"),
+                "client_order_id": open_order.get("client_order_id"),
+                "exchange_order_id": open_order.get("exchange_order_id"),
+                "symbol": open_order.get("symbol"),
+                "status": open_order.get("status"),
+            },
+            "fills": fills,
+            "user_stream_observed": bool(stream),
+            "local_state_updated": bool(open_order.get("status")),
+            "reconciliation_matches": _reconciled(open_order) or _reconciled(close_order),
+            "close": {
+                "order_id": close_order.get("order_id"),
+                "exchange_order_id": close_order.get("exchange_order_id"),
+                "status": close_order.get("status"),
+                "reconciled_flat": local_flat and bool(close_order),
+                "reconciliation_matches": _reconciled(close_order) or local_flat,
+            },
+        }
+
+    partial = next(
+        (
+            {
+                "status": "PARTIALLY_FILLED",
+                "order_id": order.get("order_id"),
+                "exchange_order_id": order.get("exchange_order_id"),
+                "event_type": event.get("event_type"),
+                "event_id": event.get("event_id"),
+            }
+            for order in orders
+            for event in events_by_order.get(str(order.get("order_id") or ""), [])
+            if str(order.get("status") or "").upper() == "PARTIALLY_FILLED"
+            or str(event.get("status") or "").upper() == "PARTIALLY_FILLED"
+        ),
+        {},
+    )
+    cancel = next(
+        (
+            {
+                "status": "CANCELLED",
+                "order_id": order.get("order_id"),
+                "exchange_order_id": order.get("exchange_order_id"),
+                "event_type": event.get("event_type"),
+                "event_id": event.get("event_id"),
+            }
+            for order in orders
+            for event in events_by_order.get(str(order.get("order_id") or ""), [])
+            if str(order.get("status") or "").upper() in {"CANCELLED", "CANCELED"}
+            and str(event.get("event_type") or "") in {"ORDER_CANCELLED", "CANCEL_RECONCILED"}
+        ),
+        {},
+    )
+    unknown = {}
+    for order in orders:
+        events = events_by_order.get(str(order.get("order_id") or ""), [])
+        unknown_events = [
+            event for event in events
+            if str(event.get("event_type") or "") in {"ORDER_UNKNOWN", "CANCEL_UNKNOWN"}
+            or str(event.get("status") or "").upper() == "UNKNOWN"
+        ]
+        if not unknown_events and str(order.get("status") or "").upper() != "UNKNOWN":
+            continue
+        resubmitted = any("RESUBMIT" in str(event.get("event_type") or "").upper() for event in events)
+        resolved = next(
+            (
+                event for event in events
+                if str(event.get("event_type") or "") in {
+                    "ORDER_RECONCILED_AFTER_UNKNOWN",
+                    "ORDER_RECONCILED",
+                    "CANCEL_RECONCILED",
+                }
+            ),
+            None,
+        )
+        resolved_by = ""
+        if resolved is not None:
+            payload = _json_obj(resolved.get("payload"))
+            if order.get("exchange_order_id") or payload.get("orderId"):
+                resolved_by = "exchange_order_id"
+            else:
+                resolved_by = "client_order_id"
+        unknown = {
+            "status": "UNKNOWN",
+            "order_id": order.get("order_id"),
+            "client_order_id": order.get("client_order_id"),
+            "exchange_order_id": order.get("exchange_order_id"),
+            "resolved_by": resolved_by,
+            "resubmitted": resubmitted,
+            "resolved_status": None if resolved is None else str(order.get("status") or resolved.get("status") or ""),
+            "halted": resolved is None,
+        }
+        break
+
+    user_stream_events: list[dict[str, Any]] = []
+    for order in orders:
+        user_stream_events.extend(_user_stream_for(order))
+    for event in system_events:
+        payload = _json_obj(event.get("payload"))
+        if str(event.get("event_type") or "") != "USER_STREAM_ACCOUNT_UPDATE":
+            continue
+        user_stream_events.append(
+            {
+                "event_id": event.get("event_id") or payload.get("event_id"),
+                "exchange_order_id": payload.get("exchange_order_id"),
+                "symbol": payload.get("symbol") or "USDT",
+                "event_time": str(event.get("event_at") or payload.get("event_time") or ""),
+                "execution_type": payload.get("execution_type") or "ACCOUNT_UPDATE",
+                "event_type": "ACCOUNT_UPDATE",
+                "position_updates": payload.get("position_updates") or [],
+            }
+        )
+    listen = next(
+        (
+            {
+                "created": True,
+                "listen_key": _json_obj(event.get("payload")).get("listen_key"),
+                "event_id": event.get("event_id"),
+            }
+            for event in system_events
+            if str(event.get("event_type") or "") == "LISTEN_KEY_CREATED"
+            and _json_obj(event.get("payload")).get("listen_key")
+        ),
+        {},
+    )
+    recon_ok = any(str(event.get("event_type") or "") == "RECONCILIATION_OK" for event in system_events)
+    recon_events = [
+        event for event in order_events
+        if str(event.get("event_type") or "") in {"ORDER_RECONCILED", "ORDER_RECONCILED_AFTER_UNKNOWN"}
+    ]
+    local_flat = all(
+        Decimal(str(position.get("quantity") or 0)) == 0
+        or str(position.get("position_side") or "FLAT").upper() == "FLAT"
+        for position in positions
+    )
+    exchange_flat_flags: list[bool] = []
+    for event in system_events:
+        payload = _json_obj(event.get("payload"))
+        event_type = str(event.get("event_type") or "")
+        if event_type == "RECONCILIATION_OK":
+            rows = payload.get("exchange_positions")
+            if isinstance(rows, list):
+                exchange_flat_flags.append(
+                    all(
+                        Decimal(str(item.get("quantity") or 0)) == 0
+                        or str(item.get("position_side") or "FLAT").upper() == "FLAT"
+                        for item in rows
+                        if isinstance(item, dict)
+                    )
+                )
+            elif "exchange_flat" in payload:
+                exchange_flat_flags.append(bool(payload.get("exchange_flat")))
+        elif event_type == "USER_STREAM_ACCOUNT_UPDATE":
+            rows = payload.get("position_updates") or []
+            if isinstance(rows, list) and rows:
+                exchange_flat_flags.append(
+                    all(
+                        Decimal(str(item.get("quantity") or 0)) == 0
+                        or str(item.get("position_side") or "FLAT").upper() == "FLAT"
+                        for item in rows
+                        if isinstance(item, dict)
+                    )
+                )
+    exchange_flat = bool(exchange_flat_flags) and all(exchange_flat_flags)
+    comparison = TradingStore.compare_restart_snapshots(
+        row.get("pre_restart_snapshot"),
+        row.get("post_restart_snapshot"),
+    )
+    return {
+        "source": "database",
+        "session_id": session_id,
+        "start_time": row.get("started_at"),
+        "started_at": row.get("started_at"),
+        "end_time": row.get("ended_at"),
+        "ended_at": row.get("ended_at"),
+        "symbol": next((str(order.get("symbol") or "") for order in orders if order.get("symbol")), None),
+        "long": _leg("LONG"),
+        "short": _leg("SHORT"),
+        "partial_fill": partial,
+        "cancel": cancel,
+        "unknown_order": unknown,
+        "user_stream": {"events": user_stream_events, "observed": bool(user_stream_events)},
+        "listen_key": listen,
+        "reconciliation": {
+            "ok": recon_ok or bool(recon_events),
+            "open_matches": recon_ok or bool(recon_events),
+            "orders": [
+                {
+                    "local_order_id": event.get("order_id"),
+                    "exchange_order_id": event.get("exchange_order_id"),
+                    "match": True,
+                }
+                for event in recon_events
+            ],
+            "fills": [
+                {
+                    "trade_id": trade.get("trade_id"),
+                    "exchange_trade_id": trade.get("source_event_id"),
+                    "match": True,
+                }
+                for trade in trades
+            ],
+            "local_flat": local_flat,
+            "exchange_flat": exchange_flat,
+        },
+        "restart": comparison,
+        "positions_scope": "current_exchange_truth",
+        "balance_scope": "current_exchange_truth",
+    }
+
+
 class TradingStore:
     """Persist trading facts and audit events without owning schema creation."""
 
@@ -115,6 +427,7 @@ class TradingStore:
         stage: str,
         commit_sha: str | None = None,
         status: str = "RUNNING",
+        started_at: datetime | None = None,
     ) -> None:
         """Bind this store to one canonical validation session."""
         self.validation_session_id = str(session_id)
@@ -125,6 +438,7 @@ class TradingStore:
             mode=self.validation_mode,
             commit_sha=commit_sha,
             status=status,
+            started_at=started_at,
         )
 
     def initialize(self) -> None:
@@ -217,6 +531,45 @@ class TradingStore:
                 )
                 return int(cursor.rowcount or 0)
 
+    def finish_validation_session(
+        self,
+        session_id: str | None = None,
+        *,
+        status: str | None = None,
+        ended_at: datetime | None = None,
+    ) -> None:
+        """Persist session end time without resetting started_at."""
+        import psycopg2
+
+        resolved = session_id or self._session_id()
+        if not resolved:
+            return
+        now = _now()
+        ended = ended_at or now
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                if status is None:
+                    cursor.execute(
+                        """
+                        UPDATE validation_sessions
+                        SET ended_at = %s,
+                            heartbeat_at = %s
+                        WHERE session_id = %s
+                        """,
+                        (ended, now, resolved),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE validation_sessions
+                        SET ended_at = %s,
+                            heartbeat_at = %s,
+                            status = %s
+                        WHERE session_id = %s
+                        """,
+                        (ended, now, status, resolved),
+                    )
+
     def record_session_observation(
         self,
         *,
@@ -253,15 +606,19 @@ class TradingStore:
         if phase not in {"pre_restart", "post_restart"}:
             raise ValueError("restart phase must be pre_restart or post_restart")
         column = "pre_restart_snapshot" if phase == "pre_restart" else "post_restart_snapshot"
+        ts_column = "pre_restart_at" if phase == "pre_restart" else "post_restart_at"
+        now = _now()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     UPDATE validation_sessions
-                    SET {column} = CAST(%s AS JSONB), heartbeat_at = %s
+                    SET {column} = CAST(%s AS JSONB),
+                        {ts_column} = COALESCE({ts_column}, %s),
+                        heartbeat_at = %s
                     WHERE session_id = %s
                     """,
-                    (_json(snapshot), _now(), session_id),
+                    (_json(snapshot), now, now, session_id),
                 )
 
     def load_validation_session(self, session_id: str) -> dict[str, Any] | None:
@@ -271,8 +628,9 @@ class TradingStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT session_id, stage, mode, started_at, ended_at, commit_sha,
-                           owner_pid, heartbeat_at, status, pre_restart_snapshot,
+                    SELECT session_id, stage, mode, started_at, pre_restart_at,
+                           post_restart_at, ended_at, commit_sha, owner_pid,
+                           heartbeat_at, status, pre_restart_snapshot,
                            post_restart_snapshot, testnet_evidence, payload
                     FROM validation_sessions
                     WHERE session_id = %s
@@ -282,14 +640,21 @@ class TradingStore:
                 row = cursor.fetchone()
         if row is None:
             return None
-        return _row_dict(
+        result = _row_dict(
             (
-                "session_id", "stage", "mode", "started_at", "ended_at", "commit_sha",
-                "owner_pid", "heartbeat_at", "status", "pre_restart_snapshot",
+                "session_id", "stage", "mode", "started_at", "pre_restart_at",
+                "post_restart_at", "ended_at", "commit_sha", "owner_pid",
+                "heartbeat_at", "status", "pre_restart_snapshot",
                 "post_restart_snapshot", "testnet_evidence", "payload",
             ),
             row,
         )
+        for key in ("pre_restart_snapshot", "post_restart_snapshot", "testnet_evidence", "payload"):
+            value = result.get(key)
+            if value is None or isinstance(value, dict):
+                continue
+            result[key] = _json_obj(value)
+        return result
 
     def record_testnet_lifecycle_evidence(self, evidence: dict[str, Any]) -> None:
         import psycopg2
@@ -309,12 +674,115 @@ class TradingStore:
                 )
 
     def testnet_lifecycle_evidence(self, session_id: str | None = None) -> dict[str, Any]:
+        """Load session-scoped Testnet facts from PostgreSQL, never JSON cache."""
+        import psycopg2
+
         resolved = session_id or self._session_id()
         if not resolved:
-            return {}
-        row = self.load_validation_session(resolved)
-        payload = (row or {}).get("testnet_evidence")
-        return payload if isinstance(payload, dict) else {}
+            return {"source": "database", "session_id": None}
+        session = self.load_validation_session(resolved) or {"session_id": resolved}
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT order_id, client_order_id, exchange_order_id, symbol, side,
+                           status, position_side, position_action, reduce_only,
+                           executed_quantity, quantity, mode, payload
+                    FROM orders
+                    WHERE validation_session_id = %s AND mode = 'testnet'
+                    ORDER BY created_at ASC
+                    """,
+                    (resolved,),
+                )
+                order_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT e.event_id, e.order_id, e.event_type, e.status, e.event_at,
+                           e.payload, o.exchange_order_id, o.symbol, o.client_order_id
+                    FROM order_events e
+                    JOIN orders o ON o.order_id = e.order_id
+                    WHERE o.validation_session_id = %s AND o.mode = 'testnet'
+                    ORDER BY e.event_at ASC
+                    """,
+                    (resolved,),
+                )
+                event_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT t.trade_id, t.order_id, t.symbol, t.quantity, t.price,
+                           t.source_event_id, t.payload
+                    FROM trades t
+                    JOIN orders o ON o.order_id = t.order_id
+                    WHERE o.validation_session_id = %s AND t.mode = 'testnet'
+                    ORDER BY t.executed_at ASC
+                    """,
+                    (resolved,),
+                )
+                trade_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT event_id, event_type, message, event_at, payload
+                    FROM system_events
+                    WHERE validation_session_id = %s
+                    ORDER BY event_at ASC
+                    """,
+                    (resolved,),
+                )
+                system_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT symbol, position_side, quantity
+                    FROM positions
+                    """
+                )
+                position_rows = cursor.fetchall()
+        orders = [
+            _row_dict(
+                (
+                    "order_id", "client_order_id", "exchange_order_id", "symbol", "side",
+                    "status", "position_side", "position_action", "reduce_only",
+                    "executed_quantity", "quantity", "mode", "payload",
+                ),
+                row,
+            )
+            for row in order_rows
+        ]
+        order_events = [
+            _row_dict(
+                (
+                    "event_id", "order_id", "event_type", "status", "event_at",
+                    "payload", "exchange_order_id", "symbol", "client_order_id",
+                ),
+                row,
+            )
+            for row in event_rows
+        ]
+        trades = [
+            _row_dict(
+                (
+                    "trade_id", "order_id", "symbol", "quantity", "price",
+                    "source_event_id", "payload",
+                ),
+                row,
+            )
+            for row in trade_rows
+        ]
+        system_events = [
+            _row_dict(("event_id", "event_type", "message", "event_at", "payload"), row)
+            for row in system_rows
+        ]
+        positions = [
+            _row_dict(("symbol", "position_side", "quantity"), row)
+            for row in position_rows
+        ]
+        return derive_testnet_lifecycle_facts(
+            session=session,
+            orders=orders,
+            order_events=order_events,
+            trades=trades,
+            positions=positions,
+            system_events=system_events,
+        )
 
     def account_continuity_snapshot(
         self,
@@ -354,9 +822,11 @@ class TradingStore:
         balance = self.get_balance("USDT", mode=resolved_mode) or {}
         wallet = Decimal(str(balance.get("wallet_balance") or 0))
         unrealized = Decimal(str(balance.get("unrealized_pnl") or 0))
+        payload = _json_obj(balance.get("payload"))
         open_orders = [
             {
                 "client_order_id": row.get("client_order_id"),
+                "exchange_order_id": row.get("exchange_order_id"),
                 "status": row.get("status"),
                 "symbol": row.get("symbol"),
                 "quantity": str(row.get("quantity") or 0),
@@ -373,6 +843,9 @@ class TradingStore:
             "used_margin": str(balance.get("used_margin") or 0),
             "unrealized_pnl": str(unrealized),
             "equity": str(wallet + unrealized),
+            "realized_pnl": str(payload.get("realized_pnl") or 0),
+            "funding_pnl": str(payload.get("funding_pnl") or 0),
+            "fee_pnl": str(payload.get("fee_pnl") or 0),
             "open_orders": open_orders,
         }
 
@@ -381,25 +854,93 @@ class TradingStore:
         pre: dict[str, Any] | None,
         post: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Compare restart continuity. Time fields may change; core state may not."""
-        if not isinstance(pre, dict) or not isinstance(post, dict):
-            return {"ok": False, "reason": "RESTART_SNAPSHOT_MISSING"}
-        fields = (
-            "positions",
-            "episodes",
-            "wallet_balance",
-            "available_balance",
-            "used_margin",
-            "unrealized_pnl",
-            "equity",
-            "open_orders",
+        """Compare restart continuity by identity and accounting invariants."""
+        if not isinstance(pre, dict):
+            pre = _json_obj(pre)
+        if not isinstance(post, dict):
+            post = _json_obj(post)
+        if not pre or not post:
+            return {"ok": False, "reason": "RESTART_SNAPSHOT_MISSING", "mismatched": []}
+
+        def _dec(value: Any) -> Decimal:
+            try:
+                return Decimal(str(value if value is not None else "0"))
+            except Exception:
+                return Decimal("0")
+
+        def _position_key(item: dict[str, Any]) -> tuple[Any, ...]:
+            return (
+                str(item.get("symbol") or "").upper(),
+                str(item.get("position_side") or "").upper(),
+                _dec(item.get("position_quantity")),
+            )
+
+        def _episode_key(item: dict[str, Any]) -> tuple[str, ...]:
+            return (str(item.get("active_episode_id") or ""),)
+
+        def _order_key(item: dict[str, Any]) -> tuple[str, ...]:
+            return (
+                str(item.get("client_order_id") or ""),
+                str(item.get("exchange_order_id") or ""),
+                str(item.get("status") or ""),
+            )
+
+        mismatched: list[str] = []
+        pre_positions = sorted(_position_key(item) for item in (pre.get("positions") or []) if isinstance(item, dict))
+        post_positions = sorted(_position_key(item) for item in (post.get("positions") or []) if isinstance(item, dict))
+        if pre_positions != post_positions:
+            mismatched.append("positions")
+        pre_episodes = sorted(_episode_key(item) for item in (pre.get("episodes") or []) if isinstance(item, dict))
+        post_episodes = sorted(_episode_key(item) for item in (post.get("episodes") or []) if isinstance(item, dict))
+        if pre_episodes != post_episodes:
+            mismatched.append("episodes")
+        pre_orders = sorted(_order_key(item) for item in (pre.get("open_orders") or []) if isinstance(item, dict))
+        post_orders = sorted(_order_key(item) for item in (post.get("open_orders") or []) if isinstance(item, dict))
+        if pre_orders != post_orders:
+            mismatched.append("open_orders")
+
+        def _invariants(snap: dict[str, Any]) -> list[str]:
+            wallet = _dec(snap.get("wallet_balance"))
+            used = _dec(snap.get("used_margin"))
+            available = _dec(snap.get("available_balance"))
+            unrealized = _dec(snap.get("unrealized_pnl"))
+            equity = _dec(snap.get("equity"))
+            problems: list[str] = []
+            if available != wallet - used:
+                problems.append("available_balance")
+            if equity != wallet + unrealized:
+                problems.append("equity")
+            return problems
+
+        pre_problems = _invariants(pre)
+        post_problems = _invariants(post)
+        if pre_problems or post_problems:
+            return {
+                "ok": False,
+                "reason": "IMPOSSIBLE_ACCOUNTING",
+                "mismatched": mismatched,
+                "pre_invariants": pre_problems,
+                "post_invariants": post_problems,
+            }
+
+        wallet_delta = _dec(post.get("wallet_balance")) - _dec(pre.get("wallet_balance"))
+        explained = (
+            (_dec(post.get("realized_pnl")) - _dec(pre.get("realized_pnl")))
+            + (_dec(post.get("funding_pnl")) - _dec(pre.get("funding_pnl")))
+            + (_dec(post.get("fee_pnl")) - _dec(pre.get("fee_pnl")))
         )
-        mismatched = [name for name in fields if pre.get(name) != post.get(name)]
-        return {
-            "ok": not mismatched,
-            "reason": "OK" if not mismatched else "RESTART_STATE_MISMATCH",
-            "mismatched": mismatched,
-        }
+        if abs(wallet_delta - explained) > Decimal("0.00000001"):
+            mismatched.append("wallet_balance")
+            return {
+                "ok": False,
+                "reason": "UNEXPECTED_BALANCE_DELTA",
+                "mismatched": mismatched,
+                "wallet_delta": str(wallet_delta),
+                "explained_delta": str(explained),
+            }
+        if mismatched:
+            return {"ok": False, "reason": "RESTART_STATE_MISMATCH", "mismatched": mismatched}
+        return {"ok": True, "reason": "OK", "mismatched": []}
 
     def is_halted(self) -> bool:
         import os
@@ -2380,6 +2921,13 @@ class TradingStore:
                     """,
                     session_params,
                 )
+                session_market_flow_count = count(
+                    """
+                    SELECT COUNT(*) FROM market_flow_events
+                    WHERE validation_session_id = %s
+                    """,
+                    session_params,
+                )
                 positioning_count = count(
                     "SELECT COUNT(*) FROM positioning_snapshots WHERE validation_session_id = %s",
                     session_params,
@@ -2526,7 +3074,7 @@ class TradingStore:
                         Decimal(str(balance[3] or 0)),
                     )
                     stored_equity = Decimal(str(balance[4])) if balance[4] is not None else wallet + unrealized
-                    payload = balance[5] if isinstance(balance[5], dict) else {}
+                    payload = _json_obj(balance[5])
                     realized = Decimal(str(payload.get("realized_pnl") or 0))
                     funding = Decimal(str(payload.get("funding_pnl") or 0))
                     fee = Decimal(str(payload.get("fee_pnl") or 0))
@@ -2579,6 +3127,17 @@ class TradingStore:
             "scoped_end": str(scoped_end) if scoped_end else None,
             "commit_sha": session_row.get("commit_sha"),
             "observation_count": observation_count,
+            "session_market_flow_count": session_market_flow_count,
+            "evidence_scope": {
+                "orders": "session",
+                "trades": "session",
+                "observations": "session",
+                "market_flow_events": "session",
+                "balances": "current_exchange_truth",
+                "positions": "current_exchange_truth",
+            },
+            "balance_scope": "current_exchange_truth",
+            "position_scope": "current_exchange_truth",
             "positioning_count": positioning_count,
             "evidence_count": evidence_count,
             "episode_count": episode_count,

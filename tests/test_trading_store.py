@@ -331,8 +331,9 @@ def test_runtime_acceptance_snapshot_requires_session_and_scopes_mode():
         executed.append((sql, params))
         if "FROM validation_sessions" in sql:
             cursor.fetchone.return_value = (
-                "sess-1", "paper_24h", "paper", "2026-09-03T00:00:00+00:00", None,
-                "abc", 1, "2026-09-03T00:01:00+00:00", "RUNNING", None, None, None, {},
+                "sess-1", "paper_24h", "paper", "2026-09-03T00:00:00+00:00",
+                None, None, None, "abc", 1, "2026-09-03T00:01:00+00:00", "RUNNING",
+                None, None, None, {},
             )
         elif "FROM balances" in sql:
             cursor.fetchone.return_value = None
@@ -356,27 +357,121 @@ def test_runtime_acceptance_snapshot_requires_session_and_scopes_mode():
     assert snapshot["unknown_order"] == 0
 
 
+def _restart_snapshot(**overrides):
+    payload = {
+        "positions": [{"symbol": "BTCUSDT", "position_side": "LONG", "position_quantity": "1"}],
+        "episodes": [{"active_episode_id": "ep-1"}],
+        "wallet_balance": "1000",
+        "available_balance": "990",
+        "used_margin": "10",
+        "unrealized_pnl": "0",
+        "equity": "1000",
+        "realized_pnl": "0",
+        "funding_pnl": "0",
+        "fee_pnl": "0",
+        "open_orders": [{"client_order_id": "c-1", "exchange_order_id": "x-1", "status": "NEW"}],
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_compare_restart_snapshots_require_before_and_after():
     from trading_store import TradingStore as Store
 
     missing = Store.compare_restart_snapshots(None, {"wallet_balance": "1"})
     assert missing["ok"] is False
-    pre = {
-        "positions": [{"symbol": "BTCUSDT", "position_side": "LONG", "position_quantity": "1"}],
-        "episodes": [{"active_episode_id": "ep-1"}],
-        "wallet_balance": "100",
-        "available_balance": "90",
-        "used_margin": "10",
-        "unrealized_pnl": "0",
-        "equity": "100",
-        "open_orders": [],
-    }
+    pre = _restart_snapshot()
     assert Store.compare_restart_snapshots(pre, dict(pre))["ok"] is True
-    post = dict(pre)
-    post["wallet_balance"] = "0"
-    mismatch = Store.compare_restart_snapshots(pre, post)
-    assert mismatch["ok"] is False
-    assert "wallet_balance" in mismatch["mismatched"]
+    moved = _restart_snapshot(unrealized_pnl="20", equity="1020")
+    valid = Store.compare_restart_snapshots(pre, moved)
+    assert valid["ok"] is True
+    position_mismatch = Store.compare_restart_snapshots(
+        pre, _restart_snapshot(positions=[{"symbol": "BTCUSDT", "position_side": "SHORT", "position_quantity": "1"}])
+    )
+    assert position_mismatch["ok"] is False
+    assert "positions" in position_mismatch["mismatched"]
+    episode_mismatch = Store.compare_restart_snapshots(
+        pre, _restart_snapshot(episodes=[{"active_episode_id": "ep-2"}])
+    )
+    assert episode_mismatch["ok"] is False
+    assert "episodes" in episode_mismatch["mismatched"]
+    order_mismatch = Store.compare_restart_snapshots(
+        pre, _restart_snapshot(open_orders=[{"client_order_id": "c-2", "exchange_order_id": "x-1", "status": "NEW"}])
+    )
+    assert order_mismatch["ok"] is False
+    assert "open_orders" in order_mismatch["mismatched"]
+    accounting = Store.compare_restart_snapshots(
+        pre,
+        _restart_snapshot(wallet_balance="500", available_balance="490", used_margin="10", equity="500", unrealized_pnl="0"),
+    )
+    assert accounting["ok"] is False
+    assert accounting["reason"] == "UNEXPECTED_BALANCE_DELTA"
+    invariant = Store.compare_restart_snapshots(pre, _restart_snapshot(equity="999"))
+    assert invariant["ok"] is False
+    assert invariant["reason"] == "IMPOSSIBLE_ACCOUNTING"
+    encoded = Store.compare_restart_snapshots(
+        __import__("json").dumps(pre),
+        __import__("json").dumps(_restart_snapshot(unrealized_pnl="20", equity="1020")),
+    )
+    assert encoded["ok"] is True
+
+
+def test_derive_testnet_facts_are_session_scoped():
+    from trading_store import derive_testnet_lifecycle_facts
+
+    old = derive_testnet_lifecycle_facts(
+        session={"session_id": "old"},
+        orders=[{
+            "order_id": "old-order",
+            "client_order_id": "L-old",
+            "exchange_order_id": "999",
+            "symbol": "BTCUSDT",
+            "status": "FILLED",
+            "position_side": "LONG",
+            "position_action": "OPEN",
+        }],
+        order_events=[],
+        trades=[{"trade_id": "old-trade", "order_id": "old-order", "quantity": "1"}],
+        positions=[{"symbol": "BTCUSDT", "quantity": "0", "position_side": "FLAT"}],
+        system_events=[],
+    )
+    current = derive_testnet_lifecycle_facts(
+        session={"session_id": "current"},
+        orders=[],
+        order_events=[],
+        trades=[],
+        positions=[{"symbol": "BTCUSDT", "quantity": "0", "position_side": "FLAT"}],
+        system_events=[],
+    )
+    assert old["session_id"] == "old"
+    assert old["long"]["order"]["exchange_order_id"] == "999"
+    assert current["session_id"] == "current"
+    assert not current["long"]["order"].get("exchange_order_id")
+    local_only = derive_testnet_lifecycle_facts(
+        session={"session_id": "flat-local"},
+        orders=[],
+        order_events=[],
+        trades=[],
+        positions=[{"symbol": "BTCUSDT", "quantity": "0", "position_side": "FLAT"}],
+        system_events=[],
+    )
+    assert local_only["reconciliation"]["local_flat"] is True
+    assert local_only["reconciliation"]["exchange_flat"] is False
+    exchange_flat = derive_testnet_lifecycle_facts(
+        session={"session_id": "flat-exchange"},
+        orders=[],
+        order_events=[],
+        trades=[],
+        positions=[{"symbol": "BTCUSDT", "quantity": "0", "position_side": "FLAT"}],
+        system_events=[{
+            "event_type": "RECONCILIATION_OK",
+            "payload": {
+                "exchange_flat": True,
+                "exchange_positions": [{"symbol": "BTCUSDT", "position_side": "FLAT", "quantity": "0"}],
+            },
+        }],
+    )
+    assert exchange_flat["reconciliation"]["exchange_flat"] is True
 
 
 def test_collector_lifecycle_events_query_ws_lifecycle():

@@ -849,6 +849,8 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
             stage TEXT NOT NULL,
             mode TEXT NOT NULL CHECK (mode IN ('paper', 'shadow', 'testnet', 'live')),
             started_at TIMESTAMPTZ NOT NULL,
+            pre_restart_at TIMESTAMPTZ,
+            post_restart_at TIMESTAMPTZ,
             ended_at TIMESTAMPTZ,
             commit_sha TEXT,
             owner_pid INTEGER,
@@ -859,6 +861,13 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
             testnet_evidence JSONB,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE validation_sessions
+            ADD COLUMN IF NOT EXISTS pre_restart_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS post_restart_at TIMESTAMPTZ
         """
     )
     cursor.execute(
