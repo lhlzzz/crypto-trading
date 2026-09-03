@@ -315,3 +315,88 @@ def test_runtime_gate_exposes_transport_health() -> None:
     assert "BTCUSDT" in gate.per_symbol_source_health
     assert "FUTURES_DEPTH" in gate.per_symbol_source_health["BTCUSDT"]
     assert gate.per_symbol_transport_health["BTCUSDT"] in {"OK", "DEGRADED", "FAILED"}
+
+
+def test_historical_session_pass_does_not_unlock_current_session() -> None:
+    class SessionStore:
+        def __init__(self, session_id: str, statuses: dict[str, str]) -> None:
+            self.validation_session_id = session_id
+            self._statuses = statuses
+
+        def runtime_gate_statuses(self):
+            return dict(self._statuses)
+
+        def runtime_gate_evidence(self):
+            return {
+                name: {"status": status, "verified_at": datetime.now(timezone.utc).isoformat(), "validation_session_id": self.validation_session_id}
+                for name, status in self._statuses.items()
+            }
+
+        def market_data_freshness(self, **kwargs):
+            return []
+
+        def user_stream_health(self) -> str:
+            return "OK"
+
+    old = evaluate_runtime_gate(
+        mode="testnet",
+        store=SessionStore("sess-a", {"testnet": "PASSED"}),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        symbols=["BTCUSDT"],
+    )
+    new = evaluate_runtime_gate(
+        mode="testnet",
+        store=SessionStore("sess-b", {}),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        symbols=["BTCUSDT"],
+    )
+    assert old.testnet_gate_status == "PASSED"
+    assert new.testnet_gate_status == "NOT_STARTED"
+    assert new.testnet_ready is False
+
+
+def test_missing_session_cannot_reuse_historical_pass() -> None:
+    class HistoricalStore:
+        def runtime_gate_statuses(self):
+            return {"testnet": "PASSED", "realtime_24h": "PASSED"}
+
+        def _session_id(self):
+            return None
+
+        def market_data_freshness(self, **kwargs):
+            return []
+
+    # TradingStore.runtime_gate_statuses now returns NOT_STARTED without a session.
+    # A store that still exposes historical PASS must not be used without a session id.
+    from trading_store import TradingStore
+
+    store = TradingStore("postgresql://test")
+    assert store.runtime_gate_statuses()["testnet"] == "NOT_STARTED"
+
+
+def test_paper_testnet_live_symbol_sets_are_independent(monkeypatch) -> None:
+    from runtime_gate import trading_symbols_for_mode
+
+    monkeypatch.setenv("BIAN_PAPER_SYMBOLS", "BTCUSDT")
+    monkeypatch.setenv("BIAN_TESTNET_SYMBOLS", "ETHUSDT")
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "SOLUSDT")
+    assert trading_symbols_for_mode("paper") == ("BTCUSDT",)
+    assert trading_symbols_for_mode("testnet") == ("ETHUSDT",)
+    assert trading_symbols_for_mode("live") == ("SOLUSDT",)
+    monkeypatch.delenv("BIAN_LIVE_SYMBOLS", raising=False)
+    assert trading_symbols_for_mode("live") == ()
+
+
+def test_live_preflight_without_client_cannot_pass(monkeypatch) -> None:
+    from runtime_gate import evaluate_live_preflight
+
+    monkeypatch.delenv("BIAN_LIVE_API_KEY", raising=False)
+    monkeypatch.delenv("BIAN_LIVE_API_SECRET", raising=False)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "tok")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "tok")
+    result = evaluate_runtime_gate(mode="live", probe_account=True)
+    assert result.live_allowed is False
+    assert result.account_reachable is False

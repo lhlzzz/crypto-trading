@@ -485,3 +485,129 @@ def test_collector_lifecycle_events_query_ws_lifecycle():
     sql = cursor.execute.call_args[0][0]
     assert "WS_LIFECYCLE" in sql
     assert "LIQUIDATION_HEARTBEAT" not in sql
+
+
+def test_duplicate_exchange_trade_id_is_idempotent():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("00000000-0000-0000-0000-000000000003",)
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection):
+        first = store.record_trade(
+            UUID("00000000-0000-0000-0000-000000000001"),
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            exchange_trade_id="77",
+        )
+        second = store.record_trade(
+            UUID("00000000-0000-0000-0000-000000000001"),
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            exchange_trade_id="77",
+        )
+    statement = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "ON CONFLICT (mode, exchange_trade_id)" in statement
+    assert first == second
+
+
+def test_position_mode_isolation_uses_canonical_mode_key():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection), patch.dict(
+        "os.environ", {"BIAN_MODE": "paper"}, clear=False
+    ):
+        store.upsert_position(
+            "BTCUSDT",
+            quantity=Decimal("1"),
+            average_price=Decimal("100"),
+            realized_pnl=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            mode="paper",
+        )
+        store.get_position("BTCUSDT", mode="testnet")
+        store.list_positions(mode="live")
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any("ON CONFLICT (mode, market, symbol)" in sql for sql in statements)
+    assert any("WHERE mode = %s AND market = %s AND symbol = %s" in sql for sql in statements)
+    assert any("WHERE mode = %s AND market = %s" in sql for sql in statements)
+
+
+def test_episode_session_isolation_does_not_reuse_foreign_session():
+    cursor = MagicMock()
+    started = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    cursor.fetchone.return_value = (
+        "11111111-1111-1111-1111-111111111111", "BTCUSDT", "FUTURES", "LONG",
+        started, None, "LONG_BUILDING", "OPEN", started, "positioning-v1", "hash", {},
+    )
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    store.validation_session_id = "session-b"
+    with patch("psycopg2.connect", return_value=connection):
+        store.get_active_episode("BTCUSDT", "session-b")
+        store.start_episode(
+            symbol="BTCUSDT", direction="LONG", state="LONG_BUILDING",
+            observed_at=started, strategy_version="positioning-v1", config_hash="hash",
+        )
+    get_sql = cursor.execute.call_args_list[0].args[0]
+    start_sql = cursor.execute.call_args_list[1].args[0]
+    assert "validation_session_id IS NOT DISTINCT FROM %s" in get_sql
+    assert "ON CONFLICT (symbol, market, validation_session_id)" in start_sql
+
+
+def test_runtime_gate_statuses_are_current_session_scoped():
+    store = TradingStore("postgresql://test")
+    assert store.runtime_gate_statuses()["testnet"] == "NOT_STARTED"
+    store.validation_session_id = "sess-current"
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [("testnet", "PASSED")]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection):
+        statuses = store.runtime_gate_statuses()
+    sql = cursor.execute.call_args.args[0]
+    params = cursor.execute.call_args.args[1]
+    assert "validation_session_id = %s" in sql
+    assert params[0] == "sess-current"
+    assert statuses["testnet"] == "PASSED"
+
+
+def test_record_trade_uses_canonical_mode_not_payload():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("00000000-0000-0000-0000-000000000004",)
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection), patch.dict(
+        "os.environ", {"BIAN_MODE": "testnet"}, clear=False
+    ):
+        store.record_trade(
+            UUID("00000000-0000-0000-0000-000000000001"),
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            exchange_trade_id="91",
+            payload={"mode": "live"},
+        )
+    args = cursor.execute.call_args.args[1]
+    assert args[11] == "testnet"

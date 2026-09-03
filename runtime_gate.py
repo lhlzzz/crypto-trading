@@ -26,9 +26,53 @@ def _mode() -> str:
     return os.environ.get("BIAN_MODE", "paper").strip().lower()
 
 
-def _symbols(symbols: Iterable[str] | None) -> tuple[str, ...]:
-    configured = symbols or os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT").split(",")
-    return tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in configured if str(symbol).strip()))
+USER_STREAM_OPEN_STATES = frozenset({"LIVE", "OK"})
+USER_STREAM_BLOCKED_STATES = frozenset(
+    {"DISCONNECTED", "CONNECTING", "RECONNECTING", "DEGRADED", "FAILED", "UNKNOWN"}
+)
+
+
+def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
+    """Canonical symbol universe for one runtime mode. No cross-mode fallback."""
+    resolved = (mode or _mode()).strip().lower()
+    env_name = {
+        "paper": "BIAN_PAPER_SYMBOLS",
+        "shadow": "BIAN_PAPER_SYMBOLS",
+        "testnet": "BIAN_TESTNET_SYMBOLS",
+        "live": "BIAN_LIVE_SYMBOLS",
+    }.get(resolved)
+    if env_name is None:
+        return ()
+    raw = os.environ.get(env_name, "")
+    if not str(raw).strip():
+        if resolved in {"paper", "shadow"}:
+            raw = "BTCUSDT"
+        else:
+            return ()
+    return tuple(
+        dict.fromkeys(
+            str(symbol).strip().upper()
+            for symbol in str(raw).split(",")
+            if str(symbol).strip()
+        )
+    )
+
+
+def _symbols(symbols: Iterable[str] | None, *, mode: str | None = None) -> tuple[str, ...]:
+    if symbols is not None:
+        return tuple(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in symbols
+                if str(symbol).strip()
+            )
+        )
+    return trading_symbols_for_mode(mode)
+
+
+def user_stream_allows_open(status: str | None) -> bool:
+    """Only an explicitly healthy private stream may open a new position."""
+    return str(status or "UNKNOWN").strip().upper() in USER_STREAM_OPEN_STATES
 
 
 def _expected_position_mode() -> str:
@@ -488,7 +532,7 @@ def evaluate_runtime_gate(
         )
 
     config = ClientConfig.from_env(resolved_mode)
-    selected_symbols = _symbols(symbols)
+    selected_symbols = _symbols(symbols, mode=resolved_mode)
     reasons: list[str] = []
     positioning_enabled = _enabled("POSITIONING_DECISION_ENABLED")
     alpha_status = str(
@@ -697,7 +741,10 @@ def evaluate_runtime_gate(
          risk_config_ok, kill_switch_ok, paper_gate_status == "PASSED")
     )
     current_user_stream = _current_user_stream_health(store, mode=resolved_mode)
-    user_stream_ok = current_user_stream == "OK"
+    user_stream_ok = (
+        resolved_mode == "paper"
+        or user_stream_allows_open(current_user_stream)
+    )
     if resolved_mode != "paper" and not user_stream_ok:
         reasons.append("USER_STREAM_NOT_VERIFIED")
     exchange_ready = all(
@@ -849,6 +896,32 @@ def evaluate_runtime_gate(
         global_transport_health=global_transport_health,
         per_symbol_transport_health=per_symbol_transport_health,
         per_symbol_source_health=per_symbol_source_health,
+    )
+
+
+def evaluate_live_preflight(store: Any | None = None) -> GateResult:
+    """Canonical Live preflight: TradingStore + FuturesPrivateClient + gate."""
+    if store is None:
+        from trading_store import TradingStore
+
+        store = TradingStore()
+    initialize = getattr(store, "initialize", None)
+    if callable(initialize):
+        initialize()
+    symbols = trading_symbols_for_mode("live")
+    client = None
+    try:
+        from binance_client import FuturesPrivateClient
+
+        client = FuturesPrivateClient(ClientConfig.from_env("live"))
+    except Exception:
+        client = None
+    return evaluate_runtime_gate(
+        mode="live",
+        store=store,
+        client=client,
+        symbols=symbols,
+        probe_account=True,
     )
 
 

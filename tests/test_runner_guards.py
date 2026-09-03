@@ -559,3 +559,376 @@ def test_paper_cycle_global_halt_when_observation_store_fails() -> None:
     )
     assert result["status"] == "halted"
     assert result["reason"].startswith("GLOBAL_HALT")
+
+
+def _testnet_gate(**overrides):
+    from runtime_gate import GateResult
+
+    payload = {
+        "mode": "testnet",
+        "positioning_enabled": False,
+        "credentials_ok": True,
+        "account_mode_ok": True,
+        "margin_mode_ok": True,
+        "data_health_ok": True,
+        "reconciliation_ok": True,
+        "risk_config_ok": True,
+        "confirmation_ok": True,
+        "kill_switch_ok": True,
+        "live_allowed": False,
+        "testnet_ready": True,
+        "current_user_stream": "OK",
+    }
+    payload.update(overrides)
+    return GateResult(**payload)
+
+
+class _CycleStore:
+    def __init__(self, stream_health: str = "OK") -> None:
+        self.events = []
+        self.risk_events = []
+        self.halted = False
+        self._user_stream_health = stream_health
+
+    def latest_market_observation(self, *args, **kwargs):
+        return _frame()
+
+    def latest_positioning_state(self, *args, **kwargs):
+        return None
+
+    def get_active_episode(self, *args, **kwargs):
+        return None
+
+    def record_positioning_snapshot(self, *args, **kwargs):
+        return None
+
+    def record_system_event(self, **fields):
+        self.events.append(fields)
+
+    def record_risk_event(self, **fields):
+        self.risk_events.append(fields)
+
+    def record_intent(self, *args, **kwargs):
+        raise AssertionError("OPEN must not be recorded when UserStream is unhealthy")
+
+    def update_intent_status(self, *args, **kwargs):
+        return None
+
+    def user_stream_health(self) -> str:
+        return self._user_stream_health
+
+    def set_user_stream_health(self, status: str, *, reason: str | None = None) -> None:
+        self._user_stream_health = status
+
+    def is_halted(self) -> bool:
+        return self.halted
+
+    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+        self.halted = halted
+        self.events.append({"halted": halted, "reason": reason, "source": source})
+
+
+def _open_engine():
+    from engine import StrategyConfig, StrategyEngine
+    from trade_intent import TradeIntent
+    from uuid import uuid4
+
+    class Engine(StrategyEngine):
+        def _intent_from_positioning(self, *args, **kwargs):
+            return TradeIntent(
+                symbol="BTCUSDT",
+                direction="LONG",
+                action="OPEN",
+                reduce_only=False,
+                leverage=Decimal("1"),
+                order_type="MARKET",
+                quantity=Decimal("0.001"),
+                confidence=Decimal("1"),
+                reason="test-open",
+                strategy_version="test",
+                evidence_snapshot_id=uuid4(),
+            )
+
+    return Engine(StrategyConfig(positioning_decision_enabled=True, legacy_execution_enabled=False))
+
+
+def _reduce_engine():
+    from engine import StrategyConfig, StrategyEngine
+    from trade_intent import TradeIntent
+    from uuid import uuid4
+
+    class Engine(StrategyEngine):
+        def _intent_from_positioning(self, *args, **kwargs):
+            return TradeIntent(
+                symbol="BTCUSDT",
+                direction="LONG",
+                action="CLOSE",
+                reduce_only=True,
+                leverage=Decimal("1"),
+                order_type="MARKET",
+                quantity=Decimal("0.001"),
+                confidence=Decimal("1"),
+                reason="test-close",
+                strategy_version="test",
+                evidence_snapshot_id=uuid4(),
+            )
+
+    return Engine(StrategyConfig(positioning_decision_enabled=True, legacy_execution_enabled=False))
+
+
+def _account_executor():
+    from datetime import datetime, timezone
+    from risk import FuturesAccountSnapshot
+
+    class Executor:
+        submitted = []
+
+        def account_snapshot(self):
+            return FuturesAccountSnapshot(
+                mode="testnet",
+                wallet_balance=Decimal("1000"),
+                available_balance=Decimal("1000"),
+                total_margin=Decimal("1000"),
+                used_margin=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                positions=(),
+                open_orders=(),
+                leverage={"BTCUSDT": Decimal("1")},
+                margin_mode="ISOLATED",
+                position_mode="ONE_WAY",
+                captured_at=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        def submit(self, intent, decision, market=None):
+            self.submitted.append(intent)
+            raise AssertionError("submit must not run for blocked OPEN")
+
+    return Executor()
+
+
+def test_user_stream_failure_blocks_open() -> None:
+    store = _CycleStore("FAILED")
+    result = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=_open_engine(),
+        executor=_account_executor(),
+        mode="testnet",
+        runtime_gate=_testnet_gate(current_user_stream="OK", testnet_ready=True),
+    )
+    assert result["status"] == "blocked"
+    assert result["reason"] == "USER_STREAM_UNHEALTHY"
+    assert store.risk_events[-1]["decision"] == "DENY"
+
+
+def test_user_stream_degraded_blocks_open() -> None:
+    store = _CycleStore("DEGRADED")
+    result = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=_open_engine(),
+        executor=_account_executor(),
+        mode="testnet",
+        runtime_gate=_testnet_gate(current_user_stream="OK"),
+    )
+    assert result["reason"] == "USER_STREAM_UNHEALTHY"
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["DISCONNECTED", "CONNECTING", "RECONNECTING", "UNKNOWN", "FAILED", "DEGRADED"],
+)
+def test_unhealthy_user_stream_states_cannot_use_stale_gate_to_open(state: str) -> None:
+    store = _CycleStore(state)
+    result = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=_open_engine(),
+        executor=_account_executor(),
+        mode="testnet",
+        runtime_gate=_testnet_gate(current_user_stream="LIVE", testnet_ready=True),
+    )
+    assert result["status"] == "blocked"
+    assert result["reason"] == "USER_STREAM_UNHEALTHY"
+
+
+def test_reduce_close_remains_available_under_stream_failure() -> None:
+    store = _CycleStore("FAILED")
+
+    def record_intent(*args, **kwargs):
+        return None
+
+    store.record_intent = record_intent  # type: ignore[method-assign]
+    executor = _account_executor()
+
+    def submit(intent, decision, market=None):
+        executor.submitted.append(intent)
+        class Result:
+            status = "SUBMITTED"
+            order_id = "1"
+            client_order_id = "c-1"
+            executed_quantity = Decimal("0")
+            executed_price = Decimal("0")
+        return Result()
+
+    executor.submit = submit  # type: ignore[method-assign]
+    public_client = type(
+        "Pub",
+        (),
+        {
+            "get_symbol_rules": staticmethod(
+                lambda symbol: {
+                    "status": "TRADING",
+                    "min_qty": "0.001",
+                    "max_qty": "100",
+                    "step_size": "0.001",
+                    "tick_size": "0.01",
+                    "min_notional": "5",
+                }
+            )
+        },
+    )()
+    result = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=_reduce_engine(),
+        risk_gate=type("Risk", (), {"evaluate": staticmethod(lambda *args, **kwargs: type("D", (), {"decision": "ALLOW"})())})(),
+        executor=executor,
+        public_client=public_client,
+        mode="testnet",
+        runtime_gate=_testnet_gate(current_user_stream="FAILED"),
+    )
+    assert result["status"] == "submitted"
+    assert executor.submitted[0].action == "CLOSE"
+
+
+def test_stream_recovery_requires_explicit_healthy_state() -> None:
+    store = _CycleStore("RECONNECTING")
+    blocked = run_cycle(
+        "BTCUSDT",
+        store=store,
+        engine=_open_engine(),
+        executor=_account_executor(),
+        mode="testnet",
+        runtime_gate=_testnet_gate(current_user_stream="OK"),
+    )
+    assert blocked["reason"] == "USER_STREAM_UNHEALTHY"
+    store._user_stream_health = "LIVE"
+    store.record_intent = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    executor = _account_executor()
+    executor.submit = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("risk not reached"))
+    # LIVE is healthy for OPEN; the cycle may continue into risk/execution.
+    from runtime_gate import user_stream_allows_open
+    assert user_stream_allows_open(store.user_stream_health()) is True
+
+
+def test_user_stream_task_exception_halts_runtime(monkeypatch) -> None:
+    import asyncio
+    from paper_runner import _run_private_forever
+
+    class Stream:
+        state = "LIVE"
+
+        def __init__(self, *args, **kwargs):
+            self.on_halt = kwargs.get("on_halt")
+
+        async def run_forever(self):
+            self.state = "FAILED"
+            if self.on_halt:
+                self.on_halt("task boom")
+            raise RuntimeError("task boom")
+
+        async def close(self):
+            return None
+
+    store = _CycleStore("LIVE")
+    monkeypatch.setattr("user_stream.UserStreamClient", Stream)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="USER_STREAM FAILED"):
+            await _run_private_forever(
+                ["BTCUSDT"],
+                mode="testnet",
+                store=store,
+                executor=type("E", (), {"client": None})(),
+                public_client=object(),
+                runtime_gate=_testnet_gate(),
+            )
+
+    asyncio.run(run())
+    assert store.halted is True
+
+
+def test_startup_gate_recomputes_after_reconciliation_success(monkeypatch) -> None:
+    from dataclasses import replace
+    from runtime_gate import GateResult
+
+    calls = []
+
+    def fake_gate(**kwargs):
+        calls.append(kwargs)
+        recon = bool(kwargs.get("reconciliation_ok"))
+        return GateResult(
+            mode="testnet",
+            positioning_enabled=False,
+            credentials_ok=True,
+            account_mode_ok=True,
+            margin_mode_ok=True,
+            data_health_ok=True,
+            reconciliation_ok=recon,
+            risk_config_ok=True,
+            confirmation_ok=True,
+            kill_switch_ok=True,
+            live_allowed=False,
+            account_reachable=True,
+            testnet_ready=recon,
+        )
+
+    class Recovered:
+        safe_to_trade = True
+        status = "SAFE"
+
+    monkeypatch.setattr("paper_runner.evaluate_runtime_gate", fake_gate)
+    monkeypatch.setattr("paper_runner.Reconciler", lambda *args, **kwargs: type("R", (), {"recover": lambda self: Recovered})())
+    monkeypatch.setattr("binance_client.FuturesPrivateClient", lambda config: object())
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "k")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "s")
+    monkeypatch.setenv("BIAN_TESTNET_SYMBOLS", "BTCUSDT")
+    gate = _startup_recovery("testnet", StoreStub())
+    assert calls[0].get("reconciliation_ok") in {None, False}
+    assert calls[1]["reconciliation_ok"] is True
+    assert gate.reconciliation_ok is True
+
+
+def test_startup_reconciliation_failure_halts(monkeypatch) -> None:
+    from runtime_gate import GateResult
+
+    monkeypatch.setattr(
+        "paper_runner.evaluate_runtime_gate",
+        lambda **kwargs: GateResult(
+            mode="testnet",
+            positioning_enabled=False,
+            credentials_ok=True,
+            account_mode_ok=True,
+            margin_mode_ok=True,
+            data_health_ok=True,
+            reconciliation_ok=False,
+            risk_config_ok=True,
+            confirmation_ok=True,
+            kill_switch_ok=True,
+            live_allowed=False,
+            account_reachable=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "paper_runner.Reconciler",
+        lambda *args, **kwargs: type("R", (), {"recover": lambda self: type("X", (), {"safe_to_trade": False, "status": "HALT"})()})(),
+    )
+    monkeypatch.setattr("binance_client.FuturesPrivateClient", lambda config: object())
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "k")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "s")
+    monkeypatch.setenv("BIAN_TESTNET_SYMBOLS", "BTCUSDT")
+    with pytest.raises(SystemExit, match="startup reconciliation blocked"):
+        _startup_recovery("testnet", StoreStub())

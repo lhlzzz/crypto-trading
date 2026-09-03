@@ -921,20 +921,28 @@ def _testnet_evidence(**overrides):
         "end_time": "2026-09-03T00:10:00+00:00",
         "symbol": "BTCUSDT",
         "long": {
-            "order": {"client_order_id": "L-1", "exchange_order_id": "100"},
-            "fills": [{"trade_id": "1", "quantity": "0.01"}],
+            "order": {"order_id": "lo-1", "client_order_id": "L-1", "exchange_order_id": "100"},
+            "fills": [{"trade_id": "1", "exchange_trade_id": "t-1", "quantity": "0.01"}],
             "user_stream_observed": True,
             "local_state_updated": True,
             "reconciliation_matches": True,
-            "close": {"status": "FILLED", "exchange_order_id": "104", "reconciled_flat": True},
+            "close": {
+                "status": "FILLED",
+                "exchange_order_id": "104",
+                "reconciliation_matches": True,
+            },
         },
         "short": {
-            "order": {"client_order_id": "S-1", "exchange_order_id": "101"},
-            "fills": [{"trade_id": "2", "quantity": "0.01"}],
+            "order": {"order_id": "so-1", "client_order_id": "S-1", "exchange_order_id": "101"},
+            "fills": [{"trade_id": "2", "exchange_trade_id": "t-2", "quantity": "0.01"}],
             "user_stream_observed": True,
             "local_state_updated": True,
             "reconciliation_matches": True,
-            "close": {"status": "FILLED", "exchange_order_id": "105", "reconciled_flat": True},
+            "close": {
+                "status": "FILLED",
+                "exchange_order_id": "105",
+                "reconciliation_matches": True,
+            },
         },
         "partial_fill": {
             "status": "PARTIALLY_FILLED",
@@ -973,6 +981,8 @@ def _testnet_evidence(**overrides):
                     "event_time": "2026-09-03T00:01:01+00:00",
                     "execution_type": "ACCOUNT_UPDATE",
                     "event_type": "ACCOUNT_UPDATE",
+                    "session_id": "tn-1",
+                    "position_updates": [{"symbol": "BTCUSDT", "quantity": "0"}],
                 },
             ]
         },
@@ -980,7 +990,12 @@ def _testnet_evidence(**overrides):
         "reconciliation": {
             "ok": True,
             "open_matches": True,
-            "orders": [{"local_order_id": "L-1", "exchange_order_id": "100", "match": True}],
+            "orders": [
+                {"local_order_id": "L-1", "exchange_order_id": "100", "match": True},
+                {"local_order_id": "L-2", "exchange_order_id": "104", "match": True},
+                {"local_order_id": "S-1", "exchange_order_id": "101", "match": True},
+                {"local_order_id": "S-2", "exchange_order_id": "105", "match": True},
+            ],
             "fills": [{"trade_id": "1", "exchange_trade_id": "t-1", "match": True}],
             "local_flat": True,
             "exchange_flat": True,
@@ -1395,3 +1410,190 @@ def test_db_expired_session_cannot_keep_report_passed(monkeypatch) -> None:
     assert mismatched == ["paper_24h"]
     assert stages["paper_24h"]["status"] == "EXPIRED"
     assert vr.prior_passed(stages, "shadow_7d") is False
+
+
+def test_testnet_acceptance_requires_exchange_trade_id() -> None:
+    evidence = _testnet_evidence()
+    evidence["long"]["fills"] = [{"trade_id": "1", "quantity": "0.01"}]
+    status, reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["LONG lifecycle"] is False
+
+
+def test_generic_user_stream_event_does_not_satisfy_lifecycle() -> None:
+    evidence = _testnet_evidence()
+    evidence["user_stream"] = {
+        "events": [
+            {
+                "event_id": "ev-other",
+                "exchange_order_id": "999",
+                "symbol": "ETHUSDT",
+                "event_time": "2026-09-03T00:01:00+00:00",
+                "execution_type": "TRADE",
+                "event_type": "ORDER_TRADE_UPDATE",
+            }
+        ]
+    }
+    status, reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["USER_STREAM"] is False
+
+
+def test_local_flat_does_not_replace_exchange_flat() -> None:
+    evidence = _testnet_evidence()
+    evidence["reconciliation"] = {
+        **evidence["reconciliation"],
+        "ok": True,
+        "open_matches": True,
+        "local_flat": True,
+        "exchange_flat": False,
+    }
+    status, reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["reconciliation"] is False
+
+
+def test_db_unavailable_invalidates_passed_report(monkeypatch) -> None:
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(vr, "TradingStore", boom)
+    stages = {"paper_24h": {"status": "PASSED", "session_id": "s1"}}
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert mismatched == ["paper_24h"]
+    assert stages["paper_24h"]["status"] == "FAILED"
+    assert stages["paper_24h"]["reason"] == "SESSION_STATUS_UNAVAILABLE"
+
+
+def test_missing_session_invalidates_passed_report(monkeypatch) -> None:
+    class Store:
+        def load_validation_session(self, session_id):
+            return None
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {"paper_24h": {"status": "PASSED", "session_id": "missing"}}
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert stages["paper_24h"]["status"] == "FAILED"
+    assert stages["paper_24h"]["reason"] == "SESSION_MISSING"
+    assert mismatched == ["paper_24h"]
+
+
+def test_session_lookup_exception_fails_closed(monkeypatch) -> None:
+    class Store:
+        def load_validation_session(self, session_id):
+            raise RuntimeError("timeout")
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {"paper_24h": {"status": "PASSED", "session_id": "s1"}}
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert stages["paper_24h"]["reason"] == "SESSION_LOOKUP_FAILED"
+    assert mismatched == ["paper_24h"]
+
+
+def test_session_mode_mismatch_blocks(monkeypatch) -> None:
+    class Store:
+        def load_validation_session(self, session_id):
+            return {"session_id": session_id, "status": "PASSED", "mode": "paper", "stage": "paper_24h"}
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {"paper_24h": {"status": "PASSED", "session_id": "s1", "mode": "testnet", "stage": "paper_24h"}}
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert stages["paper_24h"]["reason"] == "SESSION_MODE_MISMATCH"
+    assert mismatched == ["paper_24h"]
+
+
+def test_session_stage_mismatch_blocks(monkeypatch) -> None:
+    class Store:
+        def load_validation_session(self, session_id):
+            return {"session_id": session_id, "status": "PASSED", "mode": "paper", "stage": "shadow_7d"}
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {"paper_24h": {"status": "PASSED", "session_id": "s1", "mode": "paper", "stage": "paper_24h"}}
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert stages["paper_24h"]["reason"] == "SESSION_STAGE_MISMATCH"
+    assert mismatched == ["paper_24h"]
+
+
+def test_generic_reconciliation_event_does_not_satisfy_lifecycle() -> None:
+    evidence = _testnet_evidence()
+    evidence["reconciliation"] = {
+        "ok": True,
+        "open_matches": True,
+        "orders": [{"local_order_id": "x", "exchange_order_id": "999", "match": True}],
+        "local_flat": True,
+        "exchange_flat": True,
+    }
+    status, _reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["reconciliation"] is False
+
+
+def test_wrong_exchange_order_id_fails_testnet_acceptance() -> None:
+    evidence = _testnet_evidence()
+    evidence["user_stream"]["events"][0]["exchange_order_id"] = "999"
+    status, _reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["USER_STREAM"] is False
+
+
+def test_wrong_session_id_fails_testnet_acceptance() -> None:
+    evidence = _testnet_evidence()
+    for event in evidence["user_stream"]["events"]:
+        event["session_id"] = "other-session"
+    status, _reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["USER_STREAM"] is False
+
+
+def test_stale_account_update_fails_testnet_acceptance() -> None:
+    evidence = _testnet_evidence()
+    evidence["user_stream"]["events"][1]["event_time"] = "2020-01-01T00:00:00+00:00"
+    status, _reason, detail = vr.testnet_acceptance(evidence)
+    assert status == "FAILED"
+    assert detail["USER_STREAM"] is False
+
+
+def test_session_commit_mismatch_blocks(monkeypatch) -> None:
+    class Store:
+        def load_validation_session(self, session_id):
+            return {
+                "session_id": session_id,
+                "status": "PASSED",
+                "mode": "paper",
+                "stage": "paper_24h",
+                "commit_sha": "aaa",
+            }
+
+    monkeypatch.setattr(vr, "TradingStore", Store)
+    stages = {
+        "paper_24h": {
+            "status": "PASSED",
+            "session_id": "s1",
+            "mode": "paper",
+            "stage": "paper_24h",
+            "commit_sha": "bbb",
+        }
+    }
+    mismatched = vr.reconcile_report_with_session_status(stages)
+    assert stages["paper_24h"]["reason"] == "SESSION_COMMIT_MISMATCH"
+    assert mismatched == ["paper_24h"]
+
+
+def test_live_allowed_remains_false(monkeypatch) -> None:
+    class FakeGate:
+        def as_dict(self):
+            return {
+                "mode": "live",
+                "MARKET_HEALTH": "OK",
+                "ACCOUNT_HEALTH": "OK",
+                "USER_STREAM_HEALTH": "OK",
+                "RECONCILIATION_HEALTH": "OK",
+                "RISK_HEALTH": "SAFE",
+                "meme_universe": True,
+                "global_transport_health": "OK",
+            }
+
+    monkeypatch.setattr(vr, "TradingStore", lambda: object())
+    monkeypatch.setattr(vr, "evaluate_runtime_gate", lambda **kwargs: FakeGate())
+    result = vr.run_live_preflight({})
+    assert result["LIVE_ALLOWED"] is False

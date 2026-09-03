@@ -33,7 +33,12 @@ from execution import (
 )
 from reconciliation import Reconciler, apply_user_stream_event
 from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate, RiskLimits
-from runtime_gate import GateResult, evaluate_runtime_gate
+from runtime_gate import (
+    GateResult,
+    evaluate_runtime_gate,
+    trading_symbols_for_mode,
+    user_stream_allows_open,
+)
 from trade_intent import TradeIntent
 from trading_store import TradingStore
 
@@ -90,6 +95,39 @@ def _symbols(value: str) -> list[str]:
     if any(not symbol.endswith("USDT") for symbol in symbols):
         raise ValueError("BIAN_PAPER_SYMBOLS must contain USDT pairs")
     return list(dict.fromkeys(symbols))
+
+
+def _mode_symbols(mode: str, value: str | None = None) -> list[str]:
+    if value:
+        return _symbols(value)
+    return list(trading_symbols_for_mode(mode))
+
+
+def _current_user_stream_state(store: TradingStore, runtime_gate: GateResult | None) -> str:
+    getter = getattr(store, "user_stream_health", None)
+    if callable(getter):
+        try:
+            value = getter()
+        except Exception:
+            return "UNKNOWN"
+        if value:
+            return str(value).strip().upper()
+    if runtime_gate is not None and runtime_gate.current_user_stream:
+        return str(runtime_gate.current_user_stream).strip().upper()
+    return "UNKNOWN"
+
+
+def _halt_user_stream(store: TradingStore, reason: str, *, state: str = "FAILED") -> None:
+    setter = getattr(store, "set_user_stream_health", None)
+    if callable(setter):
+        setter(state, reason=reason)
+    store.set_halt(True, reason=reason, source="user_stream")
+    store.record_system_event(
+        event_type="RUNTIME_HALT",
+        severity="CRITICAL",
+        message=reason,
+        payload={"source": "user_stream", "state": state},
+    )
 
 
 def _test_only_signal_injection(
@@ -581,7 +619,7 @@ def run_cycle(
     if mode != "paper":
         if runtime_gate is None:
             raise RuntimeError("non-paper cycles require the canonical runtime gate")
-        if not runtime_gate.trading_enabled:
+        if mode == "live" and not runtime_gate.live_allowed:
             raise RuntimeError(
                 "canonical runtime gate blocks trading: "
                 + "; ".join(runtime_gate.reasons)
@@ -665,6 +703,21 @@ def run_cycle(
             "symbol": symbol,
             "captured_at": frame.captured_at.isoformat(),
         }
+    if mode != "paper" and intent.action == "OPEN":
+        stream_state = _current_user_stream_state(store, runtime_gate)
+        if not user_stream_allows_open(stream_state):
+            store.record_risk_event(
+                intent_id=intent.id,
+                decision="DENY",
+                reason="USER_STREAM_UNHEALTHY",
+                payload={"mode": mode, "state": stream_state, "action": intent.action},
+            )
+            return {
+                "status": "blocked",
+                "symbol": intent.symbol,
+                "reason": "USER_STREAM_UNHEALTHY",
+                "user_stream": stream_state,
+            }
     store.record_intent(intent, status="CREATED")
     decision = risk_gate.evaluate(
         intent,
@@ -703,7 +756,7 @@ def _assert_account_risk_config(client: Any) -> None:
     gate = evaluate_runtime_gate(
         mode=os.environ.get("BIAN_MODE", "testnet"),
         client=client,
-        symbols=_symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT")),
+        symbols=trading_symbols_for_mode(os.environ.get("BIAN_MODE", "testnet")),
         probe_account=True,
     )
     if not gate.account_mode_ok or not gate.margin_mode_ok:
@@ -719,7 +772,7 @@ def _startup_recovery(mode: str, store: TradingStore) -> GateResult:
         if not expected or confirmed != expected:
             raise SystemExit("live mode requires explicit confirmation token")
     store.initialize()
-    symbols = _symbols(os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT"))
+    symbols = list(trading_symbols_for_mode(mode))
     client = None
     if mode != "paper":
         from binance_client import FuturesPrivateClient
@@ -745,14 +798,14 @@ def _startup_recovery(mode: str, store: TradingStore) -> GateResult:
         result = Reconciler(store, client=client, mode=mode).recover()
     if not result.safe_to_trade:
         raise SystemExit(f"startup reconciliation blocked trading: {result.status}")
-    if mode in {"testnet", "live"} and not preflight.trading_enabled:
-        raise SystemExit("runtime gate blocked startup: " + "; ".join(preflight.reasons))
-    gate = replace(preflight, reconciliation_ok=result.safe_to_trade)
-    if not result.safe_to_trade:
-        gate = replace(
-            gate,
-            reasons=tuple(dict.fromkeys((*gate.reasons, "RECONCILIATION_NOT_VERIFIED"))),
-        )
+    gate = evaluate_runtime_gate(
+        mode=mode,
+        store=store,
+        client=client,
+        symbols=symbols,
+        probe_account=mode != "paper",
+        reconciliation_ok=result.safe_to_trade,
+    )
     if mode == "live" and not gate.live_allowed:
         raise SystemExit("runtime gate hard-blocked live: " + "; ".join(gate.reasons))
     if mode == "testnet" and not gate.data_health_ok:
@@ -776,10 +829,17 @@ async def _run_private_forever(
         client=executor.client if isinstance(executor, BinanceExecutor) else None,
         mode=mode,
     )
+    halt_event = asyncio.Event()
+
+    def on_halt(reason: str) -> None:
+        _halt_user_stream(store, reason, state="FAILED")
+        halt_event.set()
+
     stream = UserStreamClient(
         ClientConfig.from_env(mode),
         on_event=lambda event: apply_user_stream_event(store, event),
         on_reconcile=lambda: reconciler.recover(),
+        on_halt=on_halt,
         on_listen_key=lambda key: store.record_system_event(
             event_type="LISTEN_KEY_CREATED",
             severity="INFO",
@@ -791,7 +851,28 @@ async def _run_private_forever(
     interval = max(1, int(os.environ.get("BIAN_PAPER_POLL_SEC", "60")))
     try:
         while True:
+            await asyncio.sleep(0)
             _heartbeat(store)
+            if halt_event.is_set() or str(getattr(stream, "state", "")).upper() == "FAILED":
+                reason = "USER_STREAM FAILED"
+                _halt_user_stream(store, reason, state="FAILED")
+                raise RuntimeError(reason)
+            if stream_task.done():
+                exc = None
+                if not stream_task.cancelled():
+                    exc = stream_task.exception()
+                reason = (
+                    f"USER_STREAM FAILED: {type(exc).__name__}: {exc}"
+                    if exc is not None
+                    else "USER_STREAM FAILED"
+                )
+                _halt_user_stream(store, reason, state="FAILED")
+                raise RuntimeError(reason) from exc
+            stream_state = str(getattr(stream, "state", "UNKNOWN") or "UNKNOWN").upper()
+            setter = getattr(store, "set_user_stream_health", None)
+            if callable(setter):
+                setter(stream_state)
+            current_gate = runtime_gate
             for symbol in symbols:
                 try:
                     result = await asyncio.to_thread(
@@ -801,7 +882,7 @@ async def _run_private_forever(
                         executor=executor,
                         public_client=public_client,
                         mode=mode,
-                        runtime_gate=runtime_gate,
+                        runtime_gate=current_gate,
                     )
                     print(result, flush=True)
                 except Exception as exc:
@@ -952,7 +1033,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--symbols",
-        default=os.environ.get("BIAN_PAPER_SYMBOLS", "BTCUSDT"),
+        default=None,
     )
     parser.add_argument("--mode", default=os.environ.get("BIAN_MODE", "paper"))
     parser.add_argument("--duration", type=int, default=None)
@@ -974,7 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         help="continuously record positioning shadow decisions without execution",
     )
     args = parser.parse_args(argv)
-    symbols = _symbols(args.symbols)
+    symbols = _mode_symbols(args.mode, args.symbols)
     duration_sec = args.duration
     if args.mode.strip().lower() == "shadow":
         run_shadow_forever(

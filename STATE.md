@@ -199,11 +199,28 @@ research baseline until positioning gates pass.
 
 ## Current verification (2026-09-03)
 
-Base commit: `d1558de44c57d58e12250b4582d2544567e555c4`.
+Final commit: `e5f673fe743a76eaff6ed10028388bc866751fa8`.
+Base: `20c06aadfb99be1932da7350bf4e33ff5278303a`.
 
-This round hardened acceptance so PASS requires session-scoped, fail-closed
-evidence. Freeze-path files `scripts/bian_market.py` and `trading_store.py`
-changed, so previously recorded realtime PASS results are invalid:
+This round closed Futures runtime safety and evidence boundaries. `402` pytest
+tests passed. `compileall` PASS. `git diff --check` PASS.
+`LIVE_ALLOWED=false`. `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`.
+
+P0/P1 results:
+
+- UserStream failure blocks OPEN; REDUCE/CLOSE remains available.
+- Testnet lifecycle evidence is session/order/symbol/exchange-id bound.
+- `trades.exchange_trade_id` is a first-class Binance trade id.
+- Runtime gate evidence is current-session scoped; no session => NOT_STARTED.
+- DB/report reconciliation is fail-closed.
+- Startup order is initialize -> preflight -> reconcile -> recompute gate.
+- Positions are isolated by `(mode, market, symbol)` with legacy backfill.
+- Validation episodes are session-isolated.
+- Live preflight constructs TradingStore + FuturesPrivateClient; missing
+  credentials are BLOCKED, not PASS.
+- Canonical symbols: `trading_symbols_for_mode(mode)`.
+
+Realtime/paper/shadow evidence is not current:
 
 - `REALTIME_30M=EXPIRED`
 - `REALTIME_2H=EXPIRED`
@@ -216,6 +233,6 @@ changed, so previously recorded realtime PASS results are invalid:
 - `LIVE_PREFLIGHT` evaluates `mode=live` and remains blocked
 - `LIVE=BLOCKED`
 
-Do not reuse the 2026-09-02 30M/2H PASS. Paper, Shadow, and Testnet were not
-started in this round. `live_allowed` stays false until observation, shadow,
-Testnet, reconciliation, data-health, and human-confirmation gates complete.
+Do not reuse historical 30M/2H PASS. `live_allowed` stays false until
+observation, shadow, Testnet, reconciliation, data-health, and
+human-confirmation gates complete.

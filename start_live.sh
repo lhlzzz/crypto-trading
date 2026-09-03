@@ -62,8 +62,8 @@ fi
 export BIAN_LIVE_CONFIRMATION="$confirmation"
 cd "$script_dir"
 if ! "$python_bin" - <<'PY'
-from runtime_gate import evaluate_runtime_gate
-result = evaluate_runtime_gate(mode="live", probe_account=True)
+from runtime_gate import evaluate_live_preflight
+result = evaluate_live_preflight()
 print(result.as_dict())
 raise SystemExit(0 if result.live_allowed else 1)
 PY

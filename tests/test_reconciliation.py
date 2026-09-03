@@ -18,6 +18,7 @@ class StoreStub:
         self.halt_calls = []
         self.updated = []
         self.events = []
+        self.trades = []
 
     def is_halted(self) -> bool:
         return self.halted
@@ -28,13 +29,13 @@ class StoreStub:
     def list_balances(self):
         return self.balances
 
-    def list_positions(self):
+    def list_positions(self, **kwargs):
         return self.positions
 
     def get_balance(self, asset):
         return next((row for row in reversed(self.balances) if row["asset"] == asset), None)
 
-    def get_position(self, symbol):
+    def get_position(self, symbol, **kwargs):
         return next((row for row in reversed(self.positions) if row["symbol"] == symbol), None)
 
     def set_halt(self, halted: bool, *, reason: str, source: str):
@@ -46,6 +47,10 @@ class StoreStub:
 
     def upsert_position(self, symbol, **fields):
         self.positions.append({"symbol": symbol, **fields})
+
+    def record_trade(self, order_id, **fields):
+        self.trades.append({"order_id": order_id, **fields})
+        return order_id
 
     def update_order(self, order_id, **fields):
         self.updated.append((order_id, fields))
@@ -128,6 +133,110 @@ def test_matching_account_is_safe() -> None:
     )
     result = Reconciler(store, client=client, mode="testnet").recover()
     assert result.status == "SAFE"
+
+
+def test_user_stream_preserves_binance_trade_id() -> None:
+    store = StoreStub(
+        orders=[
+            {
+                "order_id": "1",
+                "client_order_id": "BIAN-1",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+            }
+        ]
+    )
+    event = normalize_user_event(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 10,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "BIAN-1",
+                "i": 9,
+                "t": 77,
+                "X": "FILLED",
+                "x": "TRADE",
+                "z": "0.1",
+                "l": "0.1",
+                "L": "100",
+                "n": "0.01",
+                "N": "USDT",
+            },
+        }
+    )
+    apply_user_stream_event(store, event)
+    trade = next(item for item in store.trades if item.get("exchange_trade_id") == "77")
+    assert trade["exchange_trade_id"] == "77"
+
+
+def test_rest_user_trade_preserves_binance_trade_id() -> None:
+    store = StoreStub(
+        balances=[{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
+        positions=[{"symbol": "BTCUSDT", "quantity": "0.1", "position_side": "LONG", "entry_price": "100", "average_price": "100"}],
+        orders=[{
+            "order_id": "1",
+            "client_order_id": "c-1",
+            "exchange_order_id": "9",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "FILLED",
+        }],
+    )
+    client = ClientStub(
+        positions=[{"symbol": "BTCUSDT", "positionAmt": "0.1", "entryPrice": "100", "leverage": "2"}],
+    )
+    client.get_user_trades = lambda symbol, limit=None: [  # type: ignore[method-assign]
+        {
+            "id": 88,
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+        }
+    ]
+    Reconciler(store, client=client, mode="testnet").recover()
+    trade = next(item for item in store.trades if item.get("exchange_trade_id") == "88")
+    assert trade["exchange_trade_id"] == "88"
+
+
+def test_account_update_testnet_does_not_mutate_live_position(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_MODE", "testnet")
+    store = StoreStub(
+        positions=[
+            {
+                "symbol": "BTCUSDT",
+                "quantity": "1",
+                "position_side": "LONG",
+                "entry_price": "100",
+                "mode": "live",
+            }
+        ]
+    )
+    original_get = store.get_position
+
+    def get_position(symbol, **kwargs):
+        mode = kwargs.get("mode")
+        if mode == "live":
+            return store.positions[0]
+        return None
+
+    store.get_position = get_position  # type: ignore[method-assign]
+    event = normalize_user_event(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 1,
+            "a": {"P": [{"s": "BTCUSDT", "pa": "9", "ep": "100", "up": "0", "cr": "0", "mt": "isolated", "ps": "BOTH"}]},
+        }
+    )
+    apply_user_stream_event(store, event)
+    live = next(row for row in store.positions if row.get("mode") == "live")
+    assert str(live["quantity"]) == "1"
+    assert store.positions[-1].get("mode") == "testnet"
 
 
 def test_position_mismatch_halts() -> None:

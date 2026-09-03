@@ -28,7 +28,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from engine import runtime_required_sources
-from runtime_gate import evaluate_runtime_gate, max_data_age_sec
+from runtime_gate import evaluate_runtime_gate, max_data_age_sec, trading_symbols_for_mode
 from scripts.bian_market import observe
 from trading_store import TradingStore
 
@@ -276,22 +276,24 @@ def session_wall_clock_proof(
     return proof
 
 
-_SESSION_STATUS_RECONCILE = True
-
 
 def reconcile_report_with_session_status(stages: dict[str, Any]) -> list[str]:
     """Prevent DB EXPIRED/FAILED sessions from remaining PASSED in the report."""
-    global _SESSION_STATUS_RECONCILE
     mismatched: list[str] = []
-    if not _SESSION_STATUS_RECONCILE:
-        return mismatched
     try:
         store = TradingStore()
         loader = getattr(store, "load_validation_session", None)
     except Exception:
-        _SESSION_STATUS_RECONCILE = False
-        return mismatched
+        loader = None
     if not callable(loader):
+        for name, current in list(stages.items()):
+            stage = dict(current or {})
+            if stage_status(stage) != "PASSED":
+                continue
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_STATUS_UNAVAILABLE"
+            stages[name] = stage
+            mismatched.append(name)
         return mismatched
     for name, current in list(stages.items()):
         stage = dict(current or {})
@@ -299,14 +301,64 @@ def reconcile_report_with_session_status(stages: dict[str, Any]) -> list[str]:
             continue
         session_id = stage.get("session_id")
         if not session_id:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_MISSING"
+            stages[name] = stage
+            mismatched.append(name)
             continue
         try:
-            row = loader(session_id) or {}
+            row = loader(session_id)
         except Exception:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_LOOKUP_FAILED"
+            stages[name] = stage
+            mismatched.append(name)
             continue
+        if not isinstance(row, dict) or not row:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_MISSING"
+            stages[name] = stage
+            mismatched.append(name)
+            continue
+        db_session = str(row.get("session_id") or session_id)
         db_status = str(row.get("status") or "").upper()
-        if db_status in {"EXPIRED", "FAILED"}:
+        db_mode = str(row.get("mode") or "").strip().lower()
+        db_stage = str(row.get("stage") or "").strip().lower()
+        db_commit = str(row.get("commit_sha") or "")
+        report_mode = str(stage.get("mode") or "").strip().lower()
+        report_stage = str(stage.get("stage") or name).strip().lower()
+        report_commit = str(stage.get("commit_sha") or "")
+        if db_session != str(session_id):
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_ID_MISMATCH"
+            stages[name] = stage
+            mismatched.append(name)
+            continue
+        if report_mode and db_mode and db_mode != report_mode:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_MODE_MISMATCH"
+            stages[name] = stage
+            mismatched.append(name)
+            continue
+        if db_stage and report_stage and db_stage != report_stage:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_STAGE_MISMATCH"
+            stages[name] = stage
+            mismatched.append(name)
+            continue
+        if report_commit and db_commit and db_commit != report_commit:
+            stage["status"] = "FAILED"
+            stage["reason"] = "SESSION_COMMIT_MISMATCH"
+            stages[name] = stage
+            mismatched.append(name)
+            continue
+        if db_status in {"EXPIRED", "FAILED", ""}:
             stage["status"] = "EXPIRED" if db_status == "EXPIRED" else "FAILED"
+            stage["reason"] = "SESSION_STATUS_MISMATCH"
+            stages[name] = stage
+            mismatched.append(name)
+        elif db_status != "PASSED":
+            stage["status"] = "FAILED"
             stage["reason"] = "SESSION_STATUS_MISMATCH"
             stages[name] = stage
             mismatched.append(name)
@@ -1751,32 +1803,75 @@ def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, An
         order = leg.get("order") if isinstance(leg.get("order"), dict) else {}
         fills = leg.get("fills") if isinstance(leg.get("fills"), list) else []
         close = leg.get("close") if isinstance(leg.get("close"), dict) else {}
-        fill_ids = [item.get("trade_id") for item in fills if isinstance(item, dict)]
+        fill_ids = [
+            item.get("exchange_trade_id") or item.get("trade_id")
+            for item in fills
+            if isinstance(item, dict)
+        ]
+        exchange_trade_ids = [
+            item.get("exchange_trade_id")
+            for item in fills
+            if isinstance(item, dict)
+        ]
         return all(
             (
+                bool(order.get("order_id") or order.get("local_order_id")),
                 bool(order.get("client_order_id")),
                 bool(order.get("exchange_order_id")),
                 bool(fill_ids) and all(fill_ids),
+                bool(exchange_trade_ids) and all(exchange_trade_ids),
                 bool(leg.get("user_stream_observed")),
                 bool(leg.get("local_state_updated")),
                 bool(leg.get("reconciliation_matches")),
                 bool(close.get("exchange_order_id")),
-                bool(close.get("reconciled_flat") or close.get("reconciliation_matches")),
+                bool(close.get("reconciliation_matches")),
             )
         )
 
     def _user_stream_ok(payload: dict[str, Any]) -> bool:
+        def _parse_dt(value: Any) -> datetime | None:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+
         events = payload.get("events")
         if not isinstance(events, list) or not events:
             return False
+        lifecycle_ids = {
+            str(item)
+            for item in (
+                (long_leg.get("order") or {}).get("exchange_order_id"),
+                (long_leg.get("close") or {}).get("exchange_order_id"),
+                (short_leg.get("order") or {}).get("exchange_order_id"),
+                (short_leg.get("close") or {}).get("exchange_order_id"),
+            )
+            if item
+        }
+        symbol = str(evidence.get("symbol") or "").upper()
+        session_id = str(evidence.get("session_id") or "")
+        session_start = _parse_dt(evidence.get("start_time") or evidence.get("started_at"))
+        session_end = _parse_dt(evidence.get("end_time") or evidence.get("ended_at"))
         trade_ok = False
         account_ok = False
         for event in events:
             if not isinstance(event, dict):
                 continue
+            event_session = str(
+                event.get("validation_session_id") or event.get("session_id") or session_id
+            )
+            if session_id and event_session != session_id:
+                continue
             event_type = str(event.get("event_type") or "").upper()
             if event_type == "ORDER_TRADE_UPDATE":
-                trade_ok = all(
+                if str(event.get("exchange_order_id") or "") not in lifecycle_ids:
+                    continue
+                trade_ok = trade_ok or all(
                     event.get(key)
                     for key in (
                         "event_id",
@@ -1788,7 +1883,26 @@ def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, An
                     )
                 )
             elif event_type == "ACCOUNT_UPDATE":
-                account_ok = all(event.get(key) for key in ("event_id", "event_type", "event_time"))
+                event_symbol = str(event.get("symbol") or "").upper()
+                position_symbols = {
+                    str(item.get("symbol") or "").upper()
+                    for item in (event.get("position_updates") or [])
+                    if isinstance(item, dict)
+                }
+                if not symbol or symbol not in position_symbols:
+                    continue
+                if event_symbol and event_symbol != symbol:
+                    continue
+                event_time = _parse_dt(event.get("event_time"))
+                if event_time is None:
+                    continue
+                if session_start is not None and event_time < session_start:
+                    continue
+                if session_end is not None and event_time > session_end:
+                    continue
+                account_ok = account_ok or all(
+                    event.get(key) for key in ("event_id", "event_type", "event_time")
+                )
         return trade_ok and account_ok
 
     recon_orders = reconciliation.get("orders") if isinstance(reconciliation.get("orders"), list) else []
@@ -1797,6 +1911,17 @@ def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, An
         for item in recon_orders
         if isinstance(item, dict)
     ]
+    lifecycle_order_ids = {
+        str(item)
+        for item in (
+            (long_leg.get("order") or {}).get("exchange_order_id"),
+            (long_leg.get("close") or {}).get("exchange_order_id"),
+            (short_leg.get("order") or {}).get("exchange_order_id"),
+            (short_leg.get("close") or {}).get("exchange_order_id"),
+        )
+        if item
+    }
+    recon_id_set = {str(item) for item in recon_ids if item}
     required = {
         "session_id": bool(evidence.get("session_id")),
         "start_time": bool(evidence.get("start_time") or evidence.get("started_at")),
@@ -1830,11 +1955,13 @@ def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, An
         "USER_STREAM": _user_stream_ok(user_stream),
         "listenKey": bool(listen_key.get("listen_key")),
         "reconciliation": (
-            bool(reconciliation.get("ok") or reconciliation.get("open_matches"))
+            bool(reconciliation.get("ok"))
+            and bool(reconciliation.get("open_matches"))
             and bool(recon_ids)
             and all(recon_ids)
-            and bool(reconciliation.get("local_flat"))
             and bool(reconciliation.get("exchange_flat"))
+            and bool(lifecycle_order_ids)
+            and lifecycle_order_ids <= recon_id_set
         ),
         "restart": bool(restart.get("ok")),
     }
@@ -1920,20 +2047,20 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
     current_health: dict[str, Any] = {}
     try:
         store = TradingStore()
-        live_symbols = [
-            item.replace("-", "").upper()
-            for item in (
-                os.environ.get("BIAN_LIVE_SYMBOLS")
-                or os.environ.get("BIAN_PAPER_SYMBOLS")
-                or "BTCUSDT"
-            ).split(",")
-            if item.strip()
-        ]
+        live_symbols = list(trading_symbols_for_mode("live"))
+        client = None
+        try:
+            from binance_client import ClientConfig, FuturesPrivateClient
+
+            client = FuturesPrivateClient(ClientConfig.from_env("live"))
+        except Exception:
+            client = None
         gate = evaluate_runtime_gate(
             mode="live",
             store=store,
+            client=client,
             symbols=live_symbols,
-            probe_account=False,
+            probe_account=True,
         ).as_dict()
         current_health = {
             "current_runtime_health": gate.get("MARKET_HEALTH"),

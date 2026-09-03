@@ -295,6 +295,7 @@ def _create_trading_tables(cursor: Any) -> None:
             position_side TEXT,
             funding NUMERIC NOT NULL DEFAULT 0,
             source_event_id TEXT,
+            exchange_trade_id TEXT,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
         )
         """
@@ -302,6 +303,7 @@ def _create_trading_tables(cursor: Any) -> None:
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS positions (
+            mode TEXT NOT NULL DEFAULT 'legacy' CHECK (mode IN ('paper', 'testnet', 'live', 'legacy')),
             market TEXT NOT NULL DEFAULT 'FUTURES',
             symbol TEXT NOT NULL,
             position_side TEXT,
@@ -321,7 +323,7 @@ def _create_trading_tables(cursor: Any) -> None:
             funding_pnl NUMERIC NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB),
-            PRIMARY KEY (market, symbol)
+            PRIMARY KEY (mode, market, symbol)
         )
         """
     )
@@ -634,6 +636,18 @@ def _create_trading_tables(cursor: Any) -> None:
     )
     cursor.execute(
         """
+        ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange_trade_id TEXT
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS trades_exchange_trade_id_idx
+        ON trades(mode, exchange_trade_id)
+        WHERE exchange_trade_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
         CREATE UNIQUE INDEX IF NOT EXISTS orders_exchange_order_id_idx
         ON orders(exchange_order_id) WHERE exchange_order_id IS NOT NULL
         """
@@ -666,7 +680,9 @@ def _migrate_futures_columns(cursor: Any) -> None:
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS position_side TEXT",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS funding NUMERIC NOT NULL DEFAULT 0",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS source_event_id TEXT",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange_trade_id TEXT",
         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS market TEXT",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mode TEXT",
         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS position_side TEXT",
         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_price NUMERIC",
         "ALTER TABLE positions ADD COLUMN IF NOT EXISTS mark_price NUMERIC",
@@ -722,17 +738,34 @@ def _migrate_futures_columns(cursor: Any) -> None:
             IF EXISTS (
                 SELECT 1
                 FROM positions
-                GROUP BY market, symbol
+                GROUP BY COALESCE(mode, 'legacy'), market, symbol
                 HAVING COUNT(*) > 1
             ) THEN
-                RAISE EXCEPTION 'positions contain duplicate canonical (market, symbol) keys';
+                RAISE EXCEPTION 'positions contain duplicate canonical (mode, market, symbol) keys';
             END IF;
         END $$
         """
     )
+    cursor.execute(
+        """
+        UPDATE positions
+        SET mode = 'legacy'
+        WHERE mode IS NULL OR BTRIM(mode) = ''
+        """
+    )
     cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey")
     cursor.execute(
-        "ALTER TABLE positions ADD CONSTRAINT positions_pkey PRIMARY KEY (market, symbol)"
+        "ALTER TABLE positions ADD CONSTRAINT positions_pkey PRIMARY KEY (mode, market, symbol)"
+    )
+    cursor.execute("ALTER TABLE positions ALTER COLUMN mode SET DEFAULT 'legacy'")
+    cursor.execute("ALTER TABLE positions ALTER COLUMN mode SET NOT NULL")
+    cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_mode_valid")
+    cursor.execute(
+        """
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_mode_valid
+            CHECK (mode IN ('paper', 'testnet', 'live', 'legacy'))
+        """
     )
     cursor.execute(
         """
@@ -909,6 +942,21 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
             ON {table}(validation_session_id)
             """
         )
+    cursor.execute("DROP INDEX IF EXISTS positioning_episodes_active_symbol_idx")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positioning_episodes_active_symbol_idx
+        ON positioning_episodes(symbol, market)
+        WHERE status IN ('OPEN', 'UNRESOLVED') AND validation_session_id IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positioning_episodes_active_symbol_session_idx
+        ON positioning_episodes(symbol, market, validation_session_id)
+        WHERE status IN ('OPEN', 'UNRESOLVED') AND validation_session_id IS NOT NULL
+        """
+    )
 
 
 def schema_status(dsn: str | None = None) -> dict[str, object]:

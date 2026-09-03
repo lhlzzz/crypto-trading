@@ -379,3 +379,27 @@ def test_keepalive_failure_degrades_and_reconnects() -> None:
     assert client.stream_failure_reason == "LISTEN_KEY_KEEPALIVE_FAILED"
     assert halted
     assert reconciled
+
+
+def test_user_stream_preserves_binance_trade_id() -> None:
+    event = normalize_user_event(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 99,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "BIAN-1",
+                "i": 42,
+                "t": 777,
+                "X": "FILLED",
+                "x": "TRADE",
+                "z": "0.1",
+                "l": "0.1",
+                "L": "100",
+                "n": "0.01",
+                "N": "USDT",
+            },
+        }
+    )
+    assert event.trade_id == "777"
+    assert event.event_id is not None

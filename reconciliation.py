@@ -82,6 +82,7 @@ class Reconciler:
         recovered_balances = self._reconcile_balances(snapshot, differences)
         recovered_positions = self._reconcile_positions(differences)
         recovered_orders = self._reconcile_orders(differences)
+        recovered_trades = self._reconcile_user_trades(differences)
         if differences:
             self._record_differences(differences)
             return self._fail("; ".join(differences))
@@ -117,12 +118,27 @@ class Reconciler:
                     "recovered_orders": recovered_orders,
                     "recovered_balances": recovered_balances,
                     "recovered_positions": recovered_positions,
+                    "recovered_trades": recovered_trades,
                     "exchange_positions": exchange_positions,
+                    "exchange_open_orders": [
+                        {
+                            "symbol": str(row.get("symbol") or ""),
+                            "exchange_order_id": str(row.get("orderId") or row.get("order_id") or ""),
+                            "client_order_id": str(row.get("clientOrderId") or row.get("origClientOrderId") or ""),
+                            "status": str(row.get("status") or ""),
+                        }
+                        for row in (getattr(self.client, "get_open_orders", lambda: [])() or [])
+                    ],
+                    "exchange_trades": recovered_trades,
                     "exchange_flat": exchange_flat,
                     "local_flat": all(
                         Decimal(str(row.get("quantity") or 0)) == 0
                         or str(row.get("position_side") or "FLAT").upper() == "FLAT"
-                        for row in (getattr(self.store, "list_positions", lambda: [])() or [])
+                        for row in (
+                            getattr(self.store, "list_positions", lambda **_: [])(mode=self.mode)
+                            if callable(getattr(self.store, "list_positions", None))
+                            else []
+                        )
                     ),
                 },
             )
@@ -202,7 +218,10 @@ class Reconciler:
         local_rows = []
         lister = getattr(self.store, "list_positions", None)
         if lister is not None:
-            local_rows = lister()
+            try:
+                local_rows = lister(mode=self.mode)
+            except TypeError:
+                local_rows = lister()
         recovered = 0
         local_by_symbol = {str(row["symbol"]): row for row in local_rows}
         for symbol in set(broker) | set(local_by_symbol):
@@ -283,6 +302,67 @@ class Reconciler:
             f"exchange order has no local intent: {value}" for value in unexpected
         )
         return recovered_orders
+
+    def _reconcile_user_trades(self, differences: list[str]) -> int:
+        getter = getattr(self.client, "get_user_trades", None)
+        recorder = getattr(self.store, "record_trade", None)
+        if not callable(getter) or not callable(recorder):
+            return 0
+        recovered = 0
+        seen: set[str] = set()
+        local_orders = list(self.store.list_open_local_orders())
+        symbols = sorted(
+            {
+                str(order.get("symbol") or "")
+                for order in local_orders
+                if order.get("symbol")
+            }
+        )
+        by_exchange_id = {
+            str(order.get("exchange_order_id")): order
+            for order in local_orders
+            if order.get("exchange_order_id")
+        }
+        for symbol in symbols:
+            try:
+                rows = getter(symbol) or []
+            except Exception as exc:
+                differences.append(f"user trade lookup failed: {symbol}: {exc}")
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                exchange_trade_id = row.get("id")
+                if exchange_trade_id is None:
+                    continue
+                trade_key = str(exchange_trade_id)
+                if trade_key in seen:
+                    continue
+                seen.add(trade_key)
+                exchange_order_id = str(row.get("orderId") or "")
+                local = by_exchange_id.get(exchange_order_id)
+                if local is None:
+                    continue
+                recorder(
+                    local["order_id"],
+                    symbol=str(row.get("symbol") or local.get("symbol") or symbol).upper(),
+                    side=str(row.get("side") or local.get("side") or ""),
+                    quantity=Decimal(str(row.get("qty") or row.get("quantity") or "0")),
+                    price=Decimal(str(row.get("price") or "0")),
+                    fee=Decimal(str(row.get("commission") or row.get("fee") or "0")),
+                    fee_asset=str(row.get("commissionAsset") or row.get("fee_asset") or "USDT"),
+                    realized_pnl=Decimal(str(row.get("realizedPnl") or "0")),
+                    market="FUTURES",
+                    position_side=str(row.get("positionSide") or local.get("position_side") or "").upper() or None,
+                    exchange_trade_id=trade_key,
+                    payload={
+                        "source": "binance_rest",
+                        "exchange_trade_id": trade_key,
+                        "mode": self.mode,
+                    },
+                )
+                recovered += 1
+        return recovered
 
     def _restore_order(
         self,
@@ -382,7 +462,9 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
             if not symbol:
                 continue
             amount = Decimal(str(position.get("quantity") or "0"))
-            current = getattr(store, "get_position", lambda _symbol: None)(symbol) or {}
+            getter = getattr(store, "get_position", None)
+            current = getter(symbol, mode=mode) if callable(getter) else {}
+            current = current or {}
             direction, quantity = _exchange_position({
                 "positionAmt": str(amount),
                 "positionSide": position.get("position_side"),
@@ -408,6 +490,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 maintenance_margin=current.get("maintenance_margin"),
                 liquidation_price=current.get("liquidation_price"),
                 funding_pnl=Decimal(str(current.get("funding_pnl") or "0")),
+                mode=mode,
                 payload={
                     **(current.get("payload") or {}),
                     "source": getattr(event, "source", "USER_STREAM"),
@@ -524,9 +607,11 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 market="FUTURES",
                 position_side=position_side or None,
                 source_event_id=event_id,
+                exchange_trade_id=getattr(event, "trade_id", None),
                 payload={
                     "source": "user_stream",
                     "event_id": event_id,
+                    "exchange_trade_id": getattr(event, "trade_id", None),
                     "execution_type": getattr(event, "execution_type", None),
                     "reduce_only": getattr(event, "reduce_only", None),
                 },

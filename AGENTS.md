@@ -31,13 +31,18 @@ calling Risk, Execution, TradeIntent creation, or order submission.
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
 
-Current validation status on 2026-09-03, base `d1558de44c57d58e12250b4582d2544567e555c4`:
-code checks are the current working-tree result (`349` pytest tests passed).
-PostgreSQL schema/status remains healthy. Freeze-path files
-(`scripts/bian_market.py`, `trading_store.py`) changed in this validation-hardening
-round, so prior realtime evidence is `EXPIRED` and must not be reused:
-`REALTIME_30M=EXPIRED`, `REALTIME_2H=EXPIRED`, `REALTIME_6H=NOT_STARTED`,
-`REALTIME_24H=NOT_STARTED`. `PAPER_24H=NOT_STARTED`, `SHADOW_7D=NOT_STARTED`,
-`ALPHA=INSUFFICIENT_SAMPLE` until a later persisted OOS session exists,
-`TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`, `LIVE_PREFLIGHT` is live-mode only
-and still blocked, `LIVE=BLOCKED`. Do not treat historical 30M/2H PASS as current.
+Current validation status on 2026-09-03, commit `e5f673fe743a76eaff6ed10028388bc866751fa8`:
+code checks are `402` pytest tests passed, `compileall` PASS, `git diff --check`
+PASS. PostgreSQL schema/status remains healthy. `LIVE_ALLOWED=false`.
+`TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`. UserStream failure blocks OPEN;
+REDUCE/CLOSE remains available under current risk/reconciliation rules.
+Gate evidence is current-session scoped. `exchange_trade_id` is persisted.
+Positions are isolated by `(mode, market, symbol)`. Validation episodes are
+session-scoped. Startup recomputes the canonical gate after reconciliation.
+Canonical symbols come from `trading_symbols_for_mode()`. Freeze-path and
+runtime-safety files changed, so prior realtime evidence remains `EXPIRED`
+and must not be reused: `REALTIME_30M=EXPIRED`, `REALTIME_2H=EXPIRED`,
+`REALTIME_6H=NOT_STARTED`, `REALTIME_24H=NOT_STARTED`. `PAPER_24H=NOT_STARTED`,
+`SHADOW_7D=NOT_STARTED`, `ALPHA=INSUFFICIENT_SAMPLE` until a later persisted
+OOS session exists, `LIVE_PREFLIGHT` is live-mode only and still blocked,
+`LIVE=BLOCKED`. Do not treat historical 30M/2H PASS as current.

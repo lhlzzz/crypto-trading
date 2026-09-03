@@ -143,6 +143,11 @@ def derive_testnet_lifecycle_facts(
         return [
             {
                 "trade_id": str(trade.get("trade_id") or ""),
+                "exchange_trade_id": str(
+                    trade.get("exchange_trade_id")
+                    or _json_obj(trade.get("payload")).get("exchange_trade_id")
+                    or ""
+                ),
                 "quantity": str(trade.get("quantity") or "0"),
                 "source_event_id": trade.get("source_event_id"),
             }
@@ -151,14 +156,24 @@ def derive_testnet_lifecycle_facts(
 
     def _user_stream_for(order: dict[str, Any]) -> list[dict[str, Any]]:
         observed = []
+        expected_exchange_id = str(order.get("exchange_order_id") or "")
         for event in events_by_order.get(str(order.get("order_id") or ""), []):
             if str(event.get("event_type") or "") != "USER_STREAM_ORDER_UPDATE":
                 continue
             payload = _json_obj(event.get("payload"))
+            observed_exchange_id = str(
+                event.get("exchange_order_id")
+                or payload.get("exchange_order_id")
+                or payload.get("i")
+                or order.get("exchange_order_id")
+                or ""
+            )
+            if expected_exchange_id and observed_exchange_id != expected_exchange_id:
+                continue
             observed.append(
                 {
                     "event_id": event.get("event_id") or payload.get("event_id"),
-                    "exchange_order_id": order.get("exchange_order_id") or payload.get("exchange_order_id"),
+                    "exchange_order_id": observed_exchange_id,
                     "symbol": order.get("symbol") or payload.get("symbol"),
                     "event_time": str(event.get("event_at") or payload.get("event_time") or ""),
                     "execution_type": payload.get("execution_type") or payload.get("x") or event.get("status"),
@@ -202,13 +217,15 @@ def derive_testnet_lifecycle_facts(
             "fills": fills,
             "user_stream_observed": bool(stream),
             "local_state_updated": bool(open_order.get("status")),
-            "reconciliation_matches": _reconciled(open_order) or _reconciled(close_order),
+            "reconciliation_matches": _reconciled(open_order) and (
+                not close_order or _reconciled(close_order)
+            ),
             "close": {
                 "order_id": close_order.get("order_id"),
                 "exchange_order_id": close_order.get("exchange_order_id"),
                 "status": close_order.get("status"),
-                "reconciled_flat": local_flat and bool(close_order),
-                "reconciliation_matches": _reconciled(close_order) or local_flat,
+                "reconciled_flat": False,
+                "reconciliation_matches": _reconciled(close_order),
             },
         }
 
@@ -288,16 +305,38 @@ def derive_testnet_lifecycle_facts(
     user_stream_events: list[dict[str, Any]] = []
     for order in orders:
         user_stream_events.extend(_user_stream_for(order))
+    lifecycle_symbol = next(
+        (str(order.get("symbol") or "").upper() for order in orders if order.get("symbol")),
+        "",
+    )
+    lifecycle_exchange_ids = {
+        str(order.get("exchange_order_id") or "")
+        for order in orders
+        if order.get("exchange_order_id")
+    }
     for event in system_events:
         payload = _json_obj(event.get("payload"))
         if str(event.get("event_type") or "") != "USER_STREAM_ACCOUNT_UPDATE":
+            continue
+        event_symbol = str(payload.get("symbol") or "").upper()
+        position_symbols = {
+            str(item.get("symbol") or "").upper()
+            for item in (payload.get("position_updates") or [])
+            if isinstance(item, dict) and item.get("symbol")
+        }
+        if lifecycle_symbol and event_symbol not in {lifecycle_symbol, ""} and lifecycle_symbol not in position_symbols:
+            continue
+        if lifecycle_symbol and not event_symbol and lifecycle_symbol not in position_symbols:
+            continue
+        event_time = str(event.get("event_at") or payload.get("event_time") or "")
+        if not event_time:
             continue
         user_stream_events.append(
             {
                 "event_id": event.get("event_id") or payload.get("event_id"),
                 "exchange_order_id": payload.get("exchange_order_id"),
-                "symbol": payload.get("symbol") or "USDT",
-                "event_time": str(event.get("event_at") or payload.get("event_time") or ""),
+                "symbol": event_symbol or lifecycle_symbol,
+                "event_time": event_time,
                 "execution_type": payload.get("execution_type") or "ACCOUNT_UPDATE",
                 "event_type": "ACCOUNT_UPDATE",
                 "position_updates": payload.get("position_updates") or [],
@@ -321,6 +360,18 @@ def derive_testnet_lifecycle_facts(
         event for event in order_events
         if str(event.get("event_type") or "") in {"ORDER_RECONCILED", "ORDER_RECONCILED_AFTER_UNKNOWN"}
     ]
+    recon_exchange_ids = {
+        str(event.get("exchange_order_id") or _json_obj(event.get("payload")).get("exchange_order_id") or "")
+        for event in recon_events
+        if event.get("exchange_order_id") or _json_obj(event.get("payload")).get("exchange_order_id")
+    }
+    open_close_ids = {
+        str(order.get("exchange_order_id") or "")
+        for order in orders
+        if str(order.get("position_action") or "").upper() in {"OPEN", "CLOSE", "REDUCE"}
+        and order.get("exchange_order_id")
+    }
+    lifecycle_reconciled = bool(open_close_ids) and open_close_ids.issubset(recon_exchange_ids | lifecycle_exchange_ids) and bool(recon_events)
     local_flat = all(
         Decimal(str(position.get("quantity") or 0)) == 0
         or str(position.get("position_side") or "FLAT").upper() == "FLAT"
@@ -339,21 +390,14 @@ def derive_testnet_lifecycle_facts(
                         or str(item.get("position_side") or "FLAT").upper() == "FLAT"
                         for item in rows
                         if isinstance(item, dict)
+                        and (
+                            not lifecycle_symbol
+                            or str(item.get("symbol") or "").upper() == lifecycle_symbol
+                        )
                     )
                 )
             elif "exchange_flat" in payload:
                 exchange_flat_flags.append(bool(payload.get("exchange_flat")))
-        elif event_type == "USER_STREAM_ACCOUNT_UPDATE":
-            rows = payload.get("position_updates") or []
-            if isinstance(rows, list) and rows:
-                exchange_flat_flags.append(
-                    all(
-                        Decimal(str(item.get("quantity") or 0)) == 0
-                        or str(item.get("position_side") or "FLAT").upper() == "FLAT"
-                        for item in rows
-                        if isinstance(item, dict)
-                    )
-                )
     exchange_flat = bool(exchange_flat_flags) and all(exchange_flat_flags)
     comparison = TradingStore.compare_restart_snapshots(
         row.get("pre_restart_snapshot"),
@@ -375,8 +419,8 @@ def derive_testnet_lifecycle_facts(
         "user_stream": {"events": user_stream_events, "observed": bool(user_stream_events)},
         "listen_key": listen,
         "reconciliation": {
-            "ok": recon_ok or bool(recon_events),
-            "open_matches": recon_ok or bool(recon_events),
+            "ok": recon_ok and lifecycle_reconciled and exchange_flat,
+            "open_matches": lifecycle_reconciled,
             "orders": [
                 {
                     "local_order_id": event.get("order_id"),
@@ -388,7 +432,7 @@ def derive_testnet_lifecycle_facts(
             "fills": [
                 {
                     "trade_id": trade.get("trade_id"),
-                    "exchange_trade_id": trade.get("source_event_id"),
+                    "exchange_trade_id": trade.get("exchange_trade_id") or trade.get("source_event_id"),
                     "match": True,
                 }
                 for trade in trades
@@ -710,7 +754,7 @@ class TradingStore:
                 cursor.execute(
                     """
                     SELECT t.trade_id, t.order_id, t.symbol, t.quantity, t.price,
-                           t.source_event_id, t.payload
+                           t.source_event_id, t.exchange_trade_id, t.payload
                     FROM trades t
                     JOIN orders o ON o.order_id = t.order_id
                     WHERE o.validation_session_id = %s AND t.mode = 'testnet'
@@ -733,6 +777,7 @@ class TradingStore:
                     """
                     SELECT symbol, position_side, quantity
                     FROM positions
+                    WHERE mode = 'testnet'
                     """
                 )
                 position_rows = cursor.fetchall()
@@ -761,7 +806,7 @@ class TradingStore:
             _row_dict(
                 (
                     "trade_id", "order_id", "symbol", "quantity", "price",
-                    "source_event_id", "payload",
+                    "source_event_id", "exchange_trade_id", "payload",
                 ),
                 row,
             )
@@ -972,6 +1017,25 @@ class TradingStore:
             payload={"source": source, "halted": halted},
         )
 
+    def set_user_stream_health(self, status: str, *, reason: str | None = None) -> None:
+        normalized = str(status or "UNKNOWN").strip().upper() or "UNKNOWN"
+        previous = str(getattr(self, "_user_stream_health", "") or "").upper()
+        self._user_stream_health = normalized
+        if previous == normalized and reason is None:
+            return
+        self.record_system_event(
+            event_type="USER_STREAM_HEALTH",
+            severity="CRITICAL" if normalized in {"FAILED", "DEGRADED", "UNKNOWN"} else "INFO",
+            message=reason or f"user stream {normalized}",
+            payload={"status": normalized, "health": normalized, "reason": reason},
+        )
+
+    def user_stream_health(self) -> str:
+        current = getattr(self, "_user_stream_health", None)
+        if current:
+            return str(current).upper()
+        return "UNKNOWN"
+
     def record_intent(self, intent: TradeIntent, *, status: str = "CREATED") -> None:
         import psycopg2
 
@@ -1093,11 +1157,12 @@ class TradingStore:
         return self._episode_from_row(row) if row is not None else None
 
     def get_active_episode(
-        self, symbol: str, *, market: str = "FUTURES"
+        self, symbol: str, session_id: str | None = None, *, market: str = "FUTURES"
     ) -> dict[str, Any] | None:
         """Return the single persisted directional lifecycle for a symbol."""
         import psycopg2
 
+        resolved_session = session_id if session_id is not None else self._session_id()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1109,10 +1174,11 @@ class TradingStore:
                     WHERE symbol = %s
                       AND market = %s
                       AND status IN ('OPEN', 'UNRESOLVED')
+                      AND validation_session_id IS NOT DISTINCT FROM %s
                     ORDER BY started_at DESC, episode_id DESC
                     LIMIT 1
                     """,
-                    (symbol.upper(), market.upper()),
+                    (symbol.upper(), market.upper(), resolved_session),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -1145,6 +1211,19 @@ class TradingStore:
             raise ValueError("episodes require a directional regime")
         episode_id = uuid4()
         observed_at = _as_utc(observed_at)
+        session_id = self._session_id()
+        if session_id:
+            conflict = """
+                    ON CONFLICT (symbol, market, validation_session_id)
+                    WHERE status IN ('OPEN', 'UNRESOLVED')
+                      AND validation_session_id IS NOT NULL
+            """
+        else:
+            conflict = """
+                    ON CONFLICT (symbol, market)
+                    WHERE status IN ('OPEN', 'UNRESOLVED')
+                      AND validation_session_id IS NULL
+            """
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1155,8 +1234,9 @@ class TradingStore:
                         metadata, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s,
                               CAST(%s AS JSONB), %s)
-                    ON CONFLICT (symbol, market)
-                    WHERE status IN ('OPEN', 'UNRESOLVED')
+                    """
+                    + conflict
+                    + """
                     DO UPDATE SET
                         last_observed_at = GREATEST(
                             positioning_episodes.last_observed_at,
@@ -1170,7 +1250,7 @@ class TradingStore:
                         str(episode_id), symbol.upper(), market.upper(), direction,
                         observed_at, state, observed_at, strategy_version, config_hash,
                         _json(metadata),
-                        self._session_id(),
+                        session_id,
                     ),
                 )
                 row = cursor.fetchone()
@@ -1652,23 +1732,48 @@ class TradingStore:
         import psycopg2
         from engine import runtime_required_sources
 
+        requested_symbols = {
+            str(symbol).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
+            for symbol in (symbols or ())
+            if str(symbol).strip()
+        }
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT DISTINCT ON (symbol, event_type)
-                           symbol, market, event_type, event_timestamp,
-                           received_timestamp, latency_ms, metadata
-                    FROM market_flow_events
-                    WHERE market = 'FUTURES'
-                      AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
-                      AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
-                      AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
-                      AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
-                    ORDER BY symbol, event_type, received_timestamp DESC,
-                             event_timestamp DESC
-                    """
-                )
+                cursor.execute("SET LOCAL statement_timeout = '5000'")
+                if requested_symbols:
+                    cursor.execute(
+                        """
+                        SELECT DISTINCT ON (symbol, event_type)
+                               symbol, market, event_type, event_timestamp,
+                               received_timestamp, latency_ms, metadata
+                        FROM market_flow_events
+                        WHERE market = 'FUTURES'
+                          AND symbol = ANY(%s)
+                          AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
+                        ORDER BY symbol, event_type, received_timestamp DESC,
+                                 event_timestamp DESC
+                        """,
+                        (list(requested_symbols),),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT DISTINCT ON (symbol, event_type)
+                               symbol, market, event_type, event_timestamp,
+                               received_timestamp, latency_ms, metadata
+                        FROM market_flow_events
+                        WHERE market = 'FUTURES'
+                          AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
+                          AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
+                        ORDER BY symbol, event_type, received_timestamp DESC,
+                                 event_timestamp DESC
+                        """
+                    )
                 rows = cursor.fetchall()
         now = _now()
         source_events = {
@@ -1683,11 +1788,6 @@ class TradingStore:
                 "FUTURES_FUNDING_LIVENESS",
             ),
             "LIQUIDATION_HEARTBEAT": ("FUTURES_LIQUIDATION_LIVENESS",),
-        }
-        requested_symbols = {
-            str(symbol).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
-            for symbol in (symbols or ())
-            if str(symbol).strip()
         }
         canonical: dict[str, dict[str, tuple[str, Any, Any, int, dict[str, Any]]]] = {}
         symbols: set[str] = set()
@@ -2420,11 +2520,26 @@ class TradingStore:
         position_side: str | None = None,
         funding: Decimal = Decimal("0"),
         source_event_id: str | None = None,
+        exchange_trade_id: str | None = None,
+        mode: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> UUID:
         import psycopg2
 
         trade_id = uuid4()
+        mode = self._mode(mode)
+        conflict_sql = (
+            """
+                    ON CONFLICT (mode, exchange_trade_id)
+                    WHERE exchange_trade_id IS NOT NULL
+                    DO UPDATE SET exchange_trade_id = EXCLUDED.exchange_trade_id
+            """
+            if exchange_trade_id
+            else """
+                    ON CONFLICT (source_event_id) DO UPDATE
+                    SET source_event_id = EXCLUDED.source_event_id
+            """
+        )
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2432,11 +2547,13 @@ class TradingStore:
                     INSERT INTO trades(
                         trade_id, order_id, symbol, side, quantity, price,
                         fee, fee_asset, realized_pnl, executed_at, market, mode,
-                        position_side, funding, source_event_id, payload, validation_session_id
+                        position_side, funding, source_event_id, exchange_trade_id,
+                        payload, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
-                    ON CONFLICT (source_event_id) DO UPDATE
-                    SET source_event_id = EXCLUDED.source_event_id
+                              %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
+                    """
+                    + conflict_sql
+                    + """
                     RETURNING trade_id
                     """,
                     (
@@ -2451,10 +2568,11 @@ class TradingStore:
                         realized_pnl,
                         _now(),
                         market,
-                        self._mode((payload or {}).get("mode")),
+                        mode,
                         position_side,
                         funding,
                         source_event_id,
+                        None if exchange_trade_id is None else str(exchange_trade_id),
                         _json(payload),
                         self._session_id(),
                     ),
@@ -2548,23 +2666,25 @@ class TradingStore:
         liquidation_price: Decimal | None = None,
         funding_pnl: Decimal = Decimal("0"),
         payload: dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> None:
         import psycopg2
 
         resolved_entry = entry_price if entry_price is not None else average_price
+        resolved_mode = self._mode(mode)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO positions(
-                        market, symbol, quantity, average_price, realized_pnl,
+                        mode, market, symbol, quantity, average_price, realized_pnl,
                         unrealized_pnl, updated_at, payload, position_side,
                         entry_price, mark_price, index_price, notional,
                         leverage, margin_type, initial_margin,
                         maintenance_margin, liquidation_price, funding_pnl
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB),
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB),
                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (market, symbol) DO UPDATE SET
+                    ON CONFLICT (mode, market, symbol) DO UPDATE SET
                         quantity = EXCLUDED.quantity,
                         average_price = EXCLUDED.average_price,
                         realized_pnl = EXCLUDED.realized_pnl,
@@ -2572,6 +2692,7 @@ class TradingStore:
                         updated_at = EXCLUDED.updated_at,
                         payload = EXCLUDED.payload,
                         market = EXCLUDED.market,
+                        mode = EXCLUDED.mode,
                         position_side = EXCLUDED.position_side,
                         entry_price = EXCLUDED.entry_price,
                         mark_price = EXCLUDED.mark_price,
@@ -2585,6 +2706,7 @@ class TradingStore:
                         funding_pnl = EXCLUDED.funding_pnl
                     """,
                     (
+                        resolved_mode,
                         market,
                         symbol,
                         quantity,
@@ -2607,46 +2729,49 @@ class TradingStore:
                     ),
                 )
 
-    def get_position(self, symbol: str, *, market: str = "FUTURES") -> dict[str, Any] | None:
+    def get_position(
+        self, symbol: str, *, market: str = "FUTURES", mode: str | None = None
+    ) -> dict[str, Any] | None:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT market, symbol, quantity, average_price, realized_pnl,
+                    SELECT mode, market, symbol, quantity, average_price, realized_pnl,
                            unrealized_pnl, updated_at, position_side,
                            entry_price, mark_price, index_price, notional, leverage,
                            margin_type, initial_margin, maintenance_margin,
                            liquidation_price, funding_pnl, payload
                     FROM positions
-                    WHERE market = %s AND symbol = %s
+                    WHERE mode = %s AND market = %s AND symbol = %s
                     """,
-                    (market, symbol),
+                    (self._mode(mode), market, symbol),
                 )
                 row = cursor.fetchone()
         if row is None:
             return None
         return {
-            "market": row[0],
-            "symbol": row[1],
-            "quantity": Decimal(str(row[2])),
-            "average_price": Decimal(str(row[3])),
-            "realized_pnl": Decimal(str(row[4])),
-            "unrealized_pnl": Decimal(str(row[5])),
-            "updated_at": row[6],
-            "position_side": row[7],
-            "entry_price": Decimal(str(row[8] if row[8] is not None else row[3])),
-            "mark_price": Decimal(str(row[9])) if row[9] is not None else None,
-            "index_price": Decimal(str(row[10])) if row[10] is not None else None,
-            "notional": Decimal(str(row[11])) if row[11] is not None else None,
-            "leverage": Decimal(str(row[12])) if row[12] is not None else None,
-            "margin_type": row[13],
-            "initial_margin": Decimal(str(row[14])) if row[14] is not None else None,
-            "maintenance_margin": Decimal(str(row[15])) if row[15] is not None else None,
-            "liquidation_price": Decimal(str(row[16])) if row[16] is not None else None,
-            "funding_pnl": Decimal(str(row[17] if row[17] is not None else "0")),
-            "payload": row[18] if isinstance(row[18], dict) else {},
+            "mode": row[0],
+            "market": row[1],
+            "symbol": row[2],
+            "quantity": Decimal(str(row[3])),
+            "average_price": Decimal(str(row[4])),
+            "realized_pnl": Decimal(str(row[5])),
+            "unrealized_pnl": Decimal(str(row[6])),
+            "updated_at": row[7],
+            "position_side": row[8],
+            "entry_price": Decimal(str(row[9] if row[9] is not None else row[4])),
+            "mark_price": Decimal(str(row[10])) if row[10] is not None else None,
+            "index_price": Decimal(str(row[11])) if row[11] is not None else None,
+            "notional": Decimal(str(row[12])) if row[12] is not None else None,
+            "leverage": Decimal(str(row[13])) if row[13] is not None else None,
+            "margin_type": row[14],
+            "initial_margin": Decimal(str(row[15])) if row[15] is not None else None,
+            "maintenance_margin": Decimal(str(row[16])) if row[16] is not None else None,
+            "liquidation_price": Decimal(str(row[17])) if row[17] is not None else None,
+            "funding_pnl": Decimal(str(row[18] if row[18] is not None else "0")),
+            "payload": row[19] if isinstance(row[19], dict) else {},
         }
 
     def upsert_balance(
@@ -2780,7 +2905,7 @@ class TradingStore:
                     """
                     SELECT trade_id, order_id, symbol, side, quantity, price,
                            fee, fee_asset, realized_pnl, executed_at, market, mode,
-                           position_side, funding, payload
+                           position_side, funding, exchange_trade_id, payload
                     FROM trades
                     WHERE market = %s AND mode = %s
                     ORDER BY executed_at DESC
@@ -2792,30 +2917,32 @@ class TradingStore:
         columns = (
             "trade_id", "order_id", "symbol", "side", "quantity", "price",
             "fee", "fee_asset", "realized_pnl", "executed_at", "market",
-            "mode", "position_side", "funding", "payload",
+            "mode", "position_side", "funding", "exchange_trade_id", "payload",
         )
         return [_row_dict(columns, row) for row in rows]
 
-    def list_positions(self, *, market: str = "FUTURES") -> list[dict[str, Any]]:
+    def list_positions(
+        self, *, market: str = "FUTURES", mode: str | None = None
+    ) -> list[dict[str, Any]]:
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT market, symbol, quantity, average_price, realized_pnl,
+                    SELECT mode, market, symbol, quantity, average_price, realized_pnl,
                            unrealized_pnl, updated_at, position_side,
                            entry_price, mark_price, index_price, notional, leverage,
                            margin_type, initial_margin, maintenance_margin,
                            liquidation_price, funding_pnl
                     FROM positions
-                    WHERE market = %s
+                    WHERE mode = %s AND market = %s
                     ORDER BY market, symbol
-                    """, (market.upper(),)
+                    """, (self._mode(mode), market.upper())
                 )
                 rows = cursor.fetchall()
         columns = (
-            "market", "symbol", "quantity", "average_price", "realized_pnl",
+            "mode", "market", "symbol", "quantity", "average_price", "realized_pnl",
             "unrealized_pnl", "updated_at", "position_side",
             "entry_price", "mark_price", "index_price", "notional", "leverage",
             "margin_type", "initial_margin", "maintenance_margin",
@@ -3021,11 +3148,16 @@ class TradingStore:
                 invalid_positions = count(
                     """
                     SELECT COUNT(*) FROM positions
-                    WHERE quantity < 0
+                    WHERE mode = %s
+                      AND (
+                        quantity < 0
                        OR (quantity > 0 AND COALESCE(entry_price, 0) <= 0)
                        OR (quantity > 0 AND COALESCE(leverage, 0) <= 0)
                        OR COALESCE(position_side, 'FLAT') NOT IN ('LONG', 'SHORT', 'FLAT')
+                      )
                     """
+                    ,
+                    (resolved_mode,),
                 )
                 unknown_order = count(
                     """
@@ -3184,7 +3316,14 @@ class TradingStore:
             raise ValueError("unsupported runtime gate")
         if normalized_status not in {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}:
             raise ValueError("unsupported runtime gate status")
-        payload = {"gate": normalized_gate, "status": normalized_status, **(detail or {})}
+        payload = {
+            "gate": normalized_gate,
+            "status": normalized_status,
+            "validation_session_id": self._session_id(),
+            "verified_at": _now().isoformat(),
+            "commit_sha": os.environ.get("BIAN_VALIDATION_COMMIT") or os.environ.get("GITHUB_SHA"),
+            **(detail or {}),
+        }
         return self.record_system_event(
             event_type="RUNTIME_GATE_EVIDENCE",
             severity="INFO" if normalized_status != "FAILED" else "CRITICAL",
@@ -3206,6 +3345,9 @@ class TradingStore:
             "realtime_6h": "NOT_STARTED",
             "realtime_24h": "NOT_STARTED",
         }
+        session_id = self._session_id()
+        if not session_id:
+            return values
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -3214,8 +3356,10 @@ class TradingStore:
                     FROM system_events
                     WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
                       AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet', 'realtime_30m', 'realtime_2h', 'realtime_6h', 'realtime_24h')
+                      AND validation_session_id = %s
                     ORDER BY (payload->>'gate'), event_at DESC
-                    """
+                    """,
+                    (session_id,),
                 )
                 for gate, status in cursor.fetchall():
                     if gate in values and status:
@@ -3227,6 +3371,9 @@ class TradingStore:
         import psycopg2
 
         values: dict[str, dict[str, Any]] = {}
+        session_id = self._session_id()
+        if not session_id:
+            return values
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -3236,8 +3383,10 @@ class TradingStore:
                     FROM system_events
                     WHERE event_type = 'RUNTIME_GATE_EVIDENCE'
                       AND payload->>'gate' IN ('observation', 'paper', 'shadow', 'testnet', 'realtime_30m', 'realtime_2h', 'realtime_6h', 'realtime_24h')
+                      AND validation_session_id = %s
                     ORDER BY (payload->>'gate'), event_at DESC
-                    """
+                    """,
+                    (session_id,),
                 )
                 for gate, status, event_at, payload in cursor.fetchall():
                     if gate:
@@ -3246,6 +3395,16 @@ class TradingStore:
                             "event_at": event_at,
                             "verified_at": (
                                 payload.get("verified_at")
+                                if isinstance(payload, dict)
+                                else None
+                            ),
+                            "validation_session_id": (
+                                payload.get("validation_session_id")
+                                if isinstance(payload, dict)
+                                else session_id
+                            ),
+                            "commit_sha": (
+                                payload.get("commit_sha")
                                 if isinstance(payload, dict)
                                 else None
                             ),

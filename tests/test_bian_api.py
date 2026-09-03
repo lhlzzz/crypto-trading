@@ -9,6 +9,21 @@ import bian_api
 from scripts.database import schema_status
 
 
+def _trading_store_stub():
+    return type(
+        "StoreStub",
+        (),
+        {
+            "list_positioning_snapshots": lambda self, limit=20: [],
+            "market_data_freshness": lambda self, **kwargs: [],
+            "is_halted": lambda self: False,
+            "runtime_gate_statuses": lambda self: {},
+            "runtime_gate_evidence": lambda self: {},
+            "user_stream_health": lambda self: "UNKNOWN",
+        },
+    )()
+
+
 def _report() -> dict[str, object]:
     return {
         "database_status": {
@@ -49,7 +64,9 @@ def _report() -> dict[str, object]:
 
 
 def test_front_data_exposes_versioned_read_only_contract() -> None:
-    with patch.object(bian_api, "read_overview", return_value=_report()):
+    with patch.object(bian_api, "_trading_store", return_value=_trading_store_stub()), patch.object(
+        bian_api, "read_overview", return_value=_report()
+    ):
         response = TestClient(bian_api.app).get("/api/os/front-data?limit=1")
 
     assert response.status_code == 200
@@ -132,7 +149,9 @@ def test_front_data_keeps_empty_database_result_valid() -> None:
         "coverage": [],
         "updated_at": None,
     }
-    with patch.object(bian_api, "read_overview", return_value=empty_report):
+    with patch.object(bian_api, "_trading_store", return_value=_trading_store_stub()), patch.object(
+        bian_api, "read_overview", return_value=empty_report
+    ):
         response = TestClient(bian_api.app).get("/api/dashboard/overview")
 
     assert response.status_code == 200
