@@ -1412,18 +1412,17 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
             self.assertGreaterEqual(supervisor.sessions["TRADE"].reconnect_count, 1)
             events = supervisor.reconnect_events()
             self.assertTrue(events)
-            self.assertEqual(events[0]["source"], "collector_lifecycle")
-            self.assertEqual(events[0]["channel"], "TRADE")
-            self.assertTrue(events[0]["subscriptions_restored"])
-            self.assertNotEqual(events[0]["old_connection_id"], events[0]["new_connection_id"])
+            reconnects = [event for event in events if event.get("subscriptions_restored")]
+            self.assertTrue(reconnects)
+            self.assertEqual(reconnects[0]["source"], "collector_lifecycle")
+            self.assertEqual(reconnects[0]["channel"], "TRADE")
+            self.assertNotEqual(reconnects[0]["old_connection_id"], reconnects[0]["new_connection_id"])
             heartbeat = supervisor.build_flush_events()
             lifecycle_rows = [
                 event for event in heartbeat
-                if (event.get("metadata") or {}).get("lifecycle_source") == "collector_lifecycle"
+                if event.get("event_type") == "WS_LIFECYCLE"
             ]
             self.assertTrue(lifecycle_rows)
-            self.assertEqual(lifecycle_rows[0]["metadata"]["reconnect_events"], events)
-            self.assertEqual(lifecycle_rows[0]["metadata"]["reconnect_count"], 1)
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 

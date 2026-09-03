@@ -162,10 +162,21 @@ class AlphaGateResult:
     universe_version: str = ""
     long_episodes: int = 0
     short_episodes: int = 0
+    oos_frame_count: int = 0
+    oos_observation_samples: int = 0
+    oos_independent_episodes: int = 0
+    oos_long_episodes: int = 0
+    oos_short_episodes: int = 0
+    chronological_train: bool = True
+    chronological_validation: bool = True
+    out_of_sample: bool = True
+    frozen_strategy: bool = True
+    frozen_parameter_config: bool = True
+    model_training_completed: bool = False
 
     @property
     def out_of_sample_samples(self) -> int:
-        return self.oos_samples
+        return self.oos_independent_episodes or self.oos_samples
 
     @property
     def out_of_sample_expectancy(self) -> Decimal:
@@ -181,6 +192,12 @@ class AlphaGateResult:
             "train_samples": self.train_samples,
             "validation_samples": self.validation_samples,
             "oos_samples": self.oos_samples,
+            "oos_samples_semantics": "independent_episodes",
+            "oos_frame_count": self.oos_frame_count,
+            "oos_observation_samples": self.oos_observation_samples,
+            "oos_independent_episodes": self.oos_independent_episodes,
+            "oos_long_episodes": self.oos_long_episodes,
+            "oos_short_episodes": self.oos_short_episodes,
             "out_of_sample_samples": self.oos_samples,
             "train_metrics": dict(self.train_metrics),
             "validation_metrics": dict(self.validation_metrics),
@@ -194,6 +211,12 @@ class AlphaGateResult:
             "universe_version": self.universe_version,
             "long_episodes": self.long_episodes,
             "short_episodes": self.short_episodes,
+            "chronological_train": self.chronological_train,
+            "chronological_validation": self.chronological_validation,
+            "out_of_sample": self.out_of_sample,
+            "frozen_strategy": self.frozen_strategy,
+            "frozen_parameter_config": self.frozen_parameter_config,
+            "model_training_completed": False,
         }
 
 
@@ -849,17 +872,13 @@ def evaluate_alpha_gate(
         train_metrics: Mapping[str, Any] | None = None,
         validation_metrics: Mapping[str, Any] | None = None,
     ) -> AlphaGateResult:
-        resolved_oos_samples = (
-            int(oos_metrics["independent_episodes"])
-            if oos_metrics is not None and "independent_episodes" in oos_metrics
-            else len(oos)
-        )
         metrics = dict(oos_metrics or {})
+        independent = int(metrics.get("independent_episodes") or 0)
         return AlphaGateResult(
             status=status,
             train_samples=len(train),
             validation_samples=len(validation),
-            oos_samples=resolved_oos_samples,
+            oos_samples=independent,
             train_metrics=train_metrics or {},
             validation_metrics=validation_metrics or {},
             oos_metrics=metrics,
@@ -870,6 +889,17 @@ def evaluate_alpha_gate(
             code_commit=os.environ.get("GIT_COMMIT", "UNKNOWN"),
             long_episodes=int(metrics.get("long_episodes") or 0),
             short_episodes=int(metrics.get("short_episodes") or 0),
+            oos_frame_count=len(oos),
+            oos_observation_samples=int(metrics.get("observation_samples") or 0),
+            oos_independent_episodes=independent,
+            oos_long_episodes=int(metrics.get("long_episodes") or 0),
+            oos_short_episodes=int(metrics.get("short_episodes") or 0),
+            chronological_train=True,
+            chronological_validation=True,
+            out_of_sample=True,
+            frozen_strategy=True,
+            frozen_parameter_config=True,
+            model_training_completed=False,
         )
 
     ordered = list(frames)

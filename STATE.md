@@ -138,7 +138,7 @@ use futures position semantics. Spot remains public confirmation only.
 Legacy quote-order quantity is migrated out of the active schema. SMA stays a
 research baseline until positioning gates pass.
 
-## Current verification (2026-08-31)
+## Verification (2026-08-31)
 
 - `260` tests pass; `compileall` and `git diff --check` pass.
 - Futures order writes are single-attempt; transport uncertainty records
@@ -191,12 +191,31 @@ research baseline until positioning gates pass.
 
 ## Runtime Validation (2026-09-02)
 
-- 30M realtime `PASSED`. Evidence remains valid unless freeze-path code
-  changes (`scripts/bian_market.py`, `binance_client.py`, `runtime_gate.py`,
-  `trading_store.py`).
+- 30M realtime `PASSED` at that date. That evidence is no longer current.
 - Production mark/index/funding liveness is `MARK_INDEX_FUNDING`. Dedicated
   markPrice is `NOT_REQUIRED` and is not a second subscribed source.
-- `REAL_DATA_READY=false` until realtime 24H passes. Paper, Shadow, Alpha,
-  Testnet, and Live are not started from 30M.
 - Validation is a persisted session in `runtime_validation_report.json` with
   stage states `NOT_STARTED`/`RUNNING`/`PASSED`/`FAILED`/`BLOCKED`/`EXPIRED`.
+
+## Current verification (2026-09-03)
+
+Base commit: `d1558de44c57d58e12250b4582d2544567e555c4`.
+
+This round hardened acceptance so PASS requires session-scoped, fail-closed
+evidence. Freeze-path files `scripts/bian_market.py` and `trading_store.py`
+changed, so previously recorded realtime PASS results are invalid:
+
+- `REALTIME_30M=EXPIRED`
+- `REALTIME_2H=EXPIRED`
+- `REALTIME_6H=NOT_STARTED`
+- `REALTIME_24H=NOT_STARTED`
+- `PAPER_24H=NOT_STARTED`
+- `SHADOW_7D=NOT_STARTED`
+- `ALPHA=INSUFFICIENT_SAMPLE`
+- `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`
+- `LIVE_PREFLIGHT` evaluates `mode=live` and remains blocked
+- `LIVE=BLOCKED`
+
+Do not reuse the 2026-09-02 30M/2H PASS. Paper, Shadow, and Testnet were not
+started in this round. `live_allowed` stays false until observation, shadow,
+Testnet, reconciliation, data-health, and human-confirmation gates complete.

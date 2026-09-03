@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
@@ -39,6 +40,56 @@ def _as_utc(value: Any) -> datetime:
     return result if result.tzinfo is not None else result.replace(tzinfo=timezone.utc)
 
 
+def empty_runtime_acceptance(
+    *,
+    mode: str,
+    session_id: str | None = None,
+    stage: str | None = None,
+    scoped_start: str | None = None,
+    scoped_end: str | None = None,
+    commit_sha: str | None = None,
+    database_healthy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed acceptance counts when a validation session is missing."""
+    return {
+        "database_healthy": database_healthy,
+        "session_id": session_id,
+        "stage": stage,
+        "mode": mode,
+        "scoped_start": scoped_start,
+        "scoped_end": scoped_end,
+        "commit_sha": commit_sha,
+        "observation_count": 0,
+        "positioning_count": 0,
+        "evidence_count": 0,
+        "episode_count": 0,
+        "intent_count": 0,
+        "risk_decision_count": 0,
+        "order_count": 0,
+        "fill_count": 0,
+        "funding_count": 0,
+        "long_count": 0,
+        "short_count": 0,
+        "long_building_count": 0,
+        "short_building_count": 0,
+        "duplicate_trades": 0,
+        "duplicate_funding": 0,
+        "invalid_positions": 0,
+        "impossible_balance": False,
+        "impossible_equity": False,
+        "invalid_margin": False,
+        "unknown_order": 0,
+        "stale_pending_order": 0,
+        "unsafe_order": 0,
+        "stale_open": 0,
+        "unsafe_open": 0,
+        "accounting": {},
+        "restart_recovery": False,
+        "episode_split": False,
+        "restart_comparison": {"ok": False, "reason": "RESTART_SNAPSHOT_MISSING"},
+    }
+
+
 class TradingStore:
     """Persist trading facts and audit events without owning schema creation."""
 
@@ -47,11 +98,308 @@ class TradingStore:
 
     @staticmethod
     def _mode(mode: str | None = None) -> str:
-        import os
         return (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+
+    def _session_id(self) -> str | None:
+        bound = getattr(self, "validation_session_id", None)
+        if bound:
+            return str(bound)
+        env = os.environ.get("BIAN_VALIDATION_SESSION_ID", "").strip()
+        return env or None
+
+    def bind_validation_session(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        stage: str,
+        commit_sha: str | None = None,
+        status: str = "RUNNING",
+    ) -> None:
+        """Bind this store to one canonical validation session."""
+        self.validation_session_id = str(session_id)
+        self.validation_mode = str(mode).strip().lower()
+        self.upsert_validation_session(
+            session_id=self.validation_session_id,
+            stage=stage,
+            mode=self.validation_mode,
+            commit_sha=commit_sha,
+            status=status,
+        )
 
     def initialize(self) -> None:
         ensure_schema(self.dsn)
+
+    def upsert_validation_session(
+        self,
+        *,
+        session_id: str,
+        stage: str,
+        mode: str,
+        commit_sha: str | None = None,
+        status: str = "RUNNING",
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+        owner_pid: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        import psycopg2
+
+        now = _now()
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO validation_sessions(
+                        session_id, stage, mode, started_at, ended_at, commit_sha,
+                        owner_pid, heartbeat_at, status, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        stage = EXCLUDED.stage,
+                        mode = EXCLUDED.mode,
+                        ended_at = COALESCE(EXCLUDED.ended_at, validation_sessions.ended_at),
+                        commit_sha = COALESCE(EXCLUDED.commit_sha, validation_sessions.commit_sha),
+                        owner_pid = COALESCE(EXCLUDED.owner_pid, validation_sessions.owner_pid),
+                        heartbeat_at = EXCLUDED.heartbeat_at,
+                        status = EXCLUDED.status,
+                        payload = COALESCE(EXCLUDED.payload, validation_sessions.payload)
+                    """,
+                    (
+                        str(session_id),
+                        stage,
+                        str(mode).strip().lower(),
+                        started_at or now,
+                        ended_at,
+                        commit_sha,
+                        owner_pid if owner_pid is not None else os.getpid(),
+                        now,
+                        status,
+                        _json(payload),
+                    ),
+                )
+
+    def heartbeat_validation_session(self, session_id: str | None = None) -> None:
+        import psycopg2
+
+        resolved = session_id or self._session_id()
+        if not resolved:
+            return
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE validation_sessions
+                    SET heartbeat_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (_now(), resolved),
+                )
+
+    def expire_stale_validation_sessions(self, *, stale_after_sec: int = 600) -> int:
+        """Mark stale RUNNING validation sessions EXPIRED. Heartbeat is the owner."""
+        import psycopg2
+
+        cutoff = _now() - timedelta(seconds=max(1, int(stale_after_sec)))
+        now = _now()
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE validation_sessions
+                    SET status = 'EXPIRED',
+                        ended_at = COALESCE(ended_at, %s),
+                        payload = COALESCE(payload, CAST('{}' AS JSONB))
+                            || CAST(%s AS JSONB)
+                    WHERE status = 'RUNNING'
+                      AND COALESCE(heartbeat_at, started_at) < %s
+                    """,
+                    (now, _json({"expired_reason": "STALE_RUNNING_SESSION"}), cutoff),
+                )
+                return int(cursor.rowcount or 0)
+
+    def record_session_observation(
+        self,
+        *,
+        symbol: str,
+        observed_at: datetime,
+        observation_id: str | None = None,
+        source: str = "consumed_frame",
+    ) -> None:
+        import psycopg2
+
+        session_id = self._session_id()
+        if not session_id:
+            return
+        observed_at = _as_utc(observed_at)
+        identity = observation_id or f"{symbol.upper()}:{observed_at.isoformat()}"
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO validation_session_observations(
+                        session_id, observation_id, symbol, observed_at, source
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id, observation_id) DO NOTHING
+                    """,
+                    (session_id, identity, symbol.upper(), observed_at, source),
+                )
+
+    def record_restart_snapshot(self, phase: str, snapshot: dict[str, Any]) -> None:
+        import psycopg2
+
+        session_id = self._session_id()
+        if not session_id:
+            raise ValueError("restart snapshot requires a bound validation session")
+        if phase not in {"pre_restart", "post_restart"}:
+            raise ValueError("restart phase must be pre_restart or post_restart")
+        column = "pre_restart_snapshot" if phase == "pre_restart" else "post_restart_snapshot"
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE validation_sessions
+                    SET {column} = CAST(%s AS JSONB), heartbeat_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (_json(snapshot), _now(), session_id),
+                )
+
+    def load_validation_session(self, session_id: str) -> dict[str, Any] | None:
+        import psycopg2
+
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT session_id, stage, mode, started_at, ended_at, commit_sha,
+                           owner_pid, heartbeat_at, status, pre_restart_snapshot,
+                           post_restart_snapshot, testnet_evidence, payload
+                    FROM validation_sessions
+                    WHERE session_id = %s
+                    """,
+                    (str(session_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return _row_dict(
+            (
+                "session_id", "stage", "mode", "started_at", "ended_at", "commit_sha",
+                "owner_pid", "heartbeat_at", "status", "pre_restart_snapshot",
+                "post_restart_snapshot", "testnet_evidence", "payload",
+            ),
+            row,
+        )
+
+    def record_testnet_lifecycle_evidence(self, evidence: dict[str, Any]) -> None:
+        import psycopg2
+
+        session_id = str(evidence.get("session_id") or self._session_id() or "")
+        if not session_id:
+            raise ValueError("testnet evidence requires a validation session")
+        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE validation_sessions
+                    SET testnet_evidence = CAST(%s AS JSONB), heartbeat_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (_json(evidence), _now(), session_id),
+                )
+
+    def testnet_lifecycle_evidence(self, session_id: str | None = None) -> dict[str, Any]:
+        resolved = session_id or self._session_id()
+        if not resolved:
+            return {}
+        row = self.load_validation_session(resolved)
+        payload = (row or {}).get("testnet_evidence")
+        return payload if isinstance(payload, dict) else {}
+
+    def account_continuity_snapshot(
+        self,
+        *,
+        mode: str,
+        symbols: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Capture restart-comparable paper/shadow account state."""
+        resolved_mode = self._mode(mode)
+        symbol_list = [item.replace("-", "").upper() for item in (symbols or [])]
+        if not symbol_list:
+            symbol_list = ["BTCUSDT"]
+        positions = []
+        episodes = []
+        for symbol in symbol_list:
+            position = self.get_position(symbol) or {}
+            quantity = Decimal(str(position.get("quantity") or 0))
+            side = str(position.get("position_side") or ("FLAT" if quantity == 0 else "UNKNOWN"))
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "active_position": quantity > 0,
+                    "position_side": side,
+                    "position_quantity": str(quantity),
+                    "entry_price": str(position.get("entry_price") or 0),
+                }
+            )
+            episode = self.get_active_episode(symbol) or {}
+            episodes.append(
+                {
+                    "symbol": symbol,
+                    "active_episode_id": episode.get("episode_id"),
+                    "episode_direction": episode.get("direction"),
+                    "episode_status": episode.get("status"),
+                }
+            )
+        balance = self.get_balance("USDT", mode=resolved_mode) or {}
+        wallet = Decimal(str(balance.get("wallet_balance") or 0))
+        unrealized = Decimal(str(balance.get("unrealized_pnl") or 0))
+        open_orders = [
+            {
+                "client_order_id": row.get("client_order_id"),
+                "status": row.get("status"),
+                "symbol": row.get("symbol"),
+                "quantity": str(row.get("quantity") or 0),
+            }
+            for row in self.list_open_local_orders(mode=resolved_mode)
+        ]
+        open_orders.sort(key=lambda row: str(row.get("client_order_id") or ""))
+        return {
+            "mode": resolved_mode,
+            "positions": positions,
+            "episodes": episodes,
+            "wallet_balance": str(wallet),
+            "available_balance": str(balance.get("available_balance") or 0),
+            "used_margin": str(balance.get("used_margin") or 0),
+            "unrealized_pnl": str(unrealized),
+            "equity": str(wallet + unrealized),
+            "open_orders": open_orders,
+        }
+
+    @staticmethod
+    def compare_restart_snapshots(
+        pre: dict[str, Any] | None,
+        post: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Compare restart continuity. Time fields may change; core state may not."""
+        if not isinstance(pre, dict) or not isinstance(post, dict):
+            return {"ok": False, "reason": "RESTART_SNAPSHOT_MISSING"}
+        fields = (
+            "positions",
+            "episodes",
+            "wallet_balance",
+            "available_balance",
+            "used_margin",
+            "unrealized_pnl",
+            "equity",
+            "open_orders",
+        )
+        mismatched = [name for name in fields if pre.get(name) != post.get(name)]
+        return {
+            "ok": not mismatched,
+            "reason": "OK" if not mismatched else "RESTART_STATE_MISMATCH",
+            "mismatched": mismatched,
+        }
 
     def is_halted(self) -> bool:
         import os
@@ -98,10 +446,10 @@ class TradingStore:
                         strategy_version, status, created_at, client_order_id,
                         direction, action, reduce_only, leverage, margin_type,
                         position_mode, positioning_state, previous_state,
-                        transition, evidence_snapshot_id, payload
+                        transition, evidence_snapshot_id, payload, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, CAST(%s AS JSONB))
+                              %s, %s, CAST(%s AS JSONB), %s)
                     ON CONFLICT (intent_id) DO UPDATE SET
                         status = EXCLUDED.status,
                         client_order_id = EXCLUDED.client_order_id,
@@ -131,6 +479,7 @@ class TradingStore:
                         intent.transition,
                         str(intent.evidence_snapshot_id) if intent.evidence_snapshot_id else None,
                         _json(intent.model_dump(mode="json")),
+                        self._session_id(),
                     ),
                 )
 
@@ -160,15 +509,16 @@ class TradingStore:
                     INSERT INTO market_flow_events(
                         event_id, symbol, market, event_type, event_timestamp,
                         received_timestamp, latency_ms, price, quantity, notional,
-                        direction, metadata
+                        direction, metadata, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), %s)
                     ON CONFLICT (event_id) DO NOTHING
                     """,
                     (
                         str(event_id), symbol.upper(), market, event_type,
                         event_timestamp, received_timestamp, latency_ms, price,
                         quantity, notional, direction, _json(metadata),
+                        self._session_id(),
                     ),
                 )
         return event_id
@@ -261,9 +611,9 @@ class TradingStore:
                     INSERT INTO positioning_episodes(
                         episode_id, symbol, market, direction, started_at, state,
                         status, last_observed_at, strategy_version, config_hash,
-                        metadata
+                        metadata, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s,
-                              CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), %s)
                     ON CONFLICT (symbol, market)
                     WHERE status IN ('OPEN', 'UNRESOLVED')
                     DO UPDATE SET
@@ -279,6 +629,7 @@ class TradingStore:
                         str(episode_id), symbol.upper(), market.upper(), direction,
                         observed_at, state, observed_at, strategy_version, config_hash,
                         _json(metadata),
+                        self._session_id(),
                     ),
                 )
                 row = cursor.fetchone()
@@ -394,10 +745,11 @@ class TradingStore:
                         episode_ended_at, evidence_sufficiency, is_meme,
                         meme_classification_source, meme_classification_version,
                         meme_classified_at, meme_reason_codes, payload
+                        , validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s, %s, %s,
                               CAST(%s AS JSONB), %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB), CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
                     ON CONFLICT (snapshot_id) DO UPDATE SET
                         episode_id = EXCLUDED.episode_id,
                         episode_direction = EXCLUDED.episode_direction,
@@ -427,6 +779,7 @@ class TradingStore:
                         decision.meme_classification_version,
                         decision.meme_classified_at,
                         _json(list(decision.meme_reason_codes)), _json(payload),
+                        self._session_id(),
                     ),
                 )
                 cursor.execute(
@@ -435,10 +788,10 @@ class TradingStore:
                         snapshot_id, symbol, observed_at, source_timestamps,
                         evidence, data_quality, episode_id, episode_started_at,
                         episode_ended_at, episode_direction, episode_status,
-                        universe_classification, payload
+                        universe_classification, payload, validation_session_id
                     ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
                               CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB), CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
                     ON CONFLICT (snapshot_id) DO UPDATE SET
                         source_timestamps = EXCLUDED.source_timestamps,
                         evidence = EXCLUDED.evidence,
@@ -471,8 +824,15 @@ class TradingStore:
                             "reason_codes": list(decision.meme_reason_codes),
                         }),
                         _json(payload),
+                        self._session_id(),
                     ),
                 )
+        self.record_session_observation(
+            symbol=decision.symbol,
+            observed_at=decision.timestamp,
+            observation_id=str(snapshot_id),
+            source="positioning_pipeline",
+        )
         return snapshot_id
 
     def record_liquidation_event(
@@ -954,7 +1314,7 @@ class TradingStore:
         return result
 
     def collector_lifecycle_events(self) -> list[dict[str, Any]]:
-        """Return canonical websocket reconnect events from the latest heartbeat."""
+        """Return canonical websocket lifecycle events from WS_LIFECYCLE rows."""
         import psycopg2
 
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
@@ -964,20 +1324,33 @@ class TradingStore:
                     SELECT metadata
                     FROM market_flow_events
                     WHERE market = 'FUTURES'
-                      AND event_type IN ('LIQUIDATION_HEARTBEAT', 'FUTURES_LIQUIDATION_LIVENESS')
-                    ORDER BY received_timestamp DESC
-                    LIMIT 20
+                      AND event_type = 'WS_LIFECYCLE'
+                    ORDER BY received_timestamp ASC
+                    LIMIT 200
                     """
                 )
                 rows = cursor.fetchall()
+        events: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
         for (metadata,) in rows:
             payload = metadata if isinstance(metadata, dict) else {}
             nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            found = payload.get("reconnect_events") or nested.get("reconnect_events") or []
-            events = [event for event in found if isinstance(event, dict)]
-            if events:
-                return events
-        return []
+            event = nested if nested else payload
+            if not isinstance(event, dict):
+                continue
+            key = (
+                event.get("channel"),
+                event.get("action"),
+                event.get("old_connection_id"),
+                event.get("new_connection_id"),
+                event.get("disconnect_at"),
+                event.get("reconnect_at"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(dict(event))
+        return events
 
     @staticmethod
     def _datetime(value: Any) -> datetime:
@@ -1337,10 +1710,10 @@ class TradingStore:
                         price, status, mode, created_at,
                         updated_at, expires_at, market, position_side,
                         position_action, reduce_only, leverage, margin_type,
-                        payload
+                        payload, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), %s)
                     ON CONFLICT (client_order_id) DO UPDATE SET
                         updated_at = EXCLUDED.updated_at
                     RETURNING order_id
@@ -1367,6 +1740,7 @@ class TradingStore:
                         intent.leverage,
                         intent.margin_type,
                         _json(intent.model_dump(mode="json")),
+                        self._session_id(),
                     ),
                 )
                 row = cursor.fetchone()
@@ -1517,9 +1891,9 @@ class TradingStore:
                     INSERT INTO trades(
                         trade_id, order_id, symbol, side, quantity, price,
                         fee, fee_asset, realized_pnl, executed_at, market, mode,
-                        position_side, funding, source_event_id, payload
+                        position_side, funding, source_event_id, payload, validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                              %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
                     ON CONFLICT (source_event_id) DO UPDATE
                     SET source_event_id = EXCLUDED.source_event_id
                     RETURNING trade_id
@@ -1541,6 +1915,7 @@ class TradingStore:
                         funding,
                         source_event_id,
                         _json(payload),
+                        self._session_id(),
                     ),
                 )
                 row = cursor.fetchone()
@@ -1587,8 +1962,8 @@ class TradingStore:
                     """
                     INSERT INTO funding_settlements(
                         mode, symbol, settlement_timestamp, rate, notional,
-                        payment, position_side, recorded_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        payment, position_side, recorded_at, payload, validation_session_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
                     ON CONFLICT (mode, symbol, settlement_timestamp) DO NOTHING
                     RETURNING mode
                     """,
@@ -1606,6 +1981,7 @@ class TradingStore:
                             "symbol": symbol.upper(),
                             "settlement_timestamp": _as_utc(settlement_timestamp).isoformat(),
                         }),
+                        self._session_id(),
                     ),
                 )
                 return cursor.fetchone() is not None
@@ -1845,10 +2221,12 @@ class TradingStore:
         return [_row_dict(columns, row) for row in rows]
 
     def list_open_local_orders(self, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
+        from execution import PENDING_ORDER_STATES
+
         return [
             row
             for row in self.list_orders(limit=200, mode=mode, market=market)
-            if row["status"] in {"CREATED", "RISK_APPROVED", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED", "UNKNOWN"}
+            if row["status"] in PENDING_ORDER_STATES
         ]
 
     def list_trades(self, limit: int = 50, *, mode: str | None = None, market: str = "FUTURES") -> list[dict[str, Any]]:
@@ -1967,11 +2345,25 @@ class TradingStore:
         columns = ("event_id", "event_type", "severity", "message", "event_at", "mode", "market")
         return [_row_dict(columns, row) for row in rows]
 
-    def runtime_acceptance_snapshot(self, *, mode: str = "paper") -> dict[str, Any]:
-        """Read canonical paper/shadow acceptance counts from PostgreSQL."""
+    def runtime_acceptance_snapshot(
+        self,
+        *,
+        mode: str = "paper",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read session-scoped paper/shadow acceptance counts from PostgreSQL."""
         import psycopg2
+        from execution import PENDING_ORDER_STATES, TERMINAL_ORDER_STATES
 
-        resolved = str(mode or "paper").strip().lower()
+        resolved_mode = str(mode or "paper").strip().lower()
+        resolved_session = session_id or self._session_id()
+        if not resolved_session:
+            return empty_runtime_acceptance(mode=resolved_mode, database_healthy=True)
+        session_row = self.load_validation_session(resolved_session) or {}
+        scoped_start = session_row.get("started_at")
+        scoped_end = session_row.get("ended_at")
+        pending = tuple(sorted(PENDING_ORDER_STATES - {"UNKNOWN"}))
+        known = tuple(sorted(PENDING_ORDER_STATES | TERMINAL_ORDER_STATES))
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 def count(sql: str, params: tuple[Any, ...] = ()) -> int:
@@ -1979,45 +2371,104 @@ class TradingStore:
                     row = cursor.fetchone()
                     return int(row[0] or 0)
 
-                observation_count = count("SELECT COUNT(*) FROM market_flow_events WHERE market = 'FUTURES'")
-                positioning_count = count("SELECT COUNT(*) FROM positioning_snapshots")
-                evidence_count = count("SELECT COUNT(*) FROM evidence_snapshots")
-                episode_count = count("SELECT COUNT(*) FROM positioning_episodes")
-                intent_count = count("SELECT COUNT(*) FROM trade_intents")
-                risk_decision_count = count("SELECT COUNT(*) FROM risk_events")
-                order_count = count("SELECT COUNT(*) FROM orders WHERE mode = %s", (resolved,))
-                fill_count = count("SELECT COUNT(*) FROM trades WHERE mode = %s", (resolved,))
-                funding_count = count("SELECT COUNT(*) FROM funding_settlements WHERE mode = %s", (resolved,))
+                session_params = (resolved_session,)
+                session_mode = (resolved_session, resolved_mode)
+                observation_count = count(
+                    """
+                    SELECT COUNT(*) FROM validation_session_observations
+                    WHERE session_id = %s
+                    """,
+                    session_params,
+                )
+                positioning_count = count(
+                    "SELECT COUNT(*) FROM positioning_snapshots WHERE validation_session_id = %s",
+                    session_params,
+                )
+                evidence_count = count(
+                    "SELECT COUNT(*) FROM evidence_snapshots WHERE validation_session_id = %s",
+                    session_params,
+                )
+                episode_count = count(
+                    "SELECT COUNT(*) FROM positioning_episodes WHERE validation_session_id = %s",
+                    session_params,
+                )
+                intent_count = count(
+                    "SELECT COUNT(*) FROM trade_intents WHERE validation_session_id = %s",
+                    session_params,
+                )
+                risk_decision_count = count(
+                    """
+                    SELECT COUNT(*) FROM risk_events
+                    WHERE validation_session_id = %s AND mode = %s
+                    """,
+                    session_mode,
+                )
+                order_count = count(
+                    "SELECT COUNT(*) FROM orders WHERE validation_session_id = %s AND mode = %s",
+                    session_mode,
+                )
+                fill_count = count(
+                    "SELECT COUNT(*) FROM trades WHERE validation_session_id = %s AND mode = %s",
+                    session_mode,
+                )
+                funding_count = count(
+                    """
+                    SELECT COUNT(*) FROM funding_settlements
+                    WHERE validation_session_id = %s AND mode = %s
+                    """,
+                    session_mode,
+                )
                 long_count = count(
-                    "SELECT COUNT(*) FROM positioning_snapshots WHERE direction = 'LONG'"
+                    """
+                    SELECT COUNT(*) FROM positioning_snapshots
+                    WHERE validation_session_id = %s AND direction = 'LONG'
+                    """,
+                    session_params,
                 )
                 short_count = count(
-                    "SELECT COUNT(*) FROM positioning_snapshots WHERE direction = 'SHORT'"
+                    """
+                    SELECT COUNT(*) FROM positioning_snapshots
+                    WHERE validation_session_id = %s AND direction = 'SHORT'
+                    """,
+                    session_params,
                 )
                 long_building_count = count(
-                    "SELECT COUNT(*) FROM positioning_snapshots WHERE state = 'LONG_BUILDING'"
+                    """
+                    SELECT COUNT(*) FROM positioning_snapshots
+                    WHERE validation_session_id = %s AND state = 'LONG_BUILDING'
+                    """,
+                    session_params,
                 )
                 short_building_count = count(
-                    "SELECT COUNT(*) FROM positioning_snapshots WHERE state = 'SHORT_BUILDING'"
+                    """
+                    SELECT COUNT(*) FROM positioning_snapshots
+                    WHERE validation_session_id = %s AND state = 'SHORT_BUILDING'
+                    """,
+                    session_params,
                 )
                 duplicate_trades = count(
                     """
                     SELECT COUNT(*) FROM (
                         SELECT source_event_id FROM trades
-                        WHERE source_event_id IS NOT NULL
+                        WHERE validation_session_id = %s
+                          AND mode = %s
+                          AND source_event_id IS NOT NULL
                         GROUP BY source_event_id HAVING COUNT(*) > 1
                     ) duplicated
-                    """
+                    """,
+                    session_mode,
                 )
                 duplicate_funding = count(
                     """
                     SELECT COUNT(*) FROM (
                         SELECT mode, symbol, settlement_timestamp
                         FROM funding_settlements
+                        WHERE validation_session_id = %s AND mode = %s
                         GROUP BY mode, symbol, settlement_timestamp
                         HAVING COUNT(*) > 1
                     ) duplicated
-                    """
+                    """,
+                    session_mode,
                 )
                 invalid_positions = count(
                     """
@@ -2028,11 +2479,31 @@ class TradingStore:
                        OR COALESCE(position_side, 'FLAT') NOT IN ('LONG', 'SHORT', 'FLAT')
                     """
                 )
-                stale_open = count(
-                    "SELECT COUNT(*) FROM orders WHERE status = 'OPEN' AND updated_at < NOW() - INTERVAL '1 hour'"
+                unknown_order = count(
+                    """
+                    SELECT COUNT(*) FROM orders
+                    WHERE validation_session_id = %s AND mode = %s AND status = 'UNKNOWN'
+                    """,
+                    session_mode,
                 )
-                unsafe_open = count(
-                    "SELECT COUNT(*) FROM orders WHERE status IN ('UNKNOWN', 'UNSAFE')"
+                stale_pending_order = count(
+                    """
+                    SELECT COUNT(*) FROM orders
+                    WHERE validation_session_id = %s
+                      AND mode = %s
+                      AND status = ANY(%s)
+                      AND updated_at < NOW() - INTERVAL '1 hour'
+                    """,
+                    (resolved_session, resolved_mode, list(pending)),
+                )
+                unsafe_order = count(
+                    """
+                    SELECT COUNT(*) FROM orders
+                    WHERE validation_session_id = %s
+                      AND mode = %s
+                      AND (status = 'UNKNOWN' OR status <> ALL(%s))
+                    """,
+                    (resolved_session, resolved_mode, list(known)),
                 )
                 cursor.execute(
                     """
@@ -2040,14 +2511,14 @@ class TradingStore:
                     FROM balances
                     WHERE mode = %s AND asset = 'USDT'
                     """,
-                    (resolved,),
+                    (resolved_mode if resolved_mode != "shadow" else "paper",),
                 )
                 balance = cursor.fetchone()
                 impossible_balance = False
                 impossible_equity = False
                 invalid_margin = False
                 accounting: dict[str, str] = {}
-                if balance is not None:
+                if balance is not None and len(balance) >= 5:
                     wallet, used, available, unrealized = (
                         Decimal(str(balance[0] or 0)),
                         Decimal(str(balance[1] or 0)),
@@ -2082,18 +2553,31 @@ class TradingStore:
                     """
                     SELECT COUNT(*) FROM (
                         SELECT symbol, market FROM positioning_episodes
-                        WHERE status IN ('OPEN', 'UNRESOLVED')
+                        WHERE validation_session_id = %s
+                          AND status IN ('OPEN', 'UNRESOLVED')
                         GROUP BY symbol, market HAVING COUNT(*) > 1
                     ) split_rows
-                    """
+                    """,
+                    session_params,
                 ) > 0
-                restart_recovery = (
-                    not episode_split
-                    and duplicate_trades == 0
-                    and duplicate_funding == 0
-                )
+        comparison = self.compare_restart_snapshots(
+            session_row.get("pre_restart_snapshot"),
+            session_row.get("post_restart_snapshot"),
+        )
+        restart_recovery = (
+            bool(comparison.get("ok"))
+            and not episode_split
+            and duplicate_trades == 0
+            and duplicate_funding == 0
+        )
         return {
             "database_healthy": True,
+            "session_id": resolved_session,
+            "stage": session_row.get("stage"),
+            "mode": resolved_mode,
+            "scoped_start": str(scoped_start) if scoped_start else None,
+            "scoped_end": str(scoped_end) if scoped_end else None,
+            "commit_sha": session_row.get("commit_sha"),
             "observation_count": observation_count,
             "positioning_count": positioning_count,
             "evidence_count": evidence_count,
@@ -2113,11 +2597,15 @@ class TradingStore:
             "impossible_balance": impossible_balance,
             "impossible_equity": impossible_equity,
             "invalid_margin": invalid_margin,
-            "stale_open": stale_open,
-            "unsafe_open": unsafe_open,
+            "unknown_order": unknown_order,
+            "stale_pending_order": stale_pending_order,
+            "unsafe_order": unsafe_order,
+            "stale_open": stale_pending_order,
+            "unsafe_open": unsafe_order,
             "accounting": accounting,
             "restart_recovery": restart_recovery,
             "episode_split": episode_split,
+            "restart_comparison": comparison,
         }
 
     def record_runtime_gate_status(self, gate: str, status: str, *, detail: dict[str, Any] | None = None) -> UUID:
@@ -2292,8 +2780,8 @@ class TradingStore:
                 cursor.execute(
                     """
                     INSERT INTO risk_events(
-                        event_id, intent_id, decision, reason, mode, market, event_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        event_id, intent_id, decision, reason, mode, market, event_at, payload, validation_session_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
                     RETURNING event_id
                     """,
                     (
@@ -2305,6 +2793,7 @@ class TradingStore:
                         market,
                         _now(),
                         _json(payload),
+                        self._session_id(),
                     ),
                 )
                 row = cursor.fetchone()
@@ -2328,8 +2817,8 @@ class TradingStore:
                 cursor.execute(
                     """
                     INSERT INTO system_events(
-                        event_id, event_type, severity, message, mode, market, event_at, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                        event_id, event_type, severity, message, mode, market, event_at, payload, validation_session_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB), %s)
                     RETURNING event_id
                     """,
                     (
@@ -2341,6 +2830,7 @@ class TradingStore:
                         market,
                         _now(),
                         _json(payload),
+                        self._session_id(),
                     ),
                 )
                 row = cursor.fetchone()

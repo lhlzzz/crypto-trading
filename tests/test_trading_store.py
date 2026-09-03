@@ -255,7 +255,7 @@ def test_collector_lifecycle_events_reads_latest_heartbeat():
         "source": "collector_lifecycle",
     }
     cursor = MagicMock()
-    cursor.fetchall.return_value = [({"reconnect_events": [event]},)]
+    cursor.fetchall.return_value = [({"metadata": event},)]
     connection = MagicMock()
     connection.__enter__.return_value = connection
     connection.cursor.return_value.__enter__.return_value = cursor
@@ -315,3 +315,78 @@ def test_market_data_freshness_ignores_synthetic_stale_markers():
         )
     by_source = {row["source"]: row for row in rows}
     assert by_source["FUTURES_BOOK_TICKER"]["status"] == "FRESH"
+
+
+def test_runtime_acceptance_snapshot_requires_session_and_scopes_mode():
+    store = TradingStore("postgresql://test")
+    empty = store.runtime_acceptance_snapshot(mode="paper")
+    assert empty["observation_count"] == 0
+    assert empty["session_id"] is None
+    assert empty["restart_recovery"] is False
+
+    executed = []
+    cursor = MagicMock()
+
+    def execute(sql, params=()):
+        executed.append((sql, params))
+        if "FROM validation_sessions" in sql:
+            cursor.fetchone.return_value = (
+                "sess-1", "paper_24h", "paper", "2026-09-03T00:00:00+00:00", None,
+                "abc", 1, "2026-09-03T00:01:00+00:00", "RUNNING", None, None, None, {},
+            )
+        elif "FROM balances" in sql:
+            cursor.fetchone.return_value = None
+        else:
+            cursor.fetchone.return_value = (0,)
+        cursor.fetchall.return_value = []
+
+    cursor.execute.side_effect = execute
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection):
+        snapshot = store.runtime_acceptance_snapshot(mode="paper", session_id="sess-1")
+    joined = "\n".join(sql for sql, _ in executed)
+    assert "validation_session_observations" in joined
+    assert "validation_session_id" in joined
+    assert "status = 'OPEN'" not in joined
+    assert any(params and "sess-1" in str(params) for _, params in executed)
+    assert snapshot["session_id"] == "sess-1"
+    assert snapshot["mode"] == "paper"
+    assert snapshot["unknown_order"] == 0
+
+
+def test_compare_restart_snapshots_require_before_and_after():
+    from trading_store import TradingStore as Store
+
+    missing = Store.compare_restart_snapshots(None, {"wallet_balance": "1"})
+    assert missing["ok"] is False
+    pre = {
+        "positions": [{"symbol": "BTCUSDT", "position_side": "LONG", "position_quantity": "1"}],
+        "episodes": [{"active_episode_id": "ep-1"}],
+        "wallet_balance": "100",
+        "available_balance": "90",
+        "used_margin": "10",
+        "unrealized_pnl": "0",
+        "equity": "100",
+        "open_orders": [],
+    }
+    assert Store.compare_restart_snapshots(pre, dict(pre))["ok"] is True
+    post = dict(pre)
+    post["wallet_balance"] = "0"
+    mismatch = Store.compare_restart_snapshots(pre, post)
+    assert mismatch["ok"] is False
+    assert "wallet_balance" in mismatch["mismatched"]
+
+
+def test_collector_lifecycle_events_query_ws_lifecycle():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection):
+        TradingStore("postgresql://test").collector_lifecycle_events()
+    sql = cursor.execute.call_args[0][0]
+    assert "WS_LIFECYCLE" in sql
+    assert "LIQUIDATION_HEARTBEAT" not in sql

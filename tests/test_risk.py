@@ -123,6 +123,8 @@ def test_risk_limits_load_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("MAX_OPEN_ORDERS", "2")
     monkeypatch.setenv("MAX_LEVERAGE", "3")
     monkeypatch.setenv("MIN_DATA_QUALITY", "0.7")
+    monkeypatch.setenv("MAX_FUNDING_ABS", "0.02")
+    monkeypatch.setenv("MAX_MARGIN_RATIO", "0.5")
 
     limits = RiskLimits.from_env()
 
@@ -130,6 +132,15 @@ def test_risk_limits_load_from_environment(monkeypatch) -> None:
     assert limits.max_open_orders == 2
     assert limits.max_leverage == Decimal("3")
     assert limits.min_data_quality_score == Decimal("0.7")
+    assert limits.max_funding_abs == Decimal("0.02")
+    assert limits.max_margin_ratio == Decimal("0.5")
+
+
+def test_risk_limits_reject_out_of_range_margin_ratio() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="max_margin_ratio"):
+        RiskLimits(max_margin_ratio=Decimal("1.5"))
 
 
 def test_daily_loss_triggers_halt() -> None:

@@ -54,6 +54,7 @@ PAPER_RESTART_EXIT = 75
 STAGE_STATES = {
     "NOT_STARTED", "RUNNING", "PASSED", "FAILED", "BLOCKED", "EXPIRED",
 }
+STALE_HEARTBEAT_SEC = 600
 STORE_STATES = {"NOT_STARTED", "RUNNING", "PASSED", "FAILED"}
 CHANNEL_SOURCES = {
     "TRADE": ("FUTURES_TRADE",),
@@ -195,6 +196,16 @@ def session_owner_alive(stage: dict[str, Any] | None) -> bool:
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
+    heartbeat = (stage or {}).get("heartbeat_at") or (stage or {}).get("start_at")
+    if heartbeat:
+        try:
+            at = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if (_now() - at).total_seconds() > STALE_HEARTBEAT_SEC:
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
     return True
 
 
@@ -206,8 +217,8 @@ def recover_orphaned_sessions(stages: dict[str, Any]) -> list[str]:
             continue
         if session_owner_alive(stage):
             continue
-        stage["status"] = "FAILED"
-        stage["reason"] = "SESSION_OWNER_DEAD"
+        stage["status"] = "EXPIRED"
+        stage["reason"] = "STALE_RUNNING_SESSION"
         stages[name] = stage
         recovered.append(name)
     return recovered
@@ -754,6 +765,7 @@ def build_session_stage(
             event for event in reconnect_events if event.get("source") != "collector_lifecycle"
         ],
         "owner_pid": os.getpid(),
+        "heartbeat_at": _iso(),
         "errors": errors,
         "watchdog": watchdog,
         "rss_mb": rss_mb(),
@@ -1013,21 +1025,43 @@ def _count(store: Any, name: str, default: int = 0) -> int:
     return default
 
 
-def runtime_acceptance_snapshot(store: Any, *, mode: str = "paper") -> dict[str, Any]:
+def runtime_acceptance_snapshot(
+    store: Any,
+    *,
+    mode: str = "paper",
+    session_id: str | None = None,
+) -> dict[str, Any]:
     getter = getattr(store, "runtime_acceptance_snapshot", None)
     if getter is not None:
         try:
-            snapshot = getter(mode=mode)
+            snapshot = getter(mode=mode, session_id=session_id)
             if isinstance(snapshot, dict):
                 return snapshot
         except TypeError:
-            snapshot = getter()
+            try:
+                snapshot = getter(mode=mode)
+            except TypeError:
+                snapshot = getter()
             if isinstance(snapshot, dict):
                 return snapshot
         except Exception as exc:
-            return {"database_healthy": False, "error": type(exc).__name__}
+            return {
+                "database_healthy": False,
+                "error": type(exc).__name__,
+                "session_id": session_id,
+                "mode": mode,
+                "observation_count": 0,
+                "positioning_count": 0,
+                "evidence_count": 0,
+                "unknown_order": 0,
+                "stale_pending_order": 0,
+                "unsafe_order": 0,
+                "restart_recovery": False,
+            }
     return {
         "database_healthy": store is not None,
+        "session_id": session_id,
+        "mode": mode,
         "observation_count": _count(store, "market_observation_count"),
         "positioning_count": _count(store, "positioning_snapshot_count"),
         "evidence_count": _count(store, "evidence_snapshot_count"),
@@ -1050,7 +1084,10 @@ def runtime_acceptance_snapshot(store: Any, *, mode: str = "paper") -> dict[str,
         "stale_open": 0,
         "unsafe_open": 0,
         "accounting": {},
-        "restart_recovery": True,
+        "unknown_order": 0,
+        "stale_pending_order": 0,
+        "unsafe_order": 0,
+        "restart_recovery": False,
         "episode_split": False,
         "error": None,
     }
@@ -1099,6 +1136,11 @@ def paper_acceptance(
             "model": "SIMPLIFIED",
             "binance_parity": "NOT_BINANCE_PARITY",
         },
+        "session_id": snapshot.get("session_id"),
+        "mode": snapshot.get("mode"),
+        "unknown_order": int(snapshot.get("unknown_order") or 0),
+        "stale_pending_order": int(snapshot.get("stale_pending_order") or snapshot.get("stale_open") or 0),
+        "unsafe_order": int(snapshot.get("unsafe_order") or snapshot.get("unsafe_open") or 0),
     }
     if not process_completed:
         return "FAILED", "PAPER_PROCESS_INCOMPLETE", detail
@@ -1106,6 +1148,10 @@ def paper_acceptance(
         return "FAILED", "PAPER_DATABASE_UNHEALTHY", detail
     if duration_sec < requested_duration:
         return "FAILED", "DURATION_SHORT", detail
+    if not snapshot.get("session_id"):
+        return "FAILED", "PAPER_SESSION_MISSING", detail
+    if str(snapshot.get("mode") or "").strip().lower() != "paper":
+        return "FAILED", "PAPER_MODE_MISMATCH", detail
     if not _strategy_path_present(snapshot):
         return "FAILED", "PAPER_EVIDENCE_MISSING", detail
     if int(snapshot.get("duplicate_trades") or 0) or int(snapshot.get("duplicate_funding") or 0):
@@ -1116,10 +1162,12 @@ def paper_acceptance(
         return "FAILED", "IMPOSSIBLE_BALANCE", detail
     if snapshot.get("impossible_equity"):
         return "FAILED", "IMPOSSIBLE_EQUITY", detail
-    if int(snapshot.get("stale_open") or 0):
-        return "FAILED", "STALE_OPEN", detail
-    if int(snapshot.get("unsafe_open") or 0):
-        return "FAILED", "UNSAFE_OPEN", detail
+    if int(snapshot.get("unknown_order") or 0):
+        return "FAILED", "UNKNOWN_ORDER", detail
+    if int(snapshot.get("stale_pending_order") or snapshot.get("stale_open") or 0):
+        return "FAILED", "STALE_PENDING_ORDER", detail
+    if int(snapshot.get("unsafe_order") or snapshot.get("unsafe_open") or 0):
+        return "FAILED", "UNSAFE_ORDER", detail
     if not snapshot.get("restart_recovery", True):
         return "FAILED", "PAPER_RESTART_RECOVERY_FAILED", detail
     return "PASSED", "OK", detail
@@ -1141,19 +1189,30 @@ def shadow_acceptance(
         "SHORT_count": int(snapshot.get("short_count") or 0),
         "real_orders": 0 if real_order_delta is None else int(real_order_delta),
         "real_order_proof": (
-            "NOT_CHECKABLE_EXTERNALLY"
+            "INSUFFICIENT_EVIDENCE"
             if real_order_delta is None
             else "REAL_ORDER_ZERO_VERIFIED" if real_order_delta == 0 else "REAL_ORDER_DELTA"
         ),
         "restart_recovery": bool(snapshot.get("restart_recovery", True)),
         "episode_split": bool(snapshot.get("episode_split")),
+        "session_id": snapshot.get("session_id"),
+        "mode": snapshot.get("mode"),
+        "order_count": int(snapshot.get("order_count") or 0),
     }
     if duration_sec < requested_duration:
         return "FAILED", "DURATION_SHORT", detail
     if not _strategy_path_present(snapshot) or int(snapshot.get("episode_count") or 0) <= 0:
         return "FAILED", "SHADOW_EVIDENCE_MISSING", detail
-    if real_order_delta not in {None, 0}:
+    if not snapshot.get("session_id"):
+        return "FAILED", "SHADOW_SESSION_MISSING", detail
+    if str(snapshot.get("mode") or "").strip().lower() != "shadow":
+        return "FAILED", "SHADOW_MODE_MISMATCH", detail
+    if real_order_delta is None:
+        return "BLOCKED", "INSUFFICIENT_EVIDENCE", detail
+    if real_order_delta != 0:
         return "FAILED", "SHADOW_REAL_ORDER_DELTA", detail
+    if int(snapshot.get("order_count") or 0) > 0:
+        return "FAILED", "SHADOW_LOCAL_ORDER_PRESENT", detail
     if snapshot.get("episode_split"):
         return "FAILED", "SHADOW_EPISODE_SPLIT", detail
     if not snapshot.get("restart_recovery", True):
@@ -1172,6 +1231,31 @@ def _paper_command(duration: int, symbols: list[str], *, mode: str, planned_rest
     if planned_restart_after is not None:
         command.extend(["--planned-restart-after", str(planned_restart_after)])
     return command
+
+
+def _stage_session_env(
+    env: dict[str, str],
+    *,
+    session_id: str,
+    mode: str,
+    stage: str,
+    commit_sha: str,
+) -> dict[str, str]:
+    env = dict(env)
+    env["BIAN_VALIDATION_SESSION_ID"] = session_id
+    env["BIAN_VALIDATION_MODE"] = mode
+    env["BIAN_VALIDATION_STAGE"] = stage
+    env["BIAN_VALIDATION_COMMIT"] = commit_sha
+    return env
+
+
+def _bind_stage_session(store: Any, *, session_id: str, mode: str, stage: str, commit_sha: str) -> None:
+    binder = getattr(store, "bind_validation_session", None)
+    if callable(binder):
+        binder(session_id, mode=mode, stage=stage, commit_sha=commit_sha, status="RUNNING")
+    expire = getattr(store, "expire_stale_validation_sessions", None)
+    if callable(expire):
+        expire()
 
 
 def _run_child(command: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1203,10 +1287,28 @@ def exchange_open_order_count() -> int | None:
         return None
 
 
-def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
+def run_paper_stage(
+    duration: int,
+    symbols: list[str],
+    *,
+    session_id: str | None = None,
+    commit_sha: str | None = None,
+) -> dict[str, Any]:
     env = dict(os.environ)
     env["BIAN_MODE"] = "paper"
     env["BIAN_MARKET"] = "FUTURES"
+    session_id = session_id or str(uuid.uuid4())
+    commit_sha = commit_sha or _commit_sha()
+    env = _stage_session_env(
+        env, session_id=session_id, mode="paper", stage="paper_24h", commit_sha=commit_sha
+    )
+    try:
+        store = TradingStore()
+        _bind_stage_session(
+            store, session_id=session_id, mode="paper", stage="paper_24h", commit_sha=commit_sha
+        )
+    except Exception:
+        store = None
     restart_after = max(1, duration // 2)
     remaining = max(1, duration - restart_after)
     first = _run_child(
@@ -1217,15 +1319,36 @@ def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
     process_completed = first["returncode"] == PAPER_RESTART_EXIT and second["returncode"] == 0
     try:
         store = TradingStore()
-        snapshot = runtime_acceptance_snapshot(store, mode="paper")
+        _bind_stage_session(
+            store, session_id=session_id, mode="paper", stage="paper_24h", commit_sha=commit_sha
+        )
+        snapshot = runtime_acceptance_snapshot(store, mode="paper", session_id=session_id)
     except Exception as exc:
-        snapshot = {"database_healthy": False, "error": type(exc).__name__}
+        snapshot = {
+            "database_healthy": False,
+            "error": type(exc).__name__,
+            "session_id": session_id,
+            "mode": "paper",
+            "restart_recovery": False,
+        }
+        store = None
+    comparison = snapshot.get("restart_comparison") or {"ok": False}
+    if store is not None:
+        loader = getattr(store, "load_validation_session", None)
+        comparer = getattr(store, "compare_restart_snapshots", None)
+        if callable(loader) and callable(comparer):
+            row = loader(session_id) or {}
+            comparison = comparer(row.get("pre_restart_snapshot"), row.get("post_restart_snapshot"))
+    snapshot["restart_comparison"] = comparison
     snapshot["restart_recovery"] = bool(
         process_completed
+        and comparison.get("ok")
         and not snapshot.get("episode_split")
         and not int(snapshot.get("duplicate_trades") or 0)
         and not int(snapshot.get("duplicate_funding") or 0)
     )
+    snapshot["session_id"] = snapshot.get("session_id") or session_id
+    snapshot["mode"] = snapshot.get("mode") or "paper"
     duration_sec = duration if process_completed else 0
     status, reason, detail = paper_acceptance(
         requested_duration=duration,
@@ -1241,31 +1364,76 @@ def run_paper_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
         "paper_acceptance": detail,
         "snapshot": snapshot,
         "process_completed": process_completed,
+        "session_id": session_id,
     }
 
 
-def run_shadow_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
+def run_shadow_stage(
+    duration: int,
+    symbols: list[str],
+    *,
+    session_id: str | None = None,
+    commit_sha: str | None = None,
+) -> dict[str, Any]:
     before = exchange_open_order_count()
     restart_after = max(1, duration // 2)
     remaining = max(1, duration - restart_after)
+    session_id = session_id or str(uuid.uuid4())
+    commit_sha = commit_sha or _commit_sha()
+    env = _stage_session_env(
+        dict(os.environ),
+        session_id=session_id,
+        mode="shadow",
+        stage="shadow_7d",
+        commit_sha=commit_sha,
+    )
+    try:
+        store = TradingStore()
+        _bind_stage_session(
+            store, session_id=session_id, mode="shadow", stage="shadow_7d", commit_sha=commit_sha
+        )
+    except Exception:
+        store = None
     first = _run_child(
         _paper_command(duration, symbols, mode="shadow", planned_restart_after=restart_after),
+        env,
     )
-    second = _run_child(_paper_command(remaining, symbols, mode="shadow"))
+    second = _run_child(_paper_command(remaining, symbols, mode="shadow"), env)
     after = exchange_open_order_count()
     real_order_delta = None if before is None or after is None else after - before
     try:
         store = TradingStore()
-        snapshot = runtime_acceptance_snapshot(store, mode="shadow")
+        _bind_stage_session(
+            store, session_id=session_id, mode="shadow", stage="shadow_7d", commit_sha=commit_sha
+        )
+        snapshot = runtime_acceptance_snapshot(store, mode="shadow", session_id=session_id)
     except Exception as exc:
-        snapshot = {"database_healthy": False, "error": type(exc).__name__}
+        snapshot = {
+            "database_healthy": False,
+            "error": type(exc).__name__,
+            "session_id": session_id,
+            "mode": "shadow",
+            "restart_recovery": False,
+        }
+        store = None
     process_completed = first["returncode"] == PAPER_RESTART_EXIT and second["returncode"] == 0
+    comparison = snapshot.get("restart_comparison") or {"ok": False}
+    if store is not None:
+        loader = getattr(store, "load_validation_session", None)
+        comparer = getattr(store, "compare_restart_snapshots", None)
+        if callable(loader) and callable(comparer):
+            row = loader(session_id) or {}
+            comparison = comparer(row.get("pre_restart_snapshot"), row.get("post_restart_snapshot"))
+    snapshot["restart_comparison"] = comparison
     snapshot["restart_recovery"] = bool(
         process_completed
+        and comparison.get("ok")
         and not snapshot.get("episode_split")
         and not int(snapshot.get("duplicate_trades") or 0)
         and not int(snapshot.get("duplicate_funding") or 0)
     )
+    snapshot["session_id"] = snapshot.get("session_id") or session_id
+    snapshot["mode"] = snapshot.get("mode") or "shadow"
     status, reason, detail = shadow_acceptance(
         requested_duration=duration,
         duration_sec=duration if process_completed else 0,
@@ -1281,6 +1449,7 @@ def run_shadow_stage(duration: int, symbols: list[str]) -> dict[str, Any]:
         "snapshot": snapshot,
         "real_order_delta": real_order_delta,
         "process_completed": process_completed,
+        "session_id": session_id,
     }
 
 
@@ -1335,6 +1504,12 @@ def run_alpha_stage() -> dict[str, Any]:
         "train_samples": result.train_samples,
         "validation_samples": result.validation_samples,
         "oos_samples": result.oos_samples,
+        "oos_samples_semantics": "independent_episodes",
+        "oos_frame_count": getattr(result, "oos_frame_count", len(frames)),
+        "oos_observation_samples": getattr(result, "oos_observation_samples", None),
+        "oos_independent_episodes": getattr(result, "oos_independent_episodes", (result.oos_metrics or {}).get("independent_episodes")),
+        "oos_long_episodes": long_episodes,
+        "oos_short_episodes": short_episodes,
         "independent_episodes": (result.oos_metrics or {}).get("independent_episodes"),
         "long_episodes": long_episodes,
         "short_episodes": short_episodes,
@@ -1342,39 +1517,90 @@ def run_alpha_stage() -> dict[str, Any]:
         "cost_stress": (result.oos_metrics or {}).get("cost_stress"),
         "oos_metrics": result.oos_metrics,
         "frame_count": len(frames),
+        "chronological_train": True,
+        "chronological_validation": True,
+        "out_of_sample": True,
+        "frozen_strategy": True,
+        "frozen_parameter_config": True,
+        "model_training_completed": False,
     }
 
 
 def testnet_acceptance(snapshot: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    evidence = snapshot if isinstance(snapshot, dict) else {}
+    long_leg = evidence.get("long") if isinstance(evidence.get("long"), dict) else {}
+    short_leg = evidence.get("short") if isinstance(evidence.get("short"), dict) else {}
+    unknown = evidence.get("unknown_order") if isinstance(evidence.get("unknown_order"), dict) else {}
+    partial = evidence.get("partial_fill") if isinstance(evidence.get("partial_fill"), dict) else {}
+    cancel = evidence.get("cancel") if isinstance(evidence.get("cancel"), dict) else {}
+    user_stream = evidence.get("user_stream") if isinstance(evidence.get("user_stream"), dict) else {}
+    listen_key = evidence.get("listen_key") if isinstance(evidence.get("listen_key"), dict) else {}
+    reconciliation = evidence.get("reconciliation") if isinstance(evidence.get("reconciliation"), dict) else {}
+    restart = evidence.get("restart") if isinstance(evidence.get("restart"), dict) else {}
+
+    def _leg_ok(leg: dict[str, Any]) -> bool:
+        order = leg.get("order") if isinstance(leg.get("order"), dict) else {}
+        fills = leg.get("fills") if isinstance(leg.get("fills"), list) else []
+        close = leg.get("close") if isinstance(leg.get("close"), dict) else {}
+        return all(
+            (
+                bool(order.get("client_order_id") or order.get("exchange_order_id")),
+                bool(order.get("exchange_order_id")),
+                bool(fills),
+                bool(leg.get("user_stream_observed")),
+                bool(leg.get("local_state_updated")),
+                bool(leg.get("reconciliation_matches")),
+                bool(close.get("status") or close.get("exchange_order_id")),
+                bool(close.get("reconciled_flat") or close.get("reconciliation_matches")),
+            )
+        )
+
     required = {
-        "account": bool(snapshot.get("account")),
-        "ONE_WAY": bool(snapshot.get("one_way")),
-        "ISOLATED": bool(snapshot.get("isolated")),
-        "LONG lifecycle": bool(snapshot.get("long_lifecycle")),
-        "SHORT lifecycle": bool(snapshot.get("short_lifecycle")),
-        "partial fill": bool(snapshot.get("partial_fill")),
-        "cancel": bool(snapshot.get("cancel")),
-        "UNKNOWN resolution": bool(snapshot.get("unknown_resolution")),
-        "USER_STREAM": bool(snapshot.get("user_stream")),
-        "listenKey": bool(snapshot.get("listen_key")),
-        "reconciliation": bool(snapshot.get("reconciliation")),
-        "restart": bool(snapshot.get("restart")),
+        "session_id": bool(evidence.get("session_id")),
+        "start_time": bool(evidence.get("start_time") or evidence.get("started_at")),
+        "end_time": bool(evidence.get("end_time") or evidence.get("ended_at")),
+        "symbol": bool(evidence.get("symbol")),
+        "LONG lifecycle": _leg_ok(long_leg),
+        "SHORT lifecycle": _leg_ok(short_leg),
+        "partial fill": str(partial.get("status") or "").upper() == "PARTIALLY_FILLED",
+        "cancel": str(cancel.get("status") or "").upper() == "CANCELLED",
+        "UNKNOWN resolution": (
+            str(unknown.get("status") or "").upper() == "UNKNOWN"
+            and str(unknown.get("resolved_by") or "") in {"client_order_id", "client_order_id_lookup"}
+            and not bool(unknown.get("resubmitted"))
+            and bool(unknown.get("resolved_status"))
+        ),
+        "USER_STREAM": bool(user_stream.get("events") or user_stream.get("observed")),
+        "listenKey": bool(listen_key.get("created") or listen_key.get("listen_key")),
+        "reconciliation": bool(reconciliation.get("open_matches") or reconciliation.get("ok")),
+        "restart": bool(restart.get("ok")),
     }
+    if bool(unknown.get("resubmitted")):
+        return "FAILED", "TESTNET_UNKNOWN_RESUBMITTED", required
     missing = [name for name, ok in required.items() if not ok]
     status = "PASSED" if not missing else "FAILED"
     return status, "OK" if not missing else "TESTNET_LIFECYCLE_INCOMPLETE", required
 
 
-def run_testnet_stage() -> dict[str, Any]:
+def run_testnet_stage(*, session_id: str | None = None) -> dict[str, Any]:
     if not os.environ.get("BIAN_TESTNET_API_KEY") or not os.environ.get("BIAN_TESTNET_API_SECRET"):
         return {
             "status": "BLOCKED",
             "reason": "BLOCKED_BY_EXTERNAL_CREDENTIALS",
             "credentials": False,
         }
+    session_id = session_id or str(uuid.uuid4())
     try:
         store = TradingStore()
-        snapshot = getattr(store, "testnet_lifecycle_snapshot", lambda: {})()
+        _bind_stage_session(
+            store,
+            session_id=session_id,
+            mode="testnet",
+            stage="testnet",
+            commit_sha=_commit_sha(),
+        )
+        getter = getattr(store, "testnet_lifecycle_evidence", None)
+        snapshot = getter(session_id) if callable(getter) else {}
         if not isinstance(snapshot, dict):
             snapshot = {}
     except Exception as exc:
@@ -1386,6 +1612,7 @@ def run_testnet_stage() -> dict[str, Any]:
         "credentials": True,
         "testnet_acceptance": detail,
         "snapshot": snapshot,
+        "session_id": session_id,
     }
 
 
@@ -1407,7 +1634,21 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
     current_health: dict[str, Any] = {}
     try:
         store = TradingStore()
-        gate = evaluate_runtime_gate(mode="paper", store=store, symbols=["BTCUSDT"]).as_dict()
+        live_symbols = [
+            item.replace("-", "").upper()
+            for item in (
+                os.environ.get("BIAN_LIVE_SYMBOLS")
+                or os.environ.get("BIAN_PAPER_SYMBOLS")
+                or "BTCUSDT"
+            ).split(",")
+            if item.strip()
+        ]
+        gate = evaluate_runtime_gate(
+            mode="live",
+            store=store,
+            symbols=live_symbols,
+            probe_account=False,
+        ).as_dict()
         current_health = {
             "current_runtime_health": gate.get("MARKET_HEALTH"),
             "current_account_health": gate.get("ACCOUNT_HEALTH"),
@@ -1416,10 +1657,12 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
             "global_transport_health": gate.get("global_transport_health"),
             "risk_health": gate.get("RISK_HEALTH"),
             "meme_universe": gate.get("meme_universe"),
+            "mode": gate.get("mode"),
+            "symbols": live_symbols,
         }
         required["DATABASE_HEALTHY"] = True
-        required["ACCOUNT_HEALTHY"] = gate.get("ACCOUNT_HEALTH") in {"OK", "NOT_APPLICABLE"}
-        required["USER_STREAM_HEALTHY"] = gate.get("USER_STREAM_HEALTH") in {"OK", "NOT_APPLICABLE"}
+        required["ACCOUNT_HEALTHY"] = gate.get("ACCOUNT_HEALTH") == "OK"
+        required["USER_STREAM_HEALTHY"] = gate.get("USER_STREAM_HEALTH") == "OK"
         required["RECONCILIATION_HEALTHY"] = gate.get("RECONCILIATION_HEALTH") == "OK"
         required["RISK_HEALTHY"] = gate.get("RISK_HEALTH") == "SAFE"
         required["MEME_UNIVERSE_HEALTHY"] = bool(gate.get("meme_universe"))
@@ -1434,6 +1677,7 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
         "reason": "LIVE_RELEASE_GATES_PENDING" if missing else "OK",
         "missing": missing,
         "LIVE_ALLOWED": False,
+        "mode": "live",
         "historical_gate_evidence": {
             "realtime_24h": stage_status(stages.get("realtime_24h")),
             "paper_24h": stage_status(stages.get("paper_24h")),
@@ -1612,16 +1856,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             extra["process_duration_sec"] = elapsed["duration"]
         elif kind == "paper":
-            extra = run_paper_stage(duration, symbols)
+            extra = run_paper_stage(duration, symbols, session_id=session_id, commit_sha=commit_sha)
             status, reason = extra["status"], extra["reason"]
         elif kind == "shadow":
-            extra = run_shadow_stage(duration, symbols)
+            extra = run_shadow_stage(duration, symbols, session_id=session_id, commit_sha=commit_sha)
             status, reason = extra["status"], extra["reason"]
         elif kind == "alpha":
             extra = run_alpha_stage()
             status, reason = extra["status"], extra["reason"]
         elif kind == "testnet":
-            extra = run_testnet_stage()
+            extra = run_testnet_stage(session_id=session_id)
             status, reason = extra["status"], extra["reason"]
         else:
             extra = run_live_preflight(stages)

@@ -34,6 +34,25 @@ OrderStatus = Literal[
     "UNKNOWN",
 ]
 PositionDirection = Literal["LONG", "SHORT", "FLAT"]
+PENDING_ORDER_STATES: frozenset[str] = frozenset(
+    {
+        "CREATED",
+        "RISK_APPROVED",
+        "SUBMITTED",
+        "ACKNOWLEDGED",
+        "PARTIALLY_FILLED",
+        "UNKNOWN",
+    }
+)
+TERMINAL_ORDER_STATES: frozenset[str] = frozenset(
+    {
+        "FILLED",
+        "REJECTED",
+        "CANCELLED",
+        "EXPIRED",
+        "FAILED",
+    }
+)
 PAPER_RISK_RULES = FuturesRiskRules(symbol="PAPER")
 
 

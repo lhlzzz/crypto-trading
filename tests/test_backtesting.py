@@ -218,6 +218,13 @@ def test_alpha_gate_true_oos_and_does_not_tune_oos(monkeypatch) -> None:
     assert result.strategy_version == "positioning-v1"
     assert result.parameter_version == result.config_hash
     assert len(result.config_hash) == 64
+    payload = result.as_dict()
+    assert payload["oos_samples_semantics"] == "independent_episodes"
+    assert payload["oos_frame_count"] == 4
+    assert payload["oos_independent_episodes"] == result.oos_metrics["independent_episodes"]
+    assert payload["frozen_strategy"] is True
+    assert payload["model_training_completed"] is False
+    assert payload["chronological_train"] is True
     assert len(seen) == 2
     assert seen[0][0] == frames[12:]
     assert [frame.captured_at for frame in seen[1][0]] == [

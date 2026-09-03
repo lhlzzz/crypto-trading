@@ -1776,8 +1776,9 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         event_id, symbol, market, event_type, event_timestamp,
                         received_timestamp, latency_ms, price, quantity, notional,
                         direction, metadata
+                        , validation_session_id
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB))
+                              CAST(%s AS JSONB), %s)
                     ON CONFLICT (event_id) DO NOTHING
                     """,
                     (
@@ -1787,6 +1788,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         event["latency_ms"], event.get("price"), event.get("quantity"),
                         event.get("notional"), event.get("direction"),
                         json.dumps(event, default=str),
+                        os.environ.get("BIAN_VALIDATION_SESSION_ID") or None,
                     ),
                 )
                 if event.get("event_type") == "FORCE_ORDER":
@@ -2568,6 +2570,43 @@ def liquidation_heartbeat_event(
     }
 
 
+def ws_lifecycle_event(
+    lifecycle: dict[str, Any],
+    received_at: datetime,
+    *,
+    symbol: str = "BTCUSDT",
+) -> dict[str, Any]:
+    """Canonical websocket disconnect/reconnect event. One owner, one event_type."""
+    action = str(lifecycle.get("action") or "reconnect")
+    identity = (
+        f"bian:ws-lifecycle:{lifecycle.get('channel')}:{action}:"
+        f"{lifecycle.get('old_connection_id')}:{lifecycle.get('new_connection_id')}:"
+        f"{lifecycle.get('disconnect_at')}:{lifecycle.get('reconnect_at')}"
+    )
+    payload = dict(lifecycle)
+    payload["action"] = action
+    return {
+        "symbol": _storage_symbol(symbol),
+        "event_id": str(uuid.uuid5(uuid.NAMESPACE_URL, identity)),
+        "event_type": "WS_LIFECYCLE",
+        "source": "collector_lifecycle",
+        "market": "FUTURES",
+        "source_timestamp": received_at.isoformat(),
+        "received_timestamp": received_at.isoformat(),
+        "latency_ms": 0,
+        "metadata": payload,
+        "channel": payload.get("channel"),
+        "old_connection_id": payload.get("old_connection_id"),
+        "new_connection_id": payload.get("new_connection_id"),
+        "disconnect_at": payload.get("disconnect_at"),
+        "reconnect_at": payload.get("reconnect_at"),
+        "recovery_ms": payload.get("recovery_ms"),
+        "subscriptions_restored": payload.get("subscriptions_restored"),
+        "reason": payload.get("reason"),
+        "action": action,
+    }
+
+
 def _stale_source_event(
     channel: str, symbol: str, now: datetime
 ) -> dict[str, Any]:
@@ -2720,6 +2759,7 @@ class FuturesStreamSupervisor:
                 else 0
             )
             self.lifecycle_events.append({
+                "action": "reconnect",
                 "old_connection_id": session.connection_id or f"{session.channel.lower()}-none",
                 "new_connection_id": new_id,
                 "channel": session.channel,
@@ -2781,12 +2821,14 @@ class FuturesStreamSupervisor:
         lifecycle = self.reconnect_events()
         reconnects = len(lifecycle)
         attempts = sum(session.reconnect_count for session in self.sessions.values())
+        symbol = self.storage_symbols[0] if self.storage_symbols else "BTCUSDT"
+        for row in lifecycle:
+            events.append(ws_lifecycle_event(row, now, symbol=symbol))
         for symbol in self.storage_symbols:
             event = liquidation_heartbeat_event(symbol, now, health=health)
             event["metadata"]["reconnect_count"] = reconnects
             event["metadata"]["session_reconnect_attempts"] = attempts
-            event["metadata"]["reconnect_events"] = lifecycle
-            event["metadata"]["lifecycle_source"] = "collector_lifecycle"
+            event["metadata"]["lifecycle_source"] = "WS_LIFECYCLE"
             event["metadata"]["channel_health"] = self.channel_health()
             events.append(event)
         return events
@@ -2924,6 +2966,18 @@ class FuturesStreamSupervisor:
         pending = self._reconnect_reasons.pop(session.channel, None)
         if pending:
             session.last_error = pending
+        self.lifecycle_events.append({
+            "action": "disconnect",
+            "old_connection_id": session.connection_id or f"{session.channel.lower()}-none",
+            "new_connection_id": None,
+            "channel": session.channel,
+            "disconnect_at": now.isoformat(),
+            "reconnect_at": None,
+            "recovery_ms": None,
+            "subscriptions_restored": False,
+            "reason": session.last_error or "disconnect",
+            "source": "collector_lifecycle",
+        })
 
     def _handle_depth(
         self, payload: dict[str, Any], received_at: datetime

@@ -639,6 +639,7 @@ def _create_trading_tables(cursor: Any) -> None:
         """
     )
     _migrate_futures_columns(cursor)
+    _migrate_validation_session_columns(cursor)
 
 
 def _migrate_futures_columns(cursor: Any) -> None:
@@ -837,6 +838,68 @@ def _migrate_futures_columns(cursor: Any) -> None:
         END $$;
         """
     )
+
+
+def _migrate_validation_session_columns(cursor: Any) -> None:
+    """Canonical validation-session identity and explicit fact linkage."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validation_sessions (
+            session_id TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK (mode IN ('paper', 'shadow', 'testnet', 'live')),
+            started_at TIMESTAMPTZ NOT NULL,
+            ended_at TIMESTAMPTZ,
+            commit_sha TEXT,
+            owner_pid INTEGER,
+            heartbeat_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'RUNNING',
+            pre_restart_snapshot JSONB,
+            post_restart_snapshot JSONB,
+            testnet_evidence JSONB,
+            payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS validation_session_observations (
+            session_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            source TEXT NOT NULL DEFAULT 'consumed_frame',
+            PRIMARY KEY (session_id, observation_id)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS validation_session_observations_session_idx
+        ON validation_session_observations(session_id, observed_at DESC)
+        """
+    )
+    for table in (
+        "market_flow_events",
+        "positioning_snapshots",
+        "evidence_snapshots",
+        "positioning_episodes",
+        "trade_intents",
+        "risk_events",
+        "orders",
+        "trades",
+        "funding_settlements",
+        "system_events",
+    ):
+        cursor.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS validation_session_id TEXT"
+        )
+        cursor.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {table}_validation_session_idx
+            ON {table}(validation_session_id)
+            """
+        )
 
 
 def schema_status(dsn: str | None = None) -> dict[str, object]:

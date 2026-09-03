@@ -38,6 +38,17 @@ from trade_intent import TradeIntent
 from trading_store import TradingStore
 
 
+def _record_restart_snapshot(store: TradingStore, phase: str, *, mode: str, symbols: list[str]) -> None:
+    recorder = getattr(store, "record_restart_snapshot", None)
+    snapshotter = getattr(store, "account_continuity_snapshot", None)
+    if not callable(recorder) or not callable(snapshotter):
+        return
+    session_id = getattr(store, "_session_id", lambda: None)()
+    if not session_id:
+        return
+    recorder(phase, snapshotter(mode=mode, symbols=symbols))
+
+
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.environ.get(name, default)))
@@ -796,6 +807,8 @@ def run_forever(
         raise SystemExit("BIAN_MODE must be paper, testnet, or live")
     store = TradingStore()
     runtime_gate = _startup_recovery(resolved_mode, store)
+    if planned_restart_after is None:
+        _record_restart_snapshot(store, "post_restart", mode=resolved_mode, symbols=symbols)
     client_config = ClientConfig.from_env(resolved_mode)
     public_client = FuturesPublicClient(client_config)
     executor = executor_from_env(
@@ -842,6 +855,7 @@ def run_forever(
                     message="planned paper restart",
                     payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
                 )
+                _record_restart_snapshot(store, "pre_restart", mode=resolved_mode, symbols=symbols)
                 raise SystemExit(75)
             time.sleep(interval)
         return
@@ -866,6 +880,8 @@ def run_shadow_forever(
     """Record public positioning comparisons without entering the trade loop."""
     store = TradingStore()
     store.initialize()
+    if planned_restart_after is None:
+        _record_restart_snapshot(store, "post_restart", mode="shadow", symbols=symbols)
     engine = StrategyEngine(StrategyConfig.from_env())
     interval = _int_env("POSITIONING_SHADOW_POLL_SEC", 60, minimum=1)
     deadline = None if duration_sec is None else time.monotonic() + max(1, int(duration_sec))
@@ -893,6 +909,7 @@ def run_shadow_forever(
                 message="planned shadow restart",
                 payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
             )
+            _record_restart_snapshot(store, "pre_restart", mode="shadow", symbols=symbols)
             raise SystemExit(75)
         time.sleep(interval)
 

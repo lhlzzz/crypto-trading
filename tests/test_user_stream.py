@@ -42,7 +42,11 @@ def test_normalizes_order_trade_update() -> None:
     assert event.position_side == "BOTH"
     assert event.realized_pnl == Decimal("1.25")
     assert event.reduce_only is True
-    assert event.event_id == "ORDER_TRADE_UPDATE:42:TRADE:0.010:123"
+    assert event.exchange_order_id == "42"
+    assert event.execution_type == "TRADE"
+    assert event.event_time_ms == 123
+    assert event.event_id is not None
+    assert len(event.event_id) == 64
 
 
 def test_normalizes_account_update() -> None:
@@ -284,3 +288,94 @@ def test_listen_key_keepalive_runs() -> None:
 def test_listen_key_expired_triggers_reconnect_reconcile() -> None:
     event = normalize_user_event({"e": "listenKeyExpired"})
     assert event.event_type == "listenKeyExpired"
+
+
+def _order_event(*, symbol="BTCUSDT", order_id=42, trade_id=7, execution="TRADE", event_time=123):
+    return {
+        "e": "ORDER_TRADE_UPDATE",
+        "E": event_time,
+        "o": {
+            "s": symbol,
+            "c": "BIAN-ORDER-1",
+            "i": order_id,
+            "t": trade_id,
+            "X": "FILLED",
+            "x": execution,
+            "z": "0.010",
+            "l": "0.010",
+            "L": "100",
+        },
+    }
+
+
+def test_user_stream_event_identity_does_not_collide() -> None:
+    base = normalize_user_event(_order_event())
+    other_symbol = normalize_user_event(_order_event(symbol="ETHUSDT"))
+    other_order = normalize_user_event(_order_event(order_id=99))
+    other_execution = normalize_user_event(_order_event(execution="CALCULATED"))
+    duplicate = normalize_user_event(_order_event())
+    assert base.event_id != other_symbol.event_id
+    assert base.event_id != other_order.event_id
+    assert base.event_id != other_execution.event_id
+    assert base.event_id == duplicate.event_id
+    assert base.symbol == "BTCUSDT"
+    assert base.exchange_order_id == "42"
+    assert base.trade_id == "7"
+
+
+def test_account_update_identity_hashes_content_not_just_timestamp() -> None:
+    first = normalize_user_event({
+        "e": "ACCOUNT_UPDATE",
+        "E": 9,
+        "T": 9,
+        "a": {"B": [{"a": "USDT", "wb": "100", "cw": "90", "bc": "1"}], "P": []},
+    })
+    same_time_different_balance = normalize_user_event({
+        "e": "ACCOUNT_UPDATE",
+        "E": 9,
+        "T": 9,
+        "a": {"B": [{"a": "USDT", "wb": "200", "cw": "190", "bc": "2"}], "P": []},
+    })
+    duplicate = normalize_user_event({
+        "e": "ACCOUNT_UPDATE",
+        "E": 9,
+        "T": 9,
+        "a": {"B": [{"a": "USDT", "wb": "100", "cw": "90", "bc": "1"}], "P": []},
+    })
+    assert first.event_id != same_time_different_balance.event_id
+    assert first.event_id == duplicate.event_id
+    assert len(first.event_id) == 64
+
+
+def test_keepalive_failure_degrades_and_reconnects() -> None:
+    rest = FakeRest()
+    rest.keepalive_listen_key = lambda: (_ for _ in ()).throw(RuntimeError("keepalive failed"))
+    first, second = FakeWebsocket(), FakeWebsocket()
+    sockets = [first, second]
+    halted = []
+    reconciled = []
+
+    async def connect(url: str):
+        return sockets.pop(0)
+
+    client = UserStreamClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+        rest_client=rest,
+        websocket_connect=connect,
+        on_halt=halted.append,
+        on_reconcile=lambda: reconciled.append("reconcile"),
+        reconnect_delay_sec=0,
+        max_failures=1,
+        keepalive_sec=0.05,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(client.run_forever())
+        await asyncio.sleep(0.12)
+        with pytest.raises(RuntimeError, match="LISTEN_KEY_KEEPALIVE_FAILED"):
+            await task
+
+    asyncio.run(scenario())
+    assert client.stream_failure_reason == "LISTEN_KEY_KEEPALIVE_FAILED"
+    assert halted
+    assert reconciled

@@ -7,6 +7,7 @@ import json
 import os
 import random
 from dataclasses import dataclass, field
+import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
@@ -33,6 +34,7 @@ class UserStreamEvent:
     exchange_order_id: str | None = None
     order_status: str | None = None
     execution_type: str | None = None
+    trade_id: str | None = None
     executed_quantity: Decimal = Decimal("0")
     last_quantity: Decimal = Decimal("0")
     last_price: Decimal | None = None
@@ -76,6 +78,11 @@ def _payload(event: Any) -> dict[str, Any]:
     return {}
 
 
+def _canonical_event_id(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def normalize_user_event(event: Any) -> UserStreamEvent:
     """Normalize Binance USD-M user-data JSON into one event contract."""
     raw = _payload(event)
@@ -97,12 +104,15 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
             has_trade_id = trade_id is not None and int(trade_id) >= 0
         except (TypeError, ValueError):
             has_trade_id = False
-        event_id = (
-            f"ORDER_TRADE_UPDATE:{trade_id}"
-            if has_trade_id
-            else "ORDER_TRADE_UPDATE:"
-            f"{order.get('i')}:{order.get('x')}:{order.get('z')}:{raw.get('E')}"
-        )
+        identity = {
+            "event_type": event_type,
+            "symbol": _upper_or_none(order.get("s")) or "",
+            "exchange_order_id": str(order.get("i") or ""),
+            "trade_id": str(trade_id) if has_trade_id else str(order.get("t") or ""),
+            "execution_type": str(order.get("x") or ""),
+            "event_time": str(raw.get("E") or ""),
+        }
+        event_id = _canonical_event_id(identity)
         return UserStreamEvent(
             event_type=event_type,
             event_id=event_id,
@@ -113,6 +123,7 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
             order_status=_str_or_none(order.get("X")),
             execution_type=_str_or_none(order.get("x")),
             executed_quantity=_decimal(order.get("z")),
+            trade_id=str(trade_id) if has_trade_id else _str_or_none(order.get("t")),
             last_quantity=_decimal(order.get("l")),
             last_price=_decimal_or_none(order.get("L")),
             fee=_decimal(order.get("n")),
@@ -150,7 +161,15 @@ def normalize_user_event(event: Any) -> UserStreamEvent:
         )
         return UserStreamEvent(
             event_type=event_type,
-            event_id=f"ACCOUNT_UPDATE:{raw.get('T', raw.get('E'))}",
+            event_id=_canonical_event_id(
+                {
+                    "event_type": event_type,
+                    "event_time": str(raw.get("E") or ""),
+                    "transaction_time": str(raw.get("T") or ""),
+                    "balances": list(balances),
+                    "positions": list(positions),
+                }
+            ),
             event_time_ms=_int_or_none(raw.get("E")),
             balance_updates=balances,
             position_updates=positions,
@@ -232,6 +251,7 @@ class UserStreamClient:
         listen_key = self._client().create_listen_key()
         self._listen_key = listen_key
         websocket = await _maybe_await(self._websocket_connect(self._ws_url(listen_key)))
+        self._websocket = websocket
         self.state = "LIVE"
         self.connected_at = datetime.now(timezone.utc)
         self.last_error = None
@@ -333,7 +353,12 @@ class UserStreamClient:
                 if keeper is not None:
                     keeper()
             except Exception:
+                self.state = "DEGRADED"
+                self.stream_failure_reason = "LISTEN_KEY_KEEPALIVE_FAILED"
+                self.last_error = "LISTEN_KEY_KEEPALIVE_FAILED"
+                self.last_error_at = datetime.now(timezone.utc)
                 _dispatch(self.on_reconcile)
+                await _close_ws(getattr(self, "_websocket", None))
 
     async def close(self) -> None:
         self._stopped = True

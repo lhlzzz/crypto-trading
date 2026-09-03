@@ -31,8 +31,13 @@ calling Risk, Execution, TradeIntent creation, or order submission.
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
 
-Current validation status on 2026-08-31: code checks pass (`246` pytest
-tests, compileall, and diff check), PostgreSQL schema/status is healthy, and
-Live remains blocked. Binance public REST/WebSocket transport is externally
-unstable, Testnet credentials are absent, and no elapsed realtime, Paper,
-Shadow, Alpha OOS, or Testnet evidence may be treated as verified.
+Current validation status on 2026-09-03, base `d1558de44c57d58e12250b4582d2544567e555c4`:
+code checks are the current working-tree result (`349` pytest tests passed).
+PostgreSQL schema/status remains healthy. Freeze-path files
+(`scripts/bian_market.py`, `trading_store.py`) changed in this validation-hardening
+round, so prior realtime evidence is `EXPIRED` and must not be reused:
+`REALTIME_30M=EXPIRED`, `REALTIME_2H=EXPIRED`, `REALTIME_6H=NOT_STARTED`,
+`REALTIME_24H=NOT_STARTED`. `PAPER_24H=NOT_STARTED`, `SHADOW_7D=NOT_STARTED`,
+`ALPHA=INSUFFICIENT_SAMPLE` until a later persisted OOS session exists,
+`TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`, `LIVE_PREFLIGHT` is live-mode only
+and still blocked, `LIVE=BLOCKED`. Do not treat historical 30M/2H PASS as current.

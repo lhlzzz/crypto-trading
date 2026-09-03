@@ -386,8 +386,8 @@ def test_orphaned_running_session_is_failed() -> None:
     }
     recovered = vr.recover_orphaned_sessions(stages)
     assert recovered == ["realtime_2h"]
-    assert stages["realtime_2h"]["status"] == "FAILED"
-    assert stages["realtime_2h"]["reason"] == "SESSION_OWNER_DEAD"
+    assert stages["realtime_2h"]["status"] == "EXPIRED"
+    assert stages["realtime_2h"]["reason"] == "STALE_RUNNING_SESSION"
 
 
 def test_universe_qualification_does_not_treat_btc_as_meme_universe() -> None:
@@ -409,6 +409,8 @@ def test_paper_acceptance_requires_evidence_not_returncode() -> None:
             "observation_count": 0,
             "positioning_count": 0,
             "evidence_count": 0,
+            "session_id": "paper-sess",
+            "mode": "paper",
         },
     )
     assert status == "FAILED"
@@ -439,6 +441,11 @@ def test_paper_acceptance_requires_evidence_not_returncode() -> None:
             "stale_open": 0,
             "unsafe_open": 0,
             "restart_recovery": True,
+            "session_id": "paper-sess",
+            "mode": "paper",
+            "unknown_order": 0,
+            "stale_pending_order": 0,
+            "unsafe_order": 0,
         },
     )
     assert status == "PASSED"
@@ -456,6 +463,9 @@ def test_shadow_acceptance_requires_evidence_and_does_not_claim_uncheckable_orde
         "short_count": 0,
         "restart_recovery": True,
         "episode_split": False,
+        "session_id": "shadow-sess",
+        "mode": "shadow",
+        "order_count": 0,
     }
     status, reason, detail = vr.shadow_acceptance(
         requested_duration=10,
@@ -463,8 +473,9 @@ def test_shadow_acceptance_requires_evidence_and_does_not_claim_uncheckable_orde
         snapshot=snapshot,
         real_order_delta=None,
     )
-    assert status == "PASSED"
-    assert detail["real_order_proof"] == "NOT_CHECKABLE_EXTERNALLY"
+    assert status == "BLOCKED"
+    assert reason == "INSUFFICIENT_EVIDENCE"
+    assert detail["real_order_proof"] == "INSUFFICIENT_EVIDENCE"
     status, reason, detail = vr.shadow_acceptance(
         requested_duration=10,
         duration_sec=10,
@@ -483,12 +494,17 @@ def test_paper_stage_uses_two_child_processes(monkeypatch) -> None:
         return {"command": command, "returncode": 75 if len(calls) == 1 else 0, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(vr, "_run_child", fake_child)
-    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="paper": {
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="paper", session_id=None: {
         "database_healthy": True,
         "observation_count": 2,
         "positioning_count": 2,
         "evidence_count": 2,
         "restart_recovery": True,
+        "session_id": session_id or "paper-sess",
+        "mode": mode,
+        "unknown_order": 0,
+        "stale_pending_order": 0,
+        "unsafe_order": 0,
     })
     monkeypatch.setattr(vr, "TradingStore", lambda: object())
     result = vr.run_paper_stage(10, ["BTCUSDT"])
@@ -568,20 +584,24 @@ def test_shadow_stage_uses_two_child_processes(monkeypatch) -> None:
 
     monkeypatch.setattr(vr, "_run_child", fake_child)
     monkeypatch.setattr(vr, "exchange_open_order_count", lambda: None)
-    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="shadow": {
+    monkeypatch.setattr(vr, "runtime_acceptance_snapshot", lambda store, mode="shadow", session_id=None: {
         "database_healthy": True,
         "observation_count": 2,
         "positioning_count": 2,
         "evidence_count": 2,
         "episode_count": 1,
         "restart_recovery": True,
+        "session_id": session_id or "shadow-sess",
+        "mode": mode,
+        "order_count": 0,
     })
     monkeypatch.setattr(vr, "TradingStore", lambda: object())
     result = vr.run_shadow_stage(10, ["BTCUSDT"])
     assert len(calls) == 2
     assert "--planned-restart-after" in calls[0]
     assert result["process_completed"] is True
-    assert result["shadow_acceptance"]["real_order_proof"] == "NOT_CHECKABLE_EXTERNALLY"
+    assert result["status"] == "BLOCKED"
+    assert result["shadow_acceptance"]["real_order_proof"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_testnet_acceptance_requires_full_lifecycle() -> None:
@@ -604,8 +624,8 @@ def test_testnet_acceptance_requires_full_lifecycle() -> None:
         "reconciliation": True,
         "restart": True,
     })
-    assert status == "PASSED"
-    assert reason == "OK"
+    assert status == "FAILED"
+    assert reason == "TESTNET_LIFECYCLE_INCOMPLETE"
 
 
 def test_reconnect_events_from_lifecycle_ignore_health_sample_fallback() -> None:
@@ -650,6 +670,8 @@ def test_paper_acceptance_fails_accounting_invariants() -> None:
         "impossible_equity": False,
         "invalid_margin": False,
         "restart_recovery": True,
+        "session_id": "paper-sess",
+        "mode": "paper",
     }
     status, reason, _detail = vr.paper_acceptance(
         requested_duration=10,
@@ -709,3 +731,316 @@ def test_run_realtime_cancels_collector_after_window(monkeypatch) -> None:
     assert result["reconnect_events"][0]["channel"] == "TRADE"
     assert result["reconnect_events"][0]["source"] == "collector_lifecycle"
     assert all(event.get("proof") is not False for event in result["reconnect_events"])
+
+
+def _paper_ok_snapshot(**overrides):
+    snapshot = {
+        "database_healthy": True,
+        "session_id": "paper-sess",
+        "mode": "paper",
+        "observation_count": 4,
+        "positioning_count": 4,
+        "evidence_count": 4,
+        "episode_count": 1,
+        "duplicate_trades": 0,
+        "duplicate_funding": 0,
+        "invalid_positions": 0,
+        "impossible_balance": False,
+        "impossible_equity": False,
+        "invalid_margin": False,
+        "unknown_order": 0,
+        "stale_pending_order": 0,
+        "unsafe_order": 0,
+        "restart_recovery": True,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def test_paper_acceptance_is_session_scoped_and_rejects_foreign_mode() -> None:
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=_paper_ok_snapshot(session_id=None),
+    )
+    assert (status, reason) == ("FAILED", "PAPER_SESSION_MISSING")
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=_paper_ok_snapshot(mode="testnet"),
+    )
+    assert (status, reason) == ("FAILED", "PAPER_MODE_MISMATCH")
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=_paper_ok_snapshot(mode=""),
+    )
+    assert (status, reason) == ("FAILED", "PAPER_MODE_MISMATCH")
+
+
+def test_unknown_order_always_fails_paper_acceptance() -> None:
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=_paper_ok_snapshot(unknown_order=1),
+    )
+    assert (status, reason) == ("FAILED", "UNKNOWN_ORDER")
+
+
+def test_stale_pending_order_fails_paper_acceptance() -> None:
+    status, reason, _detail = vr.paper_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        process_completed=True,
+        snapshot=_paper_ok_snapshot(stale_pending_order=1),
+    )
+    assert (status, reason) == ("FAILED", "STALE_PENDING_ORDER")
+
+
+def test_shadow_zero_delta_can_pass_when_session_has_no_local_orders() -> None:
+    snapshot = {
+        "observation_count": 3,
+        "positioning_count": 3,
+        "evidence_count": 3,
+        "episode_count": 1,
+        "restart_recovery": True,
+        "episode_split": False,
+        "session_id": "shadow-sess",
+        "mode": "shadow",
+        "order_count": 0,
+    }
+    status, reason, _detail = vr.shadow_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        snapshot=snapshot,
+        real_order_delta=0,
+    )
+    assert (status, reason) == ("PASSED", "OK")
+    snapshot["order_count"] = 1
+    status, reason, _detail = vr.shadow_acceptance(
+        requested_duration=10,
+        duration_sec=10,
+        snapshot=snapshot,
+        real_order_delta=0,
+    )
+    assert (status, reason) == ("FAILED", "SHADOW_LOCAL_ORDER_PRESENT")
+
+
+def test_stale_running_session_expires_on_load_report(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({
+        "stages": {
+            "realtime_2h": {
+                "status": "RUNNING",
+                "owner_pid": 99999999,
+                "session_id": "dead",
+                "start_at": "2026-01-01T00:00:00+00:00",
+                "heartbeat_at": "2026-01-01T00:00:00+00:00",
+            }
+        }
+    }))
+    monkeypatch.setattr(vr, "REPORT_PATH", path)
+    report = vr.load_report()
+    assert report["stages"]["realtime_2h"]["status"] == "EXPIRED"
+    assert report["stages"]["realtime_2h"]["reason"] == "STALE_RUNNING_SESSION"
+
+
+def test_live_preflight_evaluates_live_mode(monkeypatch) -> None:
+    captured = {}
+
+    class FakeGate:
+        def as_dict(self):
+            return {
+                "mode": "live",
+                "MARKET_HEALTH": "OK",
+                "ACCOUNT_HEALTH": "OK",
+                "USER_STREAM_HEALTH": "OK",
+                "RECONCILIATION_HEALTH": "OK",
+                "RISK_HEALTH": "SAFE",
+                "meme_universe": True,
+                "global_transport_health": "OK",
+            }
+
+    def fake_gate(**kwargs):
+        captured.update(kwargs)
+        return FakeGate()
+
+    monkeypatch.setattr(vr, "TradingStore", lambda: object())
+    monkeypatch.setattr(vr, "evaluate_runtime_gate", fake_gate)
+    result = vr.run_live_preflight({
+        "realtime_24h": {"status": "PASSED"},
+        "paper_24h": {"status": "PASSED"},
+        "shadow_7d": {"status": "PASSED"},
+        "alpha_oos": {"alpha_status": "ALPHA_SUPPORTED"},
+        "testnet": {"status": "PASSED"},
+    })
+    assert captured["mode"] == "live"
+    assert result["mode"] == "live"
+    assert result["LIVE_ALLOWED"] is False
+    assert result["ACCOUNT_HEALTHY"] is True
+    assert result["USER_STREAM_HEALTHY"] is True
+
+
+def test_live_preflight_rejects_not_applicable_account_health(monkeypatch) -> None:
+    class FakeGate:
+        def as_dict(self):
+            return {
+                "mode": "live",
+                "MARKET_HEALTH": "OK",
+                "ACCOUNT_HEALTH": "NOT_APPLICABLE",
+                "USER_STREAM_HEALTH": "NOT_APPLICABLE",
+                "RECONCILIATION_HEALTH": "OK",
+                "RISK_HEALTH": "SAFE",
+                "meme_universe": True,
+                "global_transport_health": "OK",
+            }
+
+    monkeypatch.setattr(vr, "TradingStore", lambda: object())
+    monkeypatch.setattr(vr, "evaluate_runtime_gate", lambda **kwargs: FakeGate())
+    result = vr.run_live_preflight({
+        "realtime_24h": {"status": "PASSED"},
+        "paper_24h": {"status": "PASSED"},
+        "shadow_7d": {"status": "PASSED"},
+        "alpha_oos": {"alpha_status": "ALPHA_SUPPORTED"},
+        "testnet": {"status": "PASSED"},
+    })
+    assert result["ACCOUNT_HEALTHY"] is False
+    assert result["USER_STREAM_HEALTHY"] is False
+    assert result["LIVE_ALLOWED"] is False
+
+
+def _testnet_evidence(**overrides):
+    evidence = {
+        "session_id": "tn-1",
+        "start_time": "2026-09-03T00:00:00+00:00",
+        "end_time": "2026-09-03T00:10:00+00:00",
+        "symbol": "BTCUSDT",
+        "long": {
+            "order": {"client_order_id": "L-1", "exchange_order_id": "100"},
+            "fills": [{"trade_id": "1", "quantity": "0.01"}],
+            "user_stream_observed": True,
+            "local_state_updated": True,
+            "reconciliation_matches": True,
+            "close": {"status": "FILLED", "reconciled_flat": True},
+        },
+        "short": {
+            "order": {"client_order_id": "S-1", "exchange_order_id": "101"},
+            "fills": [{"trade_id": "2", "quantity": "0.01"}],
+            "user_stream_observed": True,
+            "local_state_updated": True,
+            "reconciliation_matches": True,
+            "close": {"status": "FILLED", "reconciled_flat": True},
+        },
+        "partial_fill": {"status": "PARTIALLY_FILLED", "exchange_order_id": "102"},
+        "cancel": {"status": "CANCELLED", "exchange_order_id": "103"},
+        "unknown_order": {
+            "status": "UNKNOWN",
+            "resolved_by": "client_order_id",
+            "resubmitted": False,
+            "resolved_status": "FILLED",
+        },
+        "user_stream": {"events": 4},
+        "listen_key": {"created": True},
+        "reconciliation": {"ok": True, "open_matches": True},
+        "restart": {"ok": True},
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def test_testnet_acceptance_requires_structured_lifecycle_evidence() -> None:
+    status, reason, _detail = vr.testnet_acceptance(_testnet_evidence())
+    assert (status, reason) == ("PASSED", "OK")
+    status, reason, _detail = vr.testnet_acceptance(_testnet_evidence(unknown_order={
+        "status": "UNKNOWN",
+        "resolved_by": "client_order_id",
+        "resubmitted": True,
+        "resolved_status": "FILLED",
+    }))
+    assert (status, reason) == ("FAILED", "TESTNET_UNKNOWN_RESUBMITTED")
+
+
+def test_alpha_stage_reports_explicit_sample_fields(monkeypatch) -> None:
+    from backtesting import AlphaGateResult
+
+    monkeypatch.setattr(vr, "_load_alpha_frames", lambda: ["frame"])
+
+    def fake_gate(frames, **kwargs):
+        return AlphaGateResult(
+            status="INSUFFICIENT_SAMPLE",
+            train_samples=1,
+            validation_samples=1,
+            oos_samples=0,
+            train_metrics={},
+            validation_metrics={},
+            oos_metrics={"independent_episodes": 0, "observation_samples": 2},
+            strategy_version="positioning-v1",
+            parameter_version="abc",
+            config_hash="abc",
+            reason="no historical frames",
+            oos_frame_count=1,
+            oos_observation_samples=2,
+            oos_independent_episodes=0,
+        )
+
+    monkeypatch.setattr("backtesting.evaluate_alpha_gate", fake_gate)
+    result = vr.run_alpha_stage()
+    assert result["oos_samples_semantics"] == "independent_episodes"
+    assert result["oos_frame_count"] == 1
+    assert result["oos_observation_samples"] == 2
+    assert result["oos_independent_episodes"] == 0
+    assert result["model_training_completed"] is False
+    assert result["frozen_strategy"] is True
+    assert result["chronological_train"] is True
+
+
+def test_pending_and_terminal_order_states_are_canonical() -> None:
+    from execution import PENDING_ORDER_STATES, TERMINAL_ORDER_STATES
+
+    assert PENDING_ORDER_STATES == {
+        "CREATED",
+        "RISK_APPROVED",
+        "SUBMITTED",
+        "ACKNOWLEDGED",
+        "PARTIALLY_FILLED",
+        "UNKNOWN",
+    }
+    assert TERMINAL_ORDER_STATES == {
+        "FILLED",
+        "REJECTED",
+        "CANCELLED",
+        "EXPIRED",
+        "FAILED",
+    }
+    assert "OPEN" not in PENDING_ORDER_STATES
+    assert "OPEN" not in TERMINAL_ORDER_STATES
+    for status in TERMINAL_ORDER_STATES:
+        snapshot = _paper_ok_snapshot()
+        status_name, reason, _detail = vr.paper_acceptance(
+            requested_duration=10,
+            duration_sec=10,
+            process_completed=True,
+            snapshot=snapshot,
+        )
+        assert (status_name, reason) == ("PASSED", "OK"), status
+    for status in PENDING_ORDER_STATES:
+        if status == "UNKNOWN":
+            status_name, reason, _detail = vr.paper_acceptance(
+                requested_duration=10,
+                duration_sec=10,
+                process_completed=True,
+                snapshot=_paper_ok_snapshot(unknown_order=1),
+            )
+            assert (status_name, reason) == ("FAILED", "UNKNOWN_ORDER")
+        else:
+            status_name, reason, _detail = vr.paper_acceptance(
+                requested_duration=10,
+                duration_sec=10,
+                process_completed=True,
+                snapshot=_paper_ok_snapshot(stale_pending_order=1),
+            )
+            assert (status_name, reason) == ("FAILED", "STALE_PENDING_ORDER")

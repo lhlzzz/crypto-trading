@@ -124,6 +124,8 @@ class RiskLimits:
             max_directional_meme_exposure_usdt=_decimal_env(
                 "MAX_DIRECTIONAL_MEME_EXPOSURE_USDT", "500",
             ),
+            max_funding_abs=_decimal_env("MAX_FUNDING_ABS", "0.01"),
+            max_margin_ratio=_decimal_env("MAX_MARGIN_RATIO", "0.8"),
         )
 
     def __post_init__(self) -> None:
@@ -146,6 +148,7 @@ class RiskLimits:
                 self.max_meme_symbol_notional_usdt,
                 self.max_meme_portfolio_notional_usdt,
                 self.max_directional_meme_exposure_usdt,
+                self.max_funding_abs,
             )
         ):
             raise ValueError("risk limits cannot be negative")
@@ -158,6 +161,9 @@ class RiskLimits:
             )
         ):
             raise ValueError("risk count limits cannot be negative")
+        if not Decimal("0") <= self.max_margin_ratio <= Decimal("1"):
+            raise ValueError("max_margin_ratio must be between 0 and 1")
+
 @dataclass(frozen=True)
 class ExchangeRules:
     symbol: str

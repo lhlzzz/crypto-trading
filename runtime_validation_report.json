@@ -6,8 +6,8 @@
   "RUNTIME_PASS": true,
   "stages": {
     "realtime_30m": {
-      "status": "PASSED",
-      "reason": "OK",
+      "status": "EXPIRED",
+      "reason": "CODE_CHANGE_INVALIDATED",
       "stage": "realtime_30m",
       "kind": "realtime",
       "session_id": "983f735b-99a5-4e0f-9cd6-15eae2c60e9b",
@@ -1331,8 +1331,8 @@
       "EVIDENCE_SUFFICIENCY": "PASS"
     },
     "realtime_2h": {
-      "status": "PASSED",
-      "reason": "OK",
+      "status": "EXPIRED",
+      "reason": "CODE_CHANGE_INVALIDATED",
       "stage": "realtime_2h",
       "kind": "realtime",
       "session_id": "89ed7338-2dd0-401a-8d98-b29aebf9ba3d",
