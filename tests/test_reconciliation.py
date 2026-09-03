@@ -20,7 +20,8 @@ class StoreStub:
         self.events = []
         self.trades = []
 
-    def is_halted(self) -> bool:
+    def is_halted(self, *, mode=None, market="FUTURES") -> bool:
+        del mode, market
         return self.halted
 
     def list_open_local_orders(self, *, mode=None, market="FUTURES"):
@@ -55,17 +56,28 @@ class StoreStub:
         return [row for row in self.balances if row.get("mode") in {None, mode}]
 
     def list_positions(self, **kwargs):
-        return self.positions
+        mode = kwargs.get("mode")
+        if mode is None:
+            return self.positions
+        return [row for row in self.positions if row.get("mode") in {None, mode}]
 
-    def get_balance(self, asset):
-        return next((row for row in reversed(self.balances) if row["asset"] == asset), None)
+    def get_balance(self, asset, **kwargs):
+        mode = kwargs.get("mode")
+        rows = self.balances
+        if mode is not None:
+            rows = [row for row in rows if row.get("mode") in {None, mode}]
+        return next((row for row in reversed(rows) if row["asset"] == asset), None)
 
     def get_position(self, symbol, **kwargs):
-        return next((row for row in reversed(self.positions) if row["symbol"] == symbol), None)
+        mode = kwargs.get("mode")
+        rows = self.positions
+        if mode is not None:
+            rows = [row for row in rows if row.get("mode") in {None, mode}]
+        return next((row for row in reversed(rows) if row["symbol"] == symbol), None)
 
-    def set_halt(self, halted: bool, *, reason: str, source: str):
+    def set_halt(self, halted: bool, *, reason: str, source: str, mode=None, market="FUTURES"):
         self.halted = halted
-        self.halt_calls.append((halted, reason, source))
+        self.halt_calls.append((halted, reason, source, mode, market))
 
     def upsert_balance(self, asset, **fields):
         self.balances.append({"asset": asset, **fields})
@@ -153,14 +165,41 @@ def test_paper_recovery_is_safe_without_unknown_orders() -> None:
     assert result.safe_to_trade is True
 
 
+def _matched_position(**updates):
+    row = {
+        "symbol": "BTCUSDT",
+        "quantity": "0.1",
+        "position_side": "LONG",
+        "entry_price": "100",
+        "average_price": "100",
+        "leverage": "2",
+        "margin_type": "ISOLATED",
+        "liquidation_price": "50",
+        "mode": "testnet",
+    }
+    row.update(updates)
+    return row
+
+
+def _matched_exchange(**updates):
+    row = {
+        "symbol": "BTCUSDT",
+        "positionAmt": "0.1",
+        "entryPrice": "100",
+        "leverage": "2",
+        "marginType": "ISOLATED",
+        "liquidationPrice": "50",
+    }
+    row.update(updates)
+    return row
+
+
 def test_matching_account_is_safe() -> None:
     store = StoreStub(
         balances=[{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
-        positions=[{"symbol": "BTCUSDT", "quantity": "0.1", "position_side": "LONG", "entry_price": "100", "average_price": "100"}],
+        positions=[_matched_position()],
     )
-    client = ClientStub(
-        positions=[{"symbol": "BTCUSDT", "positionAmt": "0.1", "entryPrice": "100", "leverage": "2"}],
-    )
+    client = ClientStub(positions=[_matched_exchange()])
     result = Reconciler(store, client=client, mode="testnet").recover()
     assert result.status == "SAFE"
 
@@ -203,7 +242,7 @@ def test_user_stream_preserves_binance_trade_id() -> None:
 def test_rest_user_trade_preserves_binance_trade_id() -> None:
     store = StoreStub(
         balances=[{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
-        positions=[{"symbol": "BTCUSDT", "quantity": "0.1", "position_side": "LONG", "entry_price": "100", "average_price": "100"}],
+        positions=[_matched_position()],
         orders=[{
             "order_id": "1",
             "client_order_id": "c-1",
@@ -215,7 +254,7 @@ def test_rest_user_trade_preserves_binance_trade_id() -> None:
         }],
     )
     client = ClientStub(
-        positions=[{"symbol": "BTCUSDT", "positionAmt": "0.1", "entryPrice": "100", "leverage": "2"}],
+        positions=[_matched_exchange()],
     )
     client.get_user_trades = lambda symbol, limit=None: [  # type: ignore[method-assign]
         {
@@ -420,10 +459,10 @@ def test_account_update_patches_position_and_does_not_replace_unobserved_balance
 def test_short_position_uses_position_side_not_negative_quantity() -> None:
     store = StoreStub(
         balances=[{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
-        positions=[{"symbol": "BTCUSDT", "quantity": "0.1", "position_side": "SHORT", "entry_price": "100", "average_price": "100"}],
+        positions=[_matched_position(position_side="SHORT")],
     )
     client = ClientStub(
-        positions=[{"symbol": "BTCUSDT", "positionAmt": "-0.1", "positionSide": "BOTH", "entryPrice": "100"}],
+        positions=[_matched_exchange(positionAmt="-0.1", positionSide="BOTH")],
     )
     result = Reconciler(store, client=client, mode="testnet").recover()
     assert result.status == "SAFE"
@@ -432,13 +471,7 @@ def test_short_position_uses_position_side_not_negative_quantity() -> None:
 def _safe_account_store(**kwargs):
     store_kwargs = {
         "balances": [{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
-        "positions": [{
-            "symbol": "BTCUSDT",
-            "quantity": "0.1",
-            "position_side": "LONG",
-            "entry_price": "100",
-            "average_price": "100",
-        }],
+        "positions": [_matched_position()],
     }
     store_kwargs.update(kwargs)
     return StoreStub(**store_kwargs)
@@ -446,7 +479,7 @@ def _safe_account_store(**kwargs):
 
 def _trade_client(trades):
     client = ClientStub(
-        positions=[{"symbol": "BTCUSDT", "positionAmt": "0.1", "entryPrice": "100", "leverage": "2"}],
+        positions=[_matched_exchange()],
     )
     client.get_user_trades = lambda symbol, limit=None: trades  # type: ignore[method-assign]
     return client
@@ -620,3 +653,160 @@ def test_missing_exchange_trade_id_fails_closed() -> None:
     assert result.safe_to_trade is False
     assert "missing exchange_trade_id" in result.differences[0]
     assert store.trades == []
+
+
+def _halted_invalid_side(store, client):
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "HALT"
+    assert result.safe_to_trade is False
+    assert store.halt_calls
+    mismatch = [item for item in store.events if item.get("event_type") == "RECONCILIATION_MISMATCH"]
+    assert mismatch
+    return result
+
+
+def test_invalid_local_position_side_none_halts() -> None:
+    store = _safe_account_store(positions=[_matched_position(position_side=None)])
+    result = _halted_invalid_side(store, ClientStub(positions=[_matched_exchange()]))
+    assert "invalid local position_side" in result.differences[0]
+
+
+def test_invalid_local_position_side_unknown_halts() -> None:
+    store = _safe_account_store(positions=[_matched_position(position_side="UNKNOWN")])
+    result = _halted_invalid_side(store, ClientStub(positions=[_matched_exchange()]))
+    assert "invalid local position_side" in result.differences[0]
+
+
+def test_invalid_local_position_side_both_halts() -> None:
+    store = _safe_account_store(positions=[_matched_position(position_side="BOTH")])
+    result = _halted_invalid_side(store, ClientStub(positions=[_matched_exchange()]))
+    assert "invalid local position_side" in result.differences[0]
+
+
+def test_exchange_long_and_local_invalid_side_halts() -> None:
+    store = _safe_account_store(positions=[_matched_position(position_side="")])
+    result = _halted_invalid_side(store, ClientStub(positions=[_matched_exchange(positionSide="LONG")]))
+    assert "invalid local position_side" in result.differences[0]
+
+
+def test_exchange_short_and_local_invalid_side_halts() -> None:
+    store = _safe_account_store(
+        positions=[_matched_position(position_side="INVALID", quantity="0.1")]
+    )
+    result = _halted_invalid_side(
+        store,
+        ClientStub(positions=[_matched_exchange(positionAmt="-0.1", positionSide="SHORT")]),
+    )
+    assert "invalid local position_side" in result.differences[0]
+
+
+def test_flat_local_missing_side_does_not_false_positive() -> None:
+    store = StoreStub(
+        balances=[{"asset": "USDT", "wallet_balance": "100", "free": "100", "mode": "testnet"}],
+        positions=[_matched_position(quantity="0", position_side=None, entry_price="0", average_price="0")],
+    )
+    client = ClientStub(positions=[])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "SAFE"
+    assert result.safe_to_trade is True
+
+
+def test_missing_local_leverage_fails_closed() -> None:
+    store = _safe_account_store(positions=[_matched_position(leverage=None)])
+    result = Reconciler(store, client=ClientStub(positions=[_matched_exchange()]), mode="testnet").recover()
+    assert result.status == "HALT"
+    assert "leverage" in result.differences[0]
+
+
+def test_missing_exchange_leverage_fails_closed() -> None:
+    store = _safe_account_store()
+    result = Reconciler(
+        store,
+        client=ClientStub(positions=[_matched_exchange(leverage=None)]),
+        mode="testnet",
+    ).recover()
+    assert result.status == "HALT"
+    assert "leverage" in result.differences[0]
+
+
+def test_missing_local_margin_type_fails_closed() -> None:
+    store = _safe_account_store(positions=[_matched_position(margin_type=None)])
+    result = Reconciler(store, client=ClientStub(positions=[_matched_exchange()]), mode="testnet").recover()
+    assert result.status == "HALT"
+    assert "margin_type" in result.differences[0]
+
+
+def test_missing_exchange_margin_type_fails_closed() -> None:
+    store = _safe_account_store()
+    result = Reconciler(
+        store,
+        client=ClientStub(positions=[_matched_exchange(marginType=None)]),
+        mode="testnet",
+    ).recover()
+    assert result.status == "HALT"
+    assert "margin_type" in result.differences[0]
+
+
+def test_missing_local_liquidation_price_fails_closed() -> None:
+    store = _safe_account_store(positions=[_matched_position(liquidation_price=None)])
+    result = Reconciler(store, client=ClientStub(positions=[_matched_exchange()]), mode="testnet").recover()
+    assert result.status == "HALT"
+    assert "liquidation_price" in result.differences[0]
+
+
+def test_missing_exchange_liquidation_price_fails_closed() -> None:
+    store = _safe_account_store()
+    result = Reconciler(
+        store,
+        client=ClientStub(positions=[_matched_exchange(liquidationPrice=None)]),
+        mode="testnet",
+    ).recover()
+    assert result.status == "HALT"
+    assert "liquidation_price" in result.differences[0]
+
+
+def test_user_stream_and_rest_same_trade_is_one_trade() -> None:
+    store = _safe_account_store(orders=[{
+        "order_id": "X",
+        "client_order_id": "c-1",
+        "exchange_order_id": "9",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "status": "FILLED",
+        "mode": "testnet",
+        "position_side": "LONG",
+    }])
+    event = normalize_user_event(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 10,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "c-1",
+                "i": 9,
+                "t": 88,
+                "X": "FILLED",
+                "x": "TRADE",
+                "z": "0.1",
+                "l": "0.1",
+                "L": "100",
+                "n": "0.01",
+                "N": "USDT",
+            },
+        }
+    )
+    apply_user_stream_event(store, event)
+    client = _trade_client([
+        {
+            "id": 88,
+            "orderId": 9,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "qty": "0.1",
+            "price": "100",
+        }
+    ])
+    result = Reconciler(store, client=client, mode="testnet").recover()
+    assert result.status == "SAFE"
+    trades = [item for item in store.trades if item.get("exchange_trade_id") == "88"]
+    assert len(trades) == 1

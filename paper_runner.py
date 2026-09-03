@@ -36,6 +36,7 @@ from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate, R
 from runtime_gate import (
     GateResult,
     evaluate_runtime_gate,
+    live_confirmation_ok,
     trading_symbols_for_mode,
     user_stream_allows_open,
 )
@@ -117,16 +118,36 @@ def _current_user_stream_state(store: TradingStore, runtime_gate: GateResult | N
     return "UNKNOWN"
 
 
-def _halt_user_stream(store: TradingStore, reason: str, *, state: str = "FAILED") -> None:
+def _set_halt(
+    store: TradingStore,
+    halted: bool,
+    *,
+    reason: str,
+    source: str,
+    mode: str | None = None,
+) -> None:
+    try:
+        store.set_halt(halted, reason=reason, source=source, mode=mode)
+    except TypeError:
+        store.set_halt(halted, reason=reason, source=source)
+
+
+def _halt_user_stream(
+    store: TradingStore,
+    reason: str,
+    *,
+    state: str = "FAILED",
+    mode: str | None = None,
+) -> None:
     setter = getattr(store, "set_user_stream_health", None)
     if callable(setter):
         setter(state, reason=reason)
-    store.set_halt(True, reason=reason, source="user_stream")
+    _set_halt(store, True, reason=reason, source="user_stream", mode=mode)
     store.record_system_event(
         event_type="RUNTIME_HALT",
         severity="CRITICAL",
         message=reason,
-        payload={"source": "user_stream", "state": state},
+        payload={"source": "user_stream", "state": state, "mode": mode},
     )
 
 
@@ -639,7 +660,7 @@ def run_cycle(
     except Exception as exc:
         reason = f"GLOBAL_HALT:{type(exc).__name__}"
         try:
-            store.set_halt(True, reason=reason, source="paper_runner")
+            _set_halt(store, True, reason=reason, source="paper_runner", mode=mode)
         except Exception:
             pass
         return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
@@ -648,10 +669,12 @@ def run_cycle(
         positioning, shadow = _record_shadow(frame, store=store, engine=engine)
     except Exception as exc:
         try:
-            store.set_halt(
+            _set_halt(
+                store,
                 True,
                 reason=f"positioning evidence persistence failed: {type(exc).__name__}",
                 source="paper_runner",
+                mode=mode,
             )
         except Exception as halt_exc:
             raise RuntimeError(
@@ -668,11 +691,11 @@ def run_cycle(
         current = _current_position(account_snapshot, symbol)
     except ValueError as exc:
         reason = f"INVALID_ACCOUNT_STATE: {exc}"
-        store.set_halt(True, reason=reason, source="paper_runner")
+        _set_halt(store, True, reason=reason, source="paper_runner", mode=mode)
         return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
     except Exception as exc:
         reason = f"ACCOUNT_UNAVAILABLE: {type(exc).__name__}"
-        store.set_halt(True, reason=reason, source="paper_runner")
+        _set_halt(store, True, reason=reason, source="paper_runner", mode=mode)
         return {"status": "halted", "symbol": symbol.upper(), "reason": reason}
     intent = injected_intent
     if intent is None and engine.config.positioning_decision_enabled:
@@ -766,11 +789,8 @@ def _assert_account_risk_config(client: Any) -> None:
 def _startup_recovery(mode: str, store: TradingStore) -> GateResult:
     if mode == "live" and os.environ.get("BIAN_MARKET", "").strip().upper() != "FUTURES":
         raise SystemExit("live mode requires BIAN_MARKET=FUTURES")
-    if mode == "live":
-        expected = os.environ.get("LIVE_CONFIRMATION_TOKEN")
-        confirmed = os.environ.get("BIAN_LIVE_CONFIRMATION")
-        if not expected or confirmed != expected:
-            raise SystemExit("live mode requires explicit confirmation token")
+    if mode == "live" and not live_confirmation_ok():
+        raise SystemExit("live mode requires explicit confirmation token")
     store.initialize()
     symbols = list(trading_symbols_for_mode(mode))
     client = None
@@ -832,7 +852,7 @@ async def _run_private_forever(
     halt_event = asyncio.Event()
 
     def on_halt(reason: str) -> None:
-        _halt_user_stream(store, reason, state="FAILED")
+        _halt_user_stream(store, reason, state="FAILED", mode=mode)
         halt_event.set()
 
     stream = UserStreamClient(
@@ -855,7 +875,7 @@ async def _run_private_forever(
             _heartbeat(store)
             if halt_event.is_set() or str(getattr(stream, "state", "")).upper() == "FAILED":
                 reason = "USER_STREAM FAILED"
-                _halt_user_stream(store, reason, state="FAILED")
+                _halt_user_stream(store, reason, state="FAILED", mode=mode)
                 raise RuntimeError(reason)
             if stream_task.done():
                 exc = None
@@ -866,7 +886,7 @@ async def _run_private_forever(
                     if exc is not None
                     else "USER_STREAM FAILED"
                 )
-                _halt_user_stream(store, reason, state="FAILED")
+                _halt_user_stream(store, reason, state="FAILED", mode=mode)
                 raise RuntimeError(reason) from exc
             stream_state = str(getattr(stream, "state", "UNKNOWN") or "UNKNOWN").upper()
             setter = getattr(store, "set_user_stream_health", None)
@@ -887,12 +907,12 @@ async def _run_private_forever(
                     print(result, flush=True)
                 except Exception as exc:
                     reason = f"WATCHDOG:engine:{type(exc).__name__}"
-                    store.set_halt(True, reason=reason, source="watchdog")
+                    _set_halt(store, True, reason=reason, source="watchdog", mode=mode)
                     store.record_system_event(
                         event_type="RUNTIME_HALT",
                         severity="CRITICAL",
                         message=reason,
-                        payload={"symbol": symbol, "error": str(exc)},
+                        payload={"symbol": symbol, "error": str(exc), "mode": mode},
                     )
                     raise RuntimeError(reason) from exc
             await asyncio.sleep(interval)
@@ -949,12 +969,12 @@ def run_forever(
                     )
                 except Exception as exc:
                     reason = f"WATCHDOG:engine:{type(exc).__name__}"
-                    store.set_halt(True, reason=reason, source="watchdog")
+                    _set_halt(store, True, reason=reason, source="watchdog", mode=resolved_mode)
                     store.record_system_event(
                         event_type="RUNTIME_HALT",
                         severity="CRITICAL",
                         message=reason,
-                        payload={"symbol": symbol, "error": str(exc)},
+                        payload={"symbol": symbol, "error": str(exc), "mode": resolved_mode},
                     )
                     raise RuntimeError(reason) from exc
             if restart_at is not None and time.monotonic() >= restart_at:

@@ -621,6 +621,15 @@ class RiskGate:
                 return self._halt(intent, "Futures exchange rules are incomplete")
             if entry and rules.status != "TRADING":
                 return self._deny(intent, "symbol is not trading")
+            if entry:
+                if intent.quantity <= 0:
+                    return self._deny(intent, "quantity must be positive")
+                if intent.quantity < rules.min_qty:
+                    return self._deny(intent, "minimum quantity requirement failed")
+                if rules.max_qty is not None and intent.quantity > rules.max_qty:
+                    return self._deny(intent, "maximum quantity requirement failed")
+                if _floor_step(intent.quantity, rules.step_size) != intent.quantity:
+                    return self._deny(intent, "quantity is not aligned to step size")
 
         mark_price = context.mark_price
         if entry and context.position_quantity > 0 and mark_price is None:
@@ -664,9 +673,15 @@ class RiskGate:
             return self._deny(intent, "normalized order notional is invalid")
 
         if rules is not None:
+            if intent.quantity <= 0 or normalized.quantity <= 0:
+                return self._deny(intent, "quantity must be positive")
+            if entry and _floor_step(intent.quantity, rules.step_size) != intent.quantity:
+                return self._deny(intent, "quantity is not aligned to step size")
             if normalized.quantity < rules.min_qty:
                 return self._deny(intent, "minimum quantity requirement failed")
-            if rules.max_qty is not None and normalized.quantity > rules.max_qty:
+            if rules.max_qty is not None and (
+                intent.quantity > rules.max_qty or normalized.quantity > rules.max_qty
+            ):
                 return self._deny(intent, "maximum quantity requirement failed")
             if normalized_notional < rules.min_notional:
                 return self._deny(intent, "minimum notional requirement failed")

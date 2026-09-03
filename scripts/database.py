@@ -843,22 +843,6 @@ def _migrate_futures_columns(cursor: Any) -> None:
     cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_active_liquidation_positive")
     cursor.execute(
         """
-        UPDATE positions
-        SET liquidation_price = entry_price
-        WHERE quantity > 0
-          AND (liquidation_price IS NULL OR liquidation_price <= 0)
-          AND COALESCE(entry_price, 0) > 0
-        """
-    )
-    cursor.execute(
-        """
-        ALTER TABLE positions
-            ADD CONSTRAINT positions_active_liquidation_positive
-            CHECK (quantity = 0 OR (liquidation_price IS NOT NULL AND liquidation_price > 0))
-        """
-    )
-    cursor.execute(
-        """
         DO $$
         BEGIN
             ALTER TABLE positions

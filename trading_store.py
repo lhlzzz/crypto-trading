@@ -843,7 +843,7 @@ class TradingStore:
         positions = []
         episodes = []
         for symbol in symbol_list:
-            position = self.get_position(symbol) or {}
+            position = self.get_position(symbol, mode=resolved_mode) or {}
             quantity = Decimal(str(position.get("quantity") or 0))
             side = str(position.get("position_side") or ("FLAT" if quantity == 0 else "UNKNOWN"))
             positions.append(
@@ -987,7 +987,7 @@ class TradingStore:
             return {"ok": False, "reason": "RESTART_STATE_MISMATCH", "mismatched": mismatched}
         return {"ok": True, "reason": "OK", "mismatched": []}
 
-    def is_halted(self) -> bool:
+    def is_halted(self, *, mode: str | None = None, market: str = "FUTURES") -> bool:
         import os
         import psycopg2
 
@@ -995,26 +995,49 @@ class TradingStore:
             "1", "true", "yes", "on"
         }:
             return True
-        with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT event_type
-                    FROM system_events
-                    WHERE event_type IN ('TRADING_HALTED', 'TRADING_RESUMED')
-                    ORDER BY event_at DESC
-                    LIMIT 1
-                    """
-                )
-                row = cursor.fetchone()
+        resolved_mode = self._mode(mode)
+        resolved_market = str(market or "FUTURES").upper()
+        try:
+            with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT event_type
+                        FROM system_events
+                        WHERE event_type IN ('TRADING_HALTED', 'TRADING_RESUMED')
+                          AND mode = %s
+                          AND market = %s
+                        ORDER BY event_at DESC
+                        LIMIT 1
+                        """,
+                        (resolved_mode, resolved_market),
+                    )
+                    row = cursor.fetchone()
+        except Exception:
+            return True
         return row is not None and row[0] == "TRADING_HALTED"
 
-    def set_halt(self, halted: bool, *, reason: str, source: str) -> UUID:
+    def set_halt(
+        self,
+        halted: bool,
+        *,
+        reason: str,
+        source: str,
+        mode: str | None = None,
+        market: str = "FUTURES",
+    ) -> UUID:
+        resolved_mode = self._mode(mode)
+        resolved_market = str(market or "FUTURES").upper()
         return self.record_system_event(
             event_type="TRADING_HALTED" if halted else "TRADING_RESUMED",
             severity="CRITICAL" if halted else "INFO",
             message=reason,
-            payload={"source": source, "halted": halted},
+            payload={
+                "source": source,
+                "halted": halted,
+                "mode": resolved_mode,
+                "market": resolved_market,
+            },
         )
 
     def set_user_stream_health(self, status: str, *, reason: str | None = None) -> None:

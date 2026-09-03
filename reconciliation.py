@@ -51,7 +51,11 @@ class Reconciler:
         self.mode = mode
 
     def recover(self) -> ReconciliationResult:
-        if self.store.is_halted():
+        try:
+            halted = self.store.is_halted(mode=self.mode)
+        except TypeError:
+            halted = self.store.is_halted()
+        if halted:
             return ReconciliationResult("HALTED", False, ("trading is halted",))
         try:
             if self.mode == "paper":
@@ -229,11 +233,15 @@ class Reconciler:
             local = local_by_symbol.get(symbol)
             exchange_dir, exchange_qty = _exchange_position(exchange)
             local_qty = abs(Decimal(str((local or {}).get("quantity") or "0")))
-            local_dir = str((local or {}).get("position_side") or "FLAT")
+            raw_local_side = (local or {}).get("position_side")
+            local_dir = str(raw_local_side or "").strip().upper()
             if local_qty == 0:
                 local_dir = "FLAT"
             elif local_dir not in {"LONG", "SHORT"}:
-                local_dir = "LONG"
+                differences.append(
+                    f"invalid local position_side: {symbol}={raw_local_side!r}"
+                )
+                continue
             if exchange is None and local_qty == 0:
                 continue
             if local is None and exchange_qty == 0:
@@ -249,23 +257,39 @@ class Reconciler:
             if entry != local_entry:
                 differences.append(f"position mismatch: {symbol}")
                 continue
-            for field, exchange_key in (
-                ("leverage", "leverage"),
-                ("margin_type", "marginType"),
-                ("mark_price", "markPrice"),
-                ("liquidation_price", "liquidationPrice"),
-                ("unrealized_pnl", "unRealizedProfit"),
-            ):
-                exchange_value = exchange.get(exchange_key)
-                local_value = local.get(field)
-                if exchange_value is None or local_value is None:
-                    continue
-                if field == "margin_type":
-                    matches = str(local_value).upper() == str(exchange_value).upper()
-                else:
-                    matches = Decimal(str(local_value)) == Decimal(str(exchange_value))
-                if not matches:
-                    differences.append(f"position mismatch: {symbol}:{field}")
+            if local_qty > 0:
+                for field, exchange_key, required in (
+                    ("leverage", "leverage", True),
+                    ("margin_type", "marginType", True),
+                    ("liquidation_price", "liquidationPrice", True),
+                    ("mark_price", "markPrice", False),
+                    ("unrealized_pnl", "unRealizedProfit", False),
+                ):
+                    exchange_value = exchange.get(exchange_key)
+                    local_value = local.get(field)
+                    if required:
+                        if _missing_position_field(exchange_value):
+                            differences.append(
+                                f"position mismatch: {symbol}:{field}: exchange missing"
+                            )
+                            continue
+                        if _missing_position_field(local_value):
+                            differences.append(
+                                f"position mismatch: {symbol}:{field}: local missing"
+                            )
+                            continue
+                    elif _missing_position_field(exchange_value) or _missing_position_field(local_value):
+                        if _missing_position_field(exchange_value) != _missing_position_field(local_value):
+                            differences.append(
+                                f"position mismatch: {symbol}:{field}: unavailable"
+                            )
+                        continue
+                    if field == "margin_type":
+                        matches = str(local_value).upper() == str(exchange_value).upper()
+                    else:
+                        matches = Decimal(str(local_value)) == Decimal(str(exchange_value))
+                    if not matches:
+                        differences.append(f"position mismatch: {symbol}:{field}")
             recovered += 1
         return recovered
 
@@ -505,7 +529,10 @@ class Reconciler:
             )
 
     def _fail(self, reason: str) -> ReconciliationResult:
-        self.store.set_halt(True, reason=reason, source="reconciliation")
+        try:
+            self.store.set_halt(True, reason=reason, source="reconciliation", mode=self.mode)
+        except TypeError:
+            self.store.set_halt(True, reason=reason, source="reconciliation")
         return ReconciliationResult("HALT", False, (reason,))
 
 
@@ -522,12 +549,21 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
         seen.add(event_id)
     event_type = getattr(event, "event_type", None)
     if event_type == "ACCOUNT_UPDATE":
-        mode = os.environ.get("BIAN_MODE", "testnet")
+        payload_mode = None
+        raw_payload = getattr(event, "raw", None)
+        if isinstance(raw_payload, dict):
+            payload_mode = raw_payload.get("mode")
+        mode = str(payload_mode or os.environ.get("BIAN_MODE", "testnet")).strip().lower()
         for balance in getattr(event, "balance_updates", ()):
             asset = str(balance.get("asset") or "").upper()
             if not asset:
                 continue
-            current = getattr(store, "get_balance", lambda _asset: None)(asset) or {}
+            getter = getattr(store, "get_balance", None)
+            try:
+                current = getter(asset, mode=mode) if callable(getter) else None
+            except TypeError:
+                current = getter(asset) if callable(getter) else None
+            current = current or {}
             payload = dict(current.get("payload") or {})
             payload.update({
                 "source": getattr(event, "source", "USER_STREAM"),
@@ -626,7 +662,14 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
     client_order_id = getattr(event, "client_order_id", None)
     if not client_order_id:
         return
-    local = store.get_order_by_client_order_id(str(client_order_id))
+    order_mode = str(os.environ.get("BIAN_MODE", "")).strip().lower() or None
+    getter = getattr(store, "get_order_by_client_order_id", None)
+    local = None
+    if callable(getter):
+        try:
+            local = getter(str(client_order_id), mode=order_mode) if order_mode else getter(str(client_order_id))
+        except TypeError:
+            local = getter(str(client_order_id))
     if local is None:
         store.set_halt(
             True,
@@ -699,6 +742,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 position_side=position_side or None,
                 source_event_id=event_id,
                 exchange_trade_id=getattr(event, "trade_id", None),
+                mode=str(local.get("mode") or order_mode or os.environ.get("BIAN_MODE", "testnet")),
                 payload={
                     "source": "user_stream",
                     "event_id": event_id,
@@ -707,6 +751,13 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                     "reduce_only": getattr(event, "reduce_only", None),
                 },
             )
+
+
+def _missing_position_field(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    return text == "" or text.upper() in {"NONE", "NULL", "UNKNOWN"}
 
 
 def _exchange_position(row: dict[str, Any] | None) -> tuple[str, Decimal]:

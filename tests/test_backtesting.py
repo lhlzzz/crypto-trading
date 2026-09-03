@@ -151,8 +151,8 @@ def test_positioning_replay_rejects_non_chronological_frames() -> None:
 def test_backtest_frames_use_futures_paper_execution_contract() -> None:
     start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
     frames = [
-        _positioning_frame(start, "100", "101"),
-        _positioning_frame(start + timedelta(minutes=1), "101", "102"),
+        _positioning_frame(start, "100", "100"),
+        _positioning_frame(start + timedelta(minutes=1), "100", "125"),
     ]
 
     result = run_backtest([], frames=frames, symbol="BTCUSDT")

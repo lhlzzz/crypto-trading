@@ -245,6 +245,16 @@ class _BaseExecutor(Executor):
             payload=payload,
         )
 
+    def _store_call(self, method: str, *args, **kwargs):
+        """Call a store method with explicit runtime mode when the owner accepts it."""
+        target = getattr(self.store, method)
+        kwargs.setdefault("mode", self.config.mode)
+        try:
+            return target(*args, **kwargs)
+        except TypeError:
+            kwargs.pop("mode", None)
+            return target(*args, **kwargs)
+
 
 class ExecutionRejected(RuntimeError):
     """The risk decision did not permit order submission."""
@@ -293,7 +303,7 @@ class PaperExecutor(_BaseExecutor):
             raise ValueError("paper execution requires a positive market snapshot")
         if market.mark_price is None or market.mark_price <= 0:
             raise ValueError("paper execution requires a positive mark_price")
-        if self.store.is_halted() and intent.action == "OPEN":
+        if self._store_call("is_halted") and intent.action == "OPEN":
             raise ExecutionRejected("trading is halted")
         approved = self._approve(intent, risk_decision)
         requested_quantity = approved.quantity
@@ -395,7 +405,11 @@ class PaperExecutor(_BaseExecutor):
         return _result_from_local(local)
 
     def get_open_orders(self) -> list[ExecutionResult]:
-        rows = getattr(self.store, "list_open_local_orders", lambda: [])()
+        lister = getattr(self.store, "list_open_local_orders", None)
+        try:
+            rows = lister(mode=self.config.mode) if lister is not None else []
+        except TypeError:
+            rows = lister() if lister is not None else []
         results: list[ExecutionResult] = []
         for row in rows:
             self._expire_if_needed(row)
@@ -444,7 +458,10 @@ class PaperExecutor(_BaseExecutor):
         return result
 
     def account_state(self) -> dict[str, Decimal]:
-        row = self.store.get_balance("USDT") or {}
+        try:
+            row = self.store.get_balance("USDT", mode=self.config.mode) or {}
+        except TypeError:
+            row = self.store.get_balance("USDT") or {}
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
         wallet = _decimal_field(row, "wallet_balance", default=str(row.get("free", self.config.initial_usdt)))
         used = _decimal_field(row, "used_margin", default=str(row.get("locked", "0")))
@@ -466,16 +483,25 @@ class PaperExecutor(_BaseExecutor):
 
     def account_snapshot(self) -> FuturesAccountSnapshot:
         account = self.account_state()
-        positions = getattr(self.store, "list_positions", lambda: [])()
+        lister = getattr(self.store, "list_positions", None)
+        try:
+            positions = lister(mode=self.config.mode) if lister is not None else []
+        except TypeError:
+            positions = lister() if lister is not None else []
         configured = {
             str(row.get("symbol")).upper(): self.config.default_leverage
             for row in positions
             if row.get("symbol")
         }
+        open_lister = getattr(self.store, "list_open_local_orders", None)
+        try:
+            open_orders = open_lister(mode=self.config.mode) if open_lister is not None else []
+        except TypeError:
+            open_orders = open_lister() if open_lister is not None else []
         return FuturesAccountSnapshot.from_paper(
             account=account,
             positions=positions,
-            open_orders=getattr(self.store, "list_open_local_orders", lambda: [])(),
+            open_orders=open_orders,
             captured_at=datetime.now(timezone.utc),
             symbol_leverage=configured,
         )
@@ -504,7 +530,7 @@ class PaperExecutor(_BaseExecutor):
     def mark_to_market(self, symbol: str, mark_price: Decimal) -> None:
         if mark_price <= 0:
             raise ValueError("mark price must be positive")
-        position = self.store.get_position(symbol)
+        position = self._store_call("get_position", symbol)
         if position is None:
             return
         quantity = _decimal_field(position, "quantity")
@@ -565,7 +591,7 @@ class PaperExecutor(_BaseExecutor):
             current_timestamp = current_timestamp.replace(tzinfo=timezone.utc)
         if current_timestamp < settlement:
             return Decimal("0")
-        position = self.store.get_position(symbol)
+        position = self._store_call("get_position", symbol)
         if position is None:
             return Decimal("0")
         quantity = _decimal_field(position, "quantity")
@@ -620,7 +646,8 @@ class PaperExecutor(_BaseExecutor):
         extra["last_funding_settlement_timestamp"] = stamp
         extra["funding_timestamp"] = stamp
         extra["funding_pnl"] = str(funding_pnl)
-        self.store.upsert_position(
+        self._store_call(
+            "upsert_position",
             symbol,
             quantity=quantity,
             average_price=_decimal_field(position, "entry_price", "average_price"),
@@ -679,14 +706,14 @@ class PaperExecutor(_BaseExecutor):
             entry_price=Decimal("0"),
             mark_price=mark_price,
             index_price=None,
-            realized_pnl=_decimal_field(self.store.get_position(symbol), "realized_pnl") + realized,
+            realized_pnl=_decimal_field(self._store_call("get_position", symbol), "realized_pnl") + realized,
             unrealized_pnl=Decimal("0"),
-            funding_pnl=_decimal_field(self.store.get_position(symbol), "funding_pnl"),
+            funding_pnl=_decimal_field(self._store_call("get_position", symbol), "funding_pnl"),
             leverage=Decimal("1"),
             initial_margin=Decimal("0"),
             maintenance_margin=Decimal("0"),
             liquidation_price=None,
-            fee_pnl=_decimal_field(self.store.get_position(symbol), "fee_pnl"),
+            fee_pnl=_decimal_field(self._store_call("get_position", symbol), "fee_pnl"),
             extra={"liquidated": True},
         )
         self.store.record_system_event(
@@ -737,7 +764,12 @@ class PaperExecutor(_BaseExecutor):
 
     def _local_order(self, order_id: UUID) -> dict[str, Any] | None:
         getter = getattr(self.store, "get_order", None)
-        return getter(order_id) if getter is not None else None
+        if getter is None:
+            return None
+        try:
+            return getter(order_id, mode=self.config.mode)
+        except TypeError:
+            return getter(order_id)
 
     def _expire_if_needed(self, order: dict[str, Any]) -> None:
         expires_at = order.get("expires_at")
@@ -853,7 +885,8 @@ class PaperExecutor(_BaseExecutor):
             intent, fill_quantity, fill_price, fee, slippage,
             index_price=market.index_price,
         )
-        trade_id = self.store.record_trade(
+        trade_id = self._store_call(
+            "record_trade",
             order_id,
             symbol=intent.symbol,
             side=intent.exchange_side(),
@@ -865,7 +898,7 @@ class PaperExecutor(_BaseExecutor):
             position_side=intent.direction,
             funding=Decimal("0"),
             payload={
-                "mode": "paper",
+                "mode": self.config.mode,
                 "action": intent.action,
                 "fee_pnl": str(-fee),
                 "slippage": str(slippage),
@@ -909,7 +942,11 @@ class PaperExecutor(_BaseExecutor):
         )
 
     def _ensure_initial_balance(self) -> None:
-        if self.store.get_balance("USDT") is None:
+        try:
+            existing = self.store.get_balance("USDT", mode=self.config.mode)
+        except TypeError:
+            existing = self.store.get_balance("USDT")
+        if existing is None:
             self._write_account(
                 wallet_balance=self.config.initial_usdt,
                 used_margin=Decimal("0"),
@@ -946,7 +983,7 @@ class PaperExecutor(_BaseExecutor):
             margin_balance=wallet_balance + unrealized_pnl,
             used_margin=used_margin,
             unrealized_pnl=unrealized_pnl,
-            mode="paper",
+            mode=self.config.mode,
             payload={
                 "updated_by": "paper_execution",
                 "initial": initial,
@@ -990,7 +1027,10 @@ class PaperExecutor(_BaseExecutor):
         extra: dict[str, Any] | None = None,
     ) -> None:
         notional = quantity * mark_price
-        current = self.store.get_position(symbol)
+        try:
+            current = self.store.get_position(symbol, mode=self.config.mode)
+        except TypeError:
+            current = self.store.get_position(symbol)
         current_payload = (
             current.get("payload")
             if isinstance(current, dict) and isinstance(current.get("payload"), dict)
@@ -998,7 +1038,7 @@ class PaperExecutor(_BaseExecutor):
         )
         payload = {
             **current_payload,
-            "mode": "paper",
+            "mode": self.config.mode,
             "market": "FUTURES",
             "position_side": direction,
             "entry_price": str(entry_price),
@@ -1035,6 +1075,7 @@ class PaperExecutor(_BaseExecutor):
             liquidation_price=liquidation_price,
             funding_pnl=funding_pnl,
             payload=payload,
+            mode=self.config.mode,
         )
 
     def _update_account(
@@ -1047,7 +1088,7 @@ class PaperExecutor(_BaseExecutor):
         *,
         index_price: Decimal | None = None,
     ) -> Decimal:
-        position = self.store.get_position(intent.symbol)
+        position = self._store_call("get_position", intent.symbol)
         current_direction = str((position or {}).get("position_side") or "FLAT")
         current_quantity = _decimal_field(position, "quantity")
         current_entry = _decimal_field(position, "entry_price", "average_price")
@@ -1169,8 +1210,15 @@ class BinanceExecutor(_BaseExecutor):
         *,
         market: MarketSnapshot | None = None,
     ) -> ExecutionResult:
-        if self.store.is_halted() and intent.action == "OPEN":
+        if self._store_call("is_halted") and intent.action == "OPEN":
             raise ExecutionRejected("trading is halted")
+        if self.config.mode == "live":
+            from runtime_gate import LiveAuthorizationError, authorize_live_order_mutation
+
+            try:
+                authorize_live_order_mutation(mode="live")
+            except LiveAuthorizationError as exc:
+                raise ExecutionRejected(str(exc)) from exc
         approved = self._approve(intent, risk_decision)
         order_id = self._create_order(approved, status="CREATED")
         self._event(order_id, "ORDER_CREATED", "CREATED")
@@ -1246,7 +1294,7 @@ class BinanceExecutor(_BaseExecutor):
         error: Exception,
     ) -> ExecutionResult:
         """Resolve a possibly accepted mutation without ever resubmitting it."""
-        local = self.store.get_order(order_id) or {}
+        local = self._store_call("get_order", order_id) or {}
         exchange_order_id = local.get("exchange_order_id")
         lookups: list[dict[str, Any]] = []
         if exchange_order_id is not None:
@@ -1276,7 +1324,7 @@ class BinanceExecutor(_BaseExecutor):
                 payload={"error": str(error), "resolution_error": reason},
             )
             self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", error=reason)
-            self.store.set_halt(True, reason=reason, source="execution")
+            self._store_call("set_halt", True, reason=reason, source="execution")
             return ExecutionResult(
                 order_id=order_id,
                 intent_id=intent.id,
@@ -1290,7 +1338,7 @@ class BinanceExecutor(_BaseExecutor):
             reason = "order lookup returned UNKNOWN status"
             self.store.update_order(order_id, status="UNKNOWN", payload=response)
             self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", response=response)
-            self.store.set_halt(True, reason=reason, source="execution")
+            self._store_call("set_halt", True, reason=reason, source="execution")
             return ExecutionResult(
                 order_id=order_id,
                 intent_id=intent.id,
@@ -1328,7 +1376,7 @@ class BinanceExecutor(_BaseExecutor):
         )
 
     def cancel(self, order_id: UUID) -> ExecutionResult:
-        local = self.store.get_order(order_id)
+        local = self._store_call("get_order", order_id)
         if local is None:
             raise KeyError(f"unknown local order: {order_id}")
         try:
@@ -1402,7 +1450,7 @@ class BinanceExecutor(_BaseExecutor):
                 order_id, status="UNKNOWN", payload={"error": reason}
             )
             self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", error=reason)
-            self.store.set_halt(True, reason=reason, source="execution")
+            self._store_call("set_halt", True, reason=reason, source="execution")
             return ExecutionResult(
                 order_id=order_id,
                 intent_id=UUID(str(local["intent_id"])),
@@ -1416,7 +1464,7 @@ class BinanceExecutor(_BaseExecutor):
             reason = "cancel lookup returned UNKNOWN status"
             self.store.update_order(order_id, status="UNKNOWN", payload=response)
             self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", response=response)
-            self.store.set_halt(True, reason=reason, source="execution")
+            self._store_call("set_halt", True, reason=reason, source="execution")
         else:
             self.store.update_order(
                 order_id,
@@ -1443,7 +1491,7 @@ class BinanceExecutor(_BaseExecutor):
         )
 
     def get_order(self, order_id: UUID) -> ExecutionResult:
-        local = self.store.get_order(order_id)
+        local = self._store_call("get_order", order_id)
         if local is None:
             raise KeyError(f"unknown local order: {order_id}")
         response = self.client.get_order(
@@ -1484,7 +1532,7 @@ class BinanceExecutor(_BaseExecutor):
 
     def get_open_orders(self) -> list[ExecutionResult]:
         results: list[ExecutionResult] = []
-        for local in self.store.list_open_local_orders():
+        for local in self._store_call("list_open_local_orders"):
             results.append(self.get_order(UUID(str(local["order_id"]))))
         return results
 
@@ -1503,7 +1551,8 @@ class BinanceExecutor(_BaseExecutor):
             if quantity <= 0 or price <= 0:
                 continue
             fee = Decimal(str(fill.get("commission", "0")))
-            self.store.record_trade(
+            self._store_call(
+                "record_trade",
                 order_id,
                 symbol=intent.symbol,
                 side=intent.exchange_side(),

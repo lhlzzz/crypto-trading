@@ -80,23 +80,29 @@ class MemoryStore:
     def upsert_position(self, symbol: str, **fields: object) -> None:
         self.positions.append({"symbol": symbol, **fields})
 
-    def get_position(self, symbol: str) -> dict[str, object] | None:
+    def get_position(self, symbol: str, *, mode: str | None = None) -> dict[str, object] | None:
         for position in reversed(self.positions):
-            if position["symbol"] == symbol:
-                return position
+            if position["symbol"] != symbol:
+                continue
+            if mode is not None and position.get("mode") not in {None, mode}:
+                continue
+            return position
         return None
 
-    def list_positions(self, *, market: str = "FUTURES"):
+    def list_positions(self, *, market: str = "FUTURES", mode: str | None = None):
         del market
         latest: dict[str, dict[str, object]] = {}
         for position in self.positions:
+            if mode is not None and position.get("mode") not in {None, mode}:
+                continue
             latest[str(position["symbol"])] = position
         return list(latest.values())
 
     def upsert_balance(self, asset: str, **fields: object) -> None:
         self.balances[asset] = {"asset": asset, **fields}
 
-    def get_balance(self, asset: str) -> dict[str, object] | None:
+    def get_balance(self, asset: str, *, mode: str | None = None) -> dict[str, object] | None:
+        del mode
         return self.balances.get(asset)
 
     def record_system_event(self, **fields: object) -> UUID:
@@ -104,17 +110,21 @@ class MemoryStore:
         self.events.append((UUID(int=0), str(fields.get("event_type", "SYSTEM_EVENT")), str(fields)))
         return UUID(int=len(self.events))
 
-    def is_halted(self) -> bool:
+    def is_halted(self, *, mode: str | None = None, market: str = "FUTURES") -> bool:
+        del mode, market
         return self.halted
 
-    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+    def set_halt(self, halted: bool, *, reason: str, source: str, mode: str | None = None, market: str = "FUTURES") -> None:
+        del mode, market
         self.halted = halted
         self.record_system_event(event_type="HALT", reason=reason, source=source)
 
-    def get_order(self, order_id: UUID):
+    def get_order(self, order_id: UUID, *, mode: str | None = None):
+        del mode
         return self.orders.get(order_id)
 
-    def list_open_local_orders(self):
+    def list_open_local_orders(self, *, mode: str | None = None, market: str = "FUTURES"):
+        del mode, market
         return [
             order
             for order in self.orders.values()
@@ -706,6 +716,8 @@ def test_futures_observation_to_paper_position_path() -> None:
         symbol="BTCUSDT",
         closes=(Decimal("100"), Decimal("101")),
         captured_at=captured,
+        mark_price=Decimal("100"),
+        last_price=Decimal("100"),
             net_spot_flow=Decimal("8"),
             futures_trade_flow=Decimal("8"),
             cvd_change=Decimal("8"),
@@ -806,3 +818,180 @@ def test_order_5xx_never_resubmits_and_halts_when_unresolved(monkeypatch) -> Non
     assert client.lookup_calls == 1
     assert store.halted is True
     assert store.orders[result.order_id]["status"] == "UNKNOWN"
+
+
+def _live_client():
+    class Client:
+        def __init__(self):
+            self.create_calls = 0
+
+        def create_order(self, **kwargs):
+            del kwargs
+            self.create_calls += 1
+            return {"orderId": "1", "status": "NEW", "executedQty": "0"}
+
+    return Client()
+
+
+def test_live_trading_disabled_does_not_send_order(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "secret")
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        ),
+    )
+    intent = _intent()
+    with pytest.raises(ExecutionRejected, match="LIVE_TRADING_ENABLED"):
+        executor.submit(intent, _risk(intent), market=_market())
+    assert client.create_calls == 0
+
+
+def test_live_confirmation_token_missing_does_not_send_order(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.delenv("LIVE_CONFIRMATION_TOKEN", raising=False)
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "secret")
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        ),
+    )
+    intent = _intent()
+    with pytest.raises(ExecutionRejected, match="LIVE_CONFIRMATION_TOKEN"):
+        executor.submit(intent, _risk(intent), market=_market())
+    assert client.create_calls == 0
+
+
+def test_live_bian_confirmation_missing_does_not_send_order(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret")
+    monkeypatch.delenv("BIAN_LIVE_CONFIRMATION", raising=False)
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        ),
+    )
+    intent = _intent()
+    with pytest.raises(ExecutionRejected, match="BIAN_LIVE_CONFIRMATION"):
+        executor.submit(intent, _risk(intent), market=_market())
+    assert client.create_calls == 0
+
+
+def test_live_confirmation_mismatch_does_not_send_order(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "other")
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        ),
+    )
+    intent = _intent()
+    with pytest.raises(ExecutionRejected, match="mismatch"):
+        executor.submit(intent, _risk(intent), market=_market())
+    assert client.create_calls == 0
+
+
+def test_live_authorization_allows_order_mutation(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "secret")
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        ),
+    )
+    intent = _intent()
+    result = executor.submit(intent, _risk(intent), market=_market())
+    assert result.status == "ACKNOWLEDGED"
+    assert client.create_calls == 1
+
+
+def test_direct_live_executor_bypass_fails_closed(monkeypatch) -> None:
+    client = _live_client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.delenv("LIVE_CONFIRMATION_TOKEN", raising=False)
+    monkeypatch.delenv("BIAN_LIVE_CONFIRMATION", raising=False)
+    executor = BinanceExecutor(
+        store=MemoryStore(),
+        config=ExecutionConfig(mode="live"),
+        client_config=ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="present-but-unused",
+        ),
+    )
+    intent = _intent()
+    with pytest.raises(ExecutionRejected):
+        executor.submit(intent, _risk(intent), market=_market())
+    assert client.create_calls == 0
+
+
+def test_paper_executor_does_not_read_testnet_position(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_MODE", "testnet")
+    store = MemoryStore()
+    store.upsert_position(
+        "BTCUSDT",
+        quantity=Decimal("9"),
+        average_price=Decimal("100"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        position_side="LONG",
+        mode="testnet",
+    )
+    executor = PaperExecutor(
+        store=store,
+        config=ExecutionConfig(mode="paper", fee_rate=Decimal("0"), slippage_bps=Decimal("0")),
+    )
+    intent = _intent()
+    result = executor.submit(intent, _risk(intent), market=_market(ask_price=Decimal("100"), bid_price=Decimal("100")))
+    assert result.status == "FILLED"
+    paper = store.get_position("BTCUSDT", mode="paper")
+    testnet = store.get_position("BTCUSDT", mode="testnet")
+    assert paper is not None
+    assert paper["quantity"] == Decimal("0.1")
+    assert testnet["quantity"] == Decimal("9")

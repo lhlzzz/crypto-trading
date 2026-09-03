@@ -932,3 +932,12 @@ def test_startup_reconciliation_failure_halts(monkeypatch) -> None:
     monkeypatch.setenv("BIAN_TESTNET_SYMBOLS", "BTCUSDT")
     with pytest.raises(SystemExit, match="startup reconciliation blocked"):
         _startup_recovery("testnet", StoreStub())
+
+
+def test_default_environment_keeps_live_allowed_false(monkeypatch) -> None:
+    from runtime_gate import evaluate_runtime_gate
+
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.delenv("BIAN_LIVE_CONFIRMATION", raising=False)
+    gate = evaluate_runtime_gate(mode="paper")
+    assert gate.live_allowed is False

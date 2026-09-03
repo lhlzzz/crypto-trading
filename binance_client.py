@@ -789,6 +789,17 @@ class FuturesPrivateClient:
         operation: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
+        if (
+            self.config.mode == "live"
+            and method.upper() == "POST"
+            and path.rstrip("/") == "/fapi/v1/order"
+        ):
+            from runtime_gate import LiveAuthorizationError, authorize_live_order_mutation
+
+            try:
+                authorize_live_order_mutation(mode="live")
+            except LiveAuthorizationError as exc:
+                raise BinanceAuthError(str(exc)) from exc
         return _futures_order_request(
             self.config,
             method,

@@ -26,6 +26,36 @@ def _mode() -> str:
     return os.environ.get("BIAN_MODE", "paper").strip().lower()
 
 
+class LiveAuthorizationError(RuntimeError):
+    """Live order mutation is blocked until confirmation matches."""
+
+
+def live_confirmation_ok() -> bool:
+    """Canonical live confirmation: both tokens present and identical."""
+    expected = os.environ.get("LIVE_CONFIRMATION_TOKEN")
+    supplied = os.environ.get("BIAN_LIVE_CONFIRMATION")
+    return bool(expected and supplied and supplied == expected)
+
+
+def authorize_live_order_mutation(*, mode: str) -> None:
+    """Fail closed before any live order mutation. Non-live is a no-op."""
+    resolved = str(mode or "").strip().lower()
+    if resolved != "live":
+        return
+    if not _enabled("LIVE_TRADING_ENABLED"):
+        raise LiveAuthorizationError(
+            "live mode is hard-blocked unless LIVE_TRADING_ENABLED=true"
+        )
+    expected = os.environ.get("LIVE_CONFIRMATION_TOKEN")
+    supplied = os.environ.get("BIAN_LIVE_CONFIRMATION")
+    if not expected or not str(expected).strip():
+        raise LiveAuthorizationError("live mode requires LIVE_CONFIRMATION_TOKEN")
+    if not supplied or not str(supplied).strip():
+        raise LiveAuthorizationError("live mode requires BIAN_LIVE_CONFIRMATION")
+    if supplied != expected:
+        raise LiveAuthorizationError("live confirmation token mismatch")
+
+
 USER_STREAM_OPEN_STATES = frozenset({"LIVE", "OK"})
 USER_STREAM_BLOCKED_STATES = frozenset(
     {"DISCONNECTED", "CONNECTING", "RECONNECTING", "DEGRADED", "FAILED", "UNKNOWN"}
@@ -662,9 +692,7 @@ def evaluate_runtime_gate(
     if not kill_switch_ok:
         reasons.append("KILL_SWITCH_ACTIVE")
 
-    expected_token = os.environ.get("LIVE_CONFIRMATION_TOKEN")
-    supplied_token = os.environ.get("BIAN_LIVE_CONFIRMATION")
-    confirmation_ok = resolved_mode != "live" or bool(expected_token and supplied_token == expected_token)
+    confirmation_ok = resolved_mode != "live" or live_confirmation_ok()
     if not confirmation_ok:
         reasons.append("LIVE_CONFIRMATION_MISSING")
 

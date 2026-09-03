@@ -185,7 +185,7 @@ def test_large_order_is_reduced_to_max_order_limit() -> None:
 
 def test_exchange_rules_normalize_quantity_and_price() -> None:
     intent = _intent(
-        quantity=Decimal("0.1099"),
+        quantity=Decimal("0.109"),
         order_type="LIMIT",
         price=Decimal("100.019"),
     )
@@ -575,6 +575,65 @@ def test_symbol_isolation_allows_healthy_symbol_when_another_is_stale() -> None:
     )
     assert pepe.decision == "DENY"
     assert doge.decision == "ALLOW"
+
+
+def test_below_min_qty_is_denied() -> None:
+    decision = RiskGate().evaluate(
+        _intent(quantity=Decimal("0.0001")),
+        _context(),
+    )
+    assert decision.decision == "DENY"
+    assert "minimum quantity" in decision.reason
+
+
+def test_above_max_qty_is_denied() -> None:
+    rules = ExchangeRules(
+        symbol="BTCUSDT",
+        min_qty=Decimal("0.001"),
+        step_size=Decimal("0.001"),
+        tick_size=Decimal("0.01"),
+        min_notional=Decimal("5"),
+        max_qty=Decimal("0.05"),
+    )
+    decision = RiskGate().evaluate(_intent(quantity=Decimal("0.1")), _context(exchange_rules=rules))
+    assert decision.decision == "DENY"
+    assert "maximum quantity" in decision.reason
+
+
+def test_unaligned_step_size_is_denied() -> None:
+    decision = RiskGate().evaluate(
+        _intent(quantity=Decimal("0.0015")),
+        _context(),
+    )
+    assert decision.decision == "DENY"
+    assert "step size" in decision.reason
+
+
+def test_below_min_notional_is_denied() -> None:
+    rules = ExchangeRules(
+        symbol="BTCUSDT",
+        min_qty=Decimal("0.001"),
+        step_size=Decimal("0.001"),
+        tick_size=Decimal("0.01"),
+        min_notional=Decimal("50"),
+    )
+    decision = RiskGate().evaluate(_intent(quantity=Decimal("0.001")), _context(exchange_rules=rules))
+    assert decision.decision == "DENY"
+    assert "minimum notional" in decision.reason
+
+
+def test_valid_quantity_is_allowed() -> None:
+    decision = RiskGate().evaluate(_intent(quantity=Decimal("0.1")), _context())
+    assert decision.decision == "ALLOW"
+
+
+def test_missing_live_liquidation_evidence_denies_open() -> None:
+    decision = RiskGate().evaluate(
+        _intent(),
+        _context(mode="live", liquidation_price=None, liquidation_distance_percent=None),
+    )
+    assert decision.decision in {"DENY", "HALT"}
+    assert "liquidation" in decision.reason
 
 
 def test_global_market_data_failure_halts() -> None:

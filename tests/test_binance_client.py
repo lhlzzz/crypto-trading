@@ -230,6 +230,25 @@ def test_private_live_client_requires_confirmation_token() -> None:
         FuturesPrivateClient(config)
 
 
+def test_live_create_order_requires_matching_confirmation(monkeypatch) -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(
+            mode="live",
+            api_key="key",
+            api_secret="secret",
+            live_trading_enabled=True,
+            live_confirmation_token="secret",
+        )
+    )
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "secret")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "other")
+    with patch("scripts.bian_market.urllib.request.urlopen") as urlopen:
+        with pytest.raises(BinanceAuthError, match="mismatch"):
+            client.create_order("BTCUSDT", "BUY", "MARKET", quantity="0.01")
+    assert urlopen.call_count == 0
+
+
 def test_spot_private_client_is_removed() -> None:
     import binance_client
     assert not hasattr(binance_client, "PrivateClient")
@@ -466,10 +485,13 @@ def test_futures_private_create_order_requires_quantity() -> None:
         client.create_order("BTCUSDT", "BUY", "MARKET")
 
 
-def test_futures_private_live_order_uses_production_host() -> None:
+def test_futures_private_live_order_uses_production_host(monkeypatch) -> None:
     response = MagicMock()
     response.read.return_value = b'{"orderId":2}'
     response.__enter__.return_value = response
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("LIVE_CONFIRMATION_TOKEN", "confirm")
+    monkeypatch.setenv("BIAN_LIVE_CONFIRMATION", "confirm")
     client = FuturesPrivateClient(
         ClientConfig(
             mode="live",

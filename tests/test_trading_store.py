@@ -630,3 +630,99 @@ def test_list_reconciliation_orders_uses_explicit_mode_and_includes_filled():
     assert params[0] == "testnet"
     assert "PENDING" not in sql
     assert "FILLED" not in sql
+
+
+def _halt_cursor(event_type: str, mode: str, market: str = "FUTURES"):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        (event_type,),
+        ("00000000-0000-0000-0000-000000000001",),
+        ("00000000-0000-0000-0000-000000000002",),
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    return cursor, connection
+
+
+def test_testnet_halt_survives_paper_resume():
+    store = TradingStore("postgresql://test")
+    cursor, connection = _halt_cursor("TRADING_HALTED", "testnet")
+    with patch("psycopg2.connect", return_value=connection):
+        halted = store.is_halted(mode="testnet")
+        store.set_halt(False, reason="paper resume", source="test", mode="paper")
+    sql = cursor.execute.call_args_list[0].args[0]
+    params = cursor.execute.call_args_list[0].args[1]
+    assert "AND mode = %s" in sql
+    assert "AND market = %s" in sql
+    assert params == ("testnet", "FUTURES")
+    assert halted is True
+    resume_params = cursor.execute.call_args_list[1].args[1]
+    assert resume_params[4] == "paper"
+    assert resume_params[5] == "FUTURES"
+
+
+def test_live_halt_survives_testnet_resume():
+    store = TradingStore("postgresql://test")
+    cursor, connection = _halt_cursor("TRADING_HALTED", "live")
+    with patch("psycopg2.connect", return_value=connection):
+        halted = store.is_halted(mode="live")
+        store.set_halt(False, reason="testnet resume", source="test", mode="testnet")
+    params = cursor.execute.call_args_list[0].args[1]
+    assert params == ("live", "FUTURES")
+    assert halted is True
+    resume_params = cursor.execute.call_args_list[1].args[1]
+    assert resume_params[4] == "testnet"
+    assert resume_params[5] == "FUTURES"
+
+
+def test_paper_halt_survives_testnet_resume():
+    store = TradingStore("postgresql://test")
+    cursor, connection = _halt_cursor("TRADING_HALTED", "paper")
+    with patch("psycopg2.connect", return_value=connection):
+        halted = store.is_halted(mode="paper")
+        store.set_halt(False, reason="testnet resume", source="test", mode="testnet")
+    params = cursor.execute.call_args_list[0].args[1]
+    assert params == ("paper", "FUTURES")
+    assert halted is True
+
+
+def test_current_mode_resume_clears_own_halt():
+    store = TradingStore("postgresql://test")
+    cursor, connection = _halt_cursor("TRADING_RESUMED", "testnet")
+    with patch("psycopg2.connect", return_value=connection):
+        halted = store.is_halted(mode="testnet")
+    params = cursor.execute.call_args.args[1]
+    assert params == ("testnet", "FUTURES")
+    assert halted is False
+
+
+def test_spot_event_does_not_clear_futures_halt():
+    store = TradingStore("postgresql://test")
+    cursor, connection = _halt_cursor("TRADING_HALTED", "testnet")
+    with patch("psycopg2.connect", return_value=connection):
+        halted = store.is_halted(mode="testnet", market="FUTURES")
+        store.set_halt(False, reason="spot resume", source="test", mode="testnet", market="SPOT")
+    params = cursor.execute.call_args_list[0].args[1]
+    assert params == ("testnet", "FUTURES")
+    assert halted is True
+    resume_params = cursor.execute.call_args_list[1].args[1]
+    assert resume_params[4] == "testnet"
+    assert resume_params[5] == "SPOT"
+
+
+def test_db_unavailable_is_halted_fails_closed():
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", side_effect=RuntimeError("db down")):
+        assert store.is_halted(mode="paper") is True
+
+
+def test_migration_does_not_fabricate_liquidation_price():
+    from scripts.database import _migrate_futures_columns
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _migrate_futures_columns(cursor)
+    statements = "\n".join(str(call.args[0]) for call in cursor.execute.call_args_list)
+    assert "liquidation_price = entry_price" not in statements
+    assert "positions_active_liquidation_positive" not in statements or "DROP CONSTRAINT" in statements
