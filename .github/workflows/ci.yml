@@ -54,7 +54,9 @@ jobs:
           grep -n 'UNAUTHORIZED_SYMBOL' risk.py runtime_gate.py
           grep -n 'is_canonical_futures_symbol' binance_client.py
       - name: Tests
-        run: pytest -q
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q
       - name: Compile
         run: python -m compileall -q -x '.venv|__pycache__' .
       - name: Whitespace
