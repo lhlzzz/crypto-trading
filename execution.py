@@ -12,6 +12,7 @@ from uuid import UUID
 
 from binance_client import (
     BinanceConnectionError,
+    BinanceOrderError,
     BinanceRateLimitError,
     ClientConfig,
     FuturesPrivateClient,
@@ -1370,11 +1371,47 @@ class BinanceExecutor(_BaseExecutor):
                     else str(local["client_order_id"])
                 ),
             )
+        except BinanceOrderError as exc:
+            return self._reconcile_cancel_business_error(order_id, local, exc)
         except Exception as exc:
             if not self._is_uncertain_transport_error(exc):
-                raise
+                return self._reconcile_cancel_business_error(order_id, local, exc)
             return self._resolve_uncertain_existing_order(order_id, local, exc)
         status = _normal_status(str(response.get("status", "CANCELED")))
+        if status == "UNKNOWN":
+            return self._halt_unknown_order(
+                order_id,
+                local,
+                response,
+                reason="cancel response returned UNKNOWN status",
+                event_type="CANCEL_UNKNOWN",
+            )
+        if status in {"ACKNOWLEDGED", "PARTIALLY_FILLED", "CREATED", "RISK_APPROVED", "SUBMITTED"}:
+            self.store.update_order(
+                order_id,
+                status=status,
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None
+                    else local.get("exchange_order_id")
+                ),
+                payload=response,
+            )
+            self._event(order_id, "CANCEL_STILL_OPEN", status, response=response)
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=UUID(str(local["intent_id"])),
+                status=status,
+                client_order_id=str(local["client_order_id"]),
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None
+                    else local.get("exchange_order_id")
+                ),
+                reason="cancel request did not cancel; Binance order is still open",
+            )
         self.store.update_order(
             order_id,
             status=status,
@@ -1453,6 +1490,7 @@ class BinanceExecutor(_BaseExecutor):
                 ),
                 payload=response,
             )
+            self._event(order_id, "CANCEL_STILL_OPEN", status, response=response)
             self._event(order_id, "STILL_OPEN", status, response=response)
             return ExecutionResult(
                 order_id=order_id,
@@ -1545,6 +1583,14 @@ class BinanceExecutor(_BaseExecutor):
             ),
         )
         status = _normal_status(str(response.get("status", "UNKNOWN")))
+        if status == "UNKNOWN":
+            return self._halt_unknown_order(
+                order_id,
+                local,
+                response,
+                reason="order lookup returned UNKNOWN status",
+                event_type="ORDER_STATUS_UNKNOWN",
+            )
         executed_quantity = Decimal(str(response.get("executedQty", "0")))
         self.store.update_order(
             order_id,
@@ -1570,6 +1616,81 @@ class BinanceExecutor(_BaseExecutor):
                 else local.get("exchange_order_id")
             ),
         )
+
+    def _halt_unknown_order(
+        self,
+        order_id: UUID,
+        local: dict[str, Any],
+        response: dict[str, Any] | None,
+        *,
+        reason: str,
+        event_type: str,
+    ) -> ExecutionResult:
+        self.store.update_order(
+            order_id,
+            status="UNKNOWN",
+            payload=response or {"error": reason},
+        )
+        self._event(order_id, event_type, "UNKNOWN", response=response, error=reason)
+        self._event(order_id, "ORDER_UNKNOWN", "UNKNOWN", response=response, error=reason)
+        self._store_call("set_halt", True, reason=reason, source="execution")
+        return ExecutionResult(
+            order_id=order_id,
+            intent_id=UUID(str(local["intent_id"])),
+            status="UNKNOWN",
+            client_order_id=str(local["client_order_id"]),
+            exchange_order_id=(
+                str(response["orderId"])
+                if response and response.get("orderId") is not None
+                else local.get("exchange_order_id")
+            ),
+            reason=reason,
+        )
+
+    def _reconcile_cancel_business_error(
+        self,
+        order_id: UUID,
+        local: dict[str, Any],
+        error: Exception,
+    ) -> ExecutionResult:
+        """A rejected cancel is not a local CANCELLED. Fetch exchange truth."""
+        result = self._resolve_uncertain_existing_order(order_id, local, error)
+        if result.status in {"ACKNOWLEDGED", "PARTIALLY_FILLED", "CREATED", "RISK_APPROVED", "SUBMITTED"}:
+            self._event(
+                order_id,
+                "CANCEL_REJECTED",
+                result.status,
+                error=str(error),
+            )
+            return ExecutionResult(
+                order_id=result.order_id,
+                intent_id=result.intent_id,
+                status=result.status,
+                client_order_id=result.client_order_id,
+                executed_quantity=result.executed_quantity,
+                exchange_order_id=result.exchange_order_id,
+                reason="CANCEL_REJECTED",
+            )
+        if result.status == "UNKNOWN":
+            return result
+        if result.status == "CANCELLED":
+            self._event(
+                order_id,
+                "CANCEL_RECONCILED",
+                result.status,
+                error=str(error),
+                response={"cancel_error": str(error)},
+            )
+            return ExecutionResult(
+                order_id=result.order_id,
+                intent_id=result.intent_id,
+                status=result.status,
+                client_order_id=result.client_order_id,
+                executed_quantity=result.executed_quantity,
+                exchange_order_id=result.exchange_order_id,
+                reason="CANCEL_RECONCILED",
+            )
+        return result
 
     def get_open_orders(self) -> list[ExecutionResult]:
         results: list[ExecutionResult] = []

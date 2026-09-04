@@ -12,6 +12,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
       - name: Dangerous-pattern checks
         run: |
           set -euo pipefail
@@ -48,6 +53,8 @@ jobs:
           grep -n 'CANONICAL_FUTURES_SYMBOLS' trade_intent.py
           grep -n 'UNAUTHORIZED_SYMBOL' risk.py runtime_gate.py
           grep -n 'is_canonical_futures_symbol' binance_client.py
+      - name: Tests
+        run: pytest -q
       - name: Compile
         run: python -m compileall -q -x '.venv|__pycache__' .
       - name: Whitespace

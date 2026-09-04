@@ -543,17 +543,6 @@ class RiskGate:
         if context.evidence_conflict and entry:
             return self._deny(intent, "positioning evidence is conflicted")
         risk_driven_reduction = False
-        if entry and (
-            context.meme_risk_tier == "BLOCK" or intent.meme_risk_tier == "BLOCK"
-        ):
-            return self._deny(intent, "symbol is blocked")
-        if entry and context.is_meme is True:
-            return self._deny(intent, "meme symbol is not in the canonical universe")
-        if entry and (
-            context.meme_risk_tier == "OBSERVE"
-            or intent.meme_risk_tier == "OBSERVE"
-        ):
-            return self._deny(intent, "symbol is observe-only")
         if (
             entry
             and
@@ -728,9 +717,6 @@ class RiskGate:
 
         max_order = self.limits.max_order_usdt
         max_position = self.limits.max_position_usdt
-        if context.meme_risk_tier == "REDUCED" or intent.meme_risk_tier == "REDUCED":
-            max_order = max_order / Decimal("2")
-            max_position = max_position / Decimal("2")
 
         positioning_reduced = False
         if (
@@ -783,24 +769,21 @@ class RiskGate:
             projected_position = normalized_notional
             if projected_position > max_position:
                 return self._deny(intent, "maximum position notional exceeded")
-            if intent.meme_risk_tier in {"TRADEABLE", "REDUCED"} or context.meme_risk_tier in {
-                "TRADEABLE", "REDUCED"
-            }:
-                if (
-                    context.symbol_notional + projected_position
-                    > self.limits.max_symbol_notional_usdt
-                ):
-                    return self._deny(intent, "maximum symbol exposure exceeded")
-                if (
-                    context.total_notional + projected_position
-                    > self.limits.max_portfolio_notional_usdt
-                ):
-                    return self._deny(intent, "maximum total exposure exceeded")
-                if (
-                    context.directional_exposure + projected_position
-                    > self.limits.max_directional_exposure_usdt
-                ):
-                    return self._deny(intent, "maximum directional exposure exceeded")
+            if (
+                context.symbol_notional + projected_position
+                > self.limits.max_symbol_notional_usdt
+            ):
+                return self._deny(intent, "maximum symbol exposure exceeded")
+            if (
+                context.total_notional + projected_position
+                > self.limits.max_portfolio_notional_usdt
+            ):
+                return self._deny(intent, "maximum total exposure exceeded")
+            if (
+                context.directional_exposure + projected_position
+                > self.limits.max_directional_exposure_usdt
+            ):
+                return self._deny(intent, "maximum directional exposure exceeded")
             if context.liquidation_price is None:
                 return self._deny(intent, "liquidation price is not verified")
             if context.liquidation_distance_percent is None:

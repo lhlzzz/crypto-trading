@@ -259,7 +259,7 @@ class BianMarketTests(unittest.TestCase):
             for call in cursor.execute.call_args_list
         )
         self.assertIn(
-            "ON CONFLICT (run_id, symbol) WHERE run_id IS NOT NULL",
+            "ON CONFLICT (run_id, symbol, market) WHERE run_id IS NOT NULL",
             statements,
         )
 

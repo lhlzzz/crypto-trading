@@ -299,10 +299,13 @@ def test_live_preflight_stays_blocked_until_release_gates_pass() -> None:
 
 
 def test_alpha_empty_frames_are_insufficient_sample(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_VALIDATION_SESSION_ID", "alpha-session")
     monkeypatch.setattr(vr, "_load_alpha_frames", lambda: [])
     result = vr.run_alpha_stage()
     assert result["alpha_status"] == "INSUFFICIENT_SAMPLE"
     assert result["status"] == "PASSED"
+    assert result["dataset_scope"] == "validation_session"
+    assert result["dataset_session_ids"] == ["alpha-session"]
 
 
 def test_paper_runner_accepts_duration_and_shadow_mode(monkeypatch) -> None:
@@ -526,6 +529,7 @@ def test_paper_stage_uses_two_child_processes(monkeypatch) -> None:
 def test_alpha_stage_loads_persisted_frames(monkeypatch) -> None:
     from backtesting import AlphaGateResult
 
+    monkeypatch.setenv("BIAN_VALIDATION_SESSION_ID", "alpha-session")
     monkeypatch.setattr(vr, "_load_alpha_frames", lambda: ["frame"])
 
     def fake_gate(frames, **kwargs):
@@ -548,6 +552,50 @@ def test_alpha_stage_loads_persisted_frames(monkeypatch) -> None:
     result = vr.run_alpha_stage()
     assert result["alpha_status"] == "INSUFFICIENT_SAMPLE"
     assert result["frame_count"] == 1
+
+
+def test_alpha_does_not_mix_validation_sessions(monkeypatch) -> None:
+    captured = {}
+
+    class Store:
+        def positioning_replay_frames(self, **kwargs):
+            captured.update(kwargs)
+            return []
+
+    monkeypatch.setenv("BIAN_VALIDATION_SESSION_ID", "session-a")
+    monkeypatch.delenv("BIAN_ALPHA_DATASET_SESSION_IDS", raising=False)
+    monkeypatch.setattr(vr, "TradingStore", lambda: Store())
+    frames = vr._load_alpha_frames()
+    assert frames == []
+    assert captured["validation_session_id"] == "session-a"
+    assert "research_session_ids" not in captured
+
+
+def test_alpha_rejects_wrong_market() -> None:
+    class Frame:
+        symbol = "BTCUSDT"
+        market = "SPOT"
+        strategy_version = "positioning-v1"
+        config_hash = "abc"
+        is_meme = False
+        source_timestamps = {"spot_trade": {}}
+
+    with pytest.raises(ValueError, match="ALPHA_DATASET_WRONG_MARKET"):
+        vr._assert_alpha_dataset_homogeneous([Frame()])
+
+
+def test_alpha_rejects_wrong_strategy_version() -> None:
+    class Frame:
+        def __init__(self, version):
+            self.symbol = "BTCUSDT"
+            self.market = "FUTURES"
+            self.strategy_version = version
+            self.config_hash = "abc"
+            self.is_meme = False
+            self.source_timestamps = {}
+
+    with pytest.raises(ValueError, match="ALPHA_DATASET_MIXED_STRATEGY_VERSION"):
+        vr._assert_alpha_dataset_homogeneous([Frame("v1"), Frame("v2")])
 
 
 def test_testnet_with_credentials_does_not_pass_preflight_only(monkeypatch) -> None:
@@ -1033,6 +1081,7 @@ def test_testnet_acceptance_requires_structured_lifecycle_evidence() -> None:
 def test_alpha_stage_reports_explicit_sample_fields(monkeypatch) -> None:
     from backtesting import AlphaGateResult
 
+    monkeypatch.setenv("BIAN_VALIDATION_SESSION_ID", "alpha-session")
     monkeypatch.setattr(vr, "_load_alpha_frames", lambda: ["frame"])
 
     def fake_gate(frames, **kwargs):

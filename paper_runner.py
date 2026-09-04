@@ -454,6 +454,7 @@ def paper_shadow_attribution(
     frames = store.positioning_replay_frames(
         symbol,
         source_ttl_sec=engine.config.source_ttl_sec,
+        validation_session_id=store._session_id(),
     )
     replay = replay_positioning_frames(frames, engine=engine)
     payload = replay.as_dict()
@@ -631,9 +632,7 @@ def _risk_context(
         liquidity_score=intent.liquidity_score,
         data_quality_score=intent.data_quality_score,
         evidence_conflict=intent.positioning_state == "CONFLICTED",
-        # An intent without an explicit, persisted Futures universe
-        # classification is observe-only; it must not default to tradeable.
-        meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
+        meme_risk_tier=intent.meme_risk_tier or "TRADEABLE",
         is_meme=intent.is_meme,
         account_snapshot=account_snapshot,
         account_state_error=account_state_error,

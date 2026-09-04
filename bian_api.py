@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from scripts.database import read_overview
@@ -36,6 +37,17 @@ BIAN_API_DOCS_ENABLED = _env_enabled(
     "BIAN_API_DOCS_ENABLED",
     default=BIAN_ENVIRONMENT != "production",
 )
+
+
+def _api_token() -> str:
+    return os.environ.get("BIAN_API_TOKEN", "").strip()
+
+
+def production_api_requires_token(environ: dict[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    environment = str(values.get("BIAN_ENVIRONMENT", "development")).strip().lower()
+    token = str(values.get("BIAN_API_TOKEN", "")).strip()
+    return environment != "production" or bool(token)
 
 
 def _csv_env(name: str, default: str) -> list[str]:
@@ -201,15 +213,36 @@ app.add_middleware(
         "http://127.0.0.1:3000,http://localhost:3000",
     ),
     allow_methods=["GET"],
-    allow_headers=["Accept", "Content-Type"],
+    allow_headers=["Accept", "Content-Type", "Authorization"],
 )
+
+
+def _trusted_hosts() -> list[str]:
+    hosts = _csv_env("BIAN_TRUSTED_HOSTS", "127.0.0.1,localhost,testserver")
+    return [host for host in hosts if host != "*"]
+
+
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=_csv_env(
-        "BIAN_TRUSTED_HOSTS",
-        "127.0.0.1,localhost,testserver",
-    ),
+    allowed_hosts=_trusted_hosts(),
 )
+
+
+@app.middleware("http")
+async def require_operator_token(request: Request, call_next):
+    environment = BIAN_ENVIRONMENT
+    token = _api_token()
+    if environment == "production" and not token:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "BIAN_API_TOKEN is required in production"},
+        )
+    if token:
+        header = request.headers.get("authorization", "")
+        expected = f"Bearer {token}"
+        if header != expected:
+            return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
 
 
 @app.get("/health", response_model=BianHealth)

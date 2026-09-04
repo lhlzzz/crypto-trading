@@ -162,6 +162,30 @@ def test_user_stream_dispatches_order_update_and_reconnect_reconcile() -> None:
     assert rest.created >= 1
 
 
+def test_event_dedupe_is_bounded(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_WS_EVENT_DEDUPE_MAX", "3")
+    client = UserStreamClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+        rest_client=FakeRest(),
+    )
+    for index in range(5):
+        client._message_received(
+            {
+                "e": "ORDER_TRADE_UPDATE",
+                "E": index,
+                "o": {
+                    "s": "BTCUSDT",
+                    "c": f"BIAN-{index}",
+                    "i": index,
+                    "X": "NEW",
+                    "x": "NEW",
+                    "z": "0",
+                },
+            }
+        )
+    assert len(client._seen_event_ids) == 3
+
+
 def test_unknown_and_disconnect_trigger_reconciliation() -> None:
     rest = FakeRest()
     first = FakeWebsocket()

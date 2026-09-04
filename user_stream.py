@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import random
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 from datetime import datetime, timezone
@@ -216,7 +217,11 @@ class UserStreamClient:
             os.environ.get("BIAN_WS_MAX_BACKOFF_SEC", "16")
         )
         self._keepalive_sec = max(0.01, float(keepalive_sec))
-        self._seen_event_ids: set[str] = set()
+        self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
+        self._seen_event_limit = max(
+            1,
+            int(os.environ.get("BIAN_WS_EVENT_DEDUPE_MAX", "10000")),
+        )
         self.stream_failure_reason: str | None = None
         self.state = "DISCONNECTED"
         self.connection_attempts = 0
@@ -343,7 +348,9 @@ class UserStreamClient:
         if normalized.event_id is not None:
             if normalized.event_id in self._seen_event_ids:
                 return
-            self._seen_event_ids.add(normalized.event_id)
+            self._seen_event_ids[normalized.event_id] = None
+            while len(self._seen_event_ids) > self._seen_event_limit:
+                self._seen_event_ids.popitem(last=False)
         _dispatch(self.on_event, normalized)
 
     async def _keepalive_loop(self) -> None:

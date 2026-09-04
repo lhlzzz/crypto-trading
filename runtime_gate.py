@@ -16,6 +16,30 @@ from risk import FuturesAccountSnapshot, RiskLimits, reject_legacy_meme_risk_env
 from trade_intent import CANONICAL_FUTURES_SYMBOLS, is_canonical_futures_symbol
 
 
+def _account_row_symbol(row: Any) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return str(
+        row.get("symbol")
+        or row.get("s")
+        or row.get("origSymbol")
+        or ""
+    ).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
+
+
+def _unauthorized_account_symbols(rows: Any) -> tuple[str, ...]:
+    if not isinstance(rows, (tuple, list)):
+        return ()
+    unauthorized: list[str] = []
+    for row in rows:
+        symbol = _account_row_symbol(row)
+        if not symbol:
+            continue
+        if not is_canonical_futures_symbol(symbol):
+            unauthorized.append(symbol)
+    return tuple(dict.fromkeys(unauthorized))
+
+
 def _enabled(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -750,8 +774,18 @@ def evaluate_runtime_gate(
                 value == expected_leverage for value in symbol_leverage.values()
             )
             margin_mode_ok = bool(selected_symbols) and margin_mode_ok
-            exchange_positions_ok = isinstance(snapshot.positions, tuple)
-            open_orders_ok = isinstance(snapshot.open_orders, tuple)
+            unauthorized_positions = _unauthorized_account_symbols(snapshot.positions)
+            unauthorized_orders = _unauthorized_account_symbols(snapshot.open_orders)
+            exchange_positions_ok = (
+                isinstance(snapshot.positions, tuple) and not unauthorized_positions
+            )
+            open_orders_ok = (
+                isinstance(snapshot.open_orders, tuple) and not unauthorized_orders
+            )
+            if unauthorized_positions:
+                reasons.append("UNAUTHORIZED_EXCHANGE_POSITION")
+            if unauthorized_orders:
+                reasons.append("UNAUTHORIZED_EXCHANGE_ORDER")
             _store_account_health(
                 resolved_mode,
                 {
@@ -800,6 +834,12 @@ def evaluate_runtime_gate(
         reasons.append("SERVER_TIME_NOT_VERIFIED")
     if resolved_mode != "paper" and not leverage_ok:
         reasons.append("LEVERAGE_PARITY_NOT_VERIFIED")
+    if resolved_mode != "paper" and not exchange_positions_ok:
+        if "UNAUTHORIZED_EXCHANGE_POSITION" not in reasons:
+            reasons.append("UNAUTHORIZED_EXCHANGE_POSITION")
+    if resolved_mode != "paper" and not open_orders_ok:
+        if "UNAUTHORIZED_EXCHANGE_ORDER" not in reasons:
+            reasons.append("UNAUTHORIZED_EXCHANGE_ORDER")
 
     health_rows: list[Mapping[str, Any]] = []
     if data_health_ok is None:

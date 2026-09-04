@@ -35,6 +35,8 @@ try:
 except ModuleNotFoundError:
     from scripts.database import configured_dsn, ensure_schema, record_collection_failure
 
+# Historical/research Spot REST hosts only. Futures runtime observation
+# uses FUTURES_HOSTS. Do not call SPOT_HOSTS from execution, risk, or gate.
 SPOT_HOSTS = (
     "https://api.binance.com/api/v3",
     "https://data-api.binance.vision/api/v3",
@@ -389,7 +391,7 @@ def _normalize_market_data_event(
     """Validate one persisted observation against the shared data envelope."""
     envelope = _market_data_envelope_type().create(
         source=str(event.get("source") or default_source),
-        market=str(event.get("market", "SPOT")).upper(),
+        market=str(event.get("market") or "UNKNOWN").upper(),
         symbol=str(event["symbol"]),
         event_type=str(event["event_type"]),
         source_timestamp=_event_datetime(event["source_timestamp"]),
@@ -1508,6 +1510,7 @@ def collect(limit: int = 20, *, run_id: str | None = None) -> dict[str, Any]:
         "markets": [
             {
                 "symbol": str(row["symbol"]),
+                "market": "FUTURES",
                 "last_price": _decimal(row.get("lastPrice")),
                 "price_change_percent": _decimal(row.get("priceChangePercent")),
                 "quote_volume": _decimal(row.get("quoteVolume")),
@@ -1735,9 +1738,9 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                     """
                     INSERT INTO bian_market_snapshots(
                         run_id, captured_at, symbol, last_price,
-                        price_change_percent, quote_volume, source_url, payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
-                    ON CONFLICT (run_id, symbol) WHERE run_id IS NOT NULL
+                        price_change_percent, quote_volume, source_url, market, payload
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CAST(%s AS JSONB))
+                    ON CONFLICT (run_id, symbol, market) WHERE run_id IS NOT NULL
                     DO UPDATE SET
                         captured_at = EXCLUDED.captured_at,
                         last_price = EXCLUDED.last_price,
@@ -1754,6 +1757,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                         market["price_change_percent"],
                         market["quote_volume"],
                         report["source_url"],
+                        str(market.get("market") or report.get("market") or "FUTURES").upper(),
                         json.dumps(market["payload"], default=str),
                     ),
                 )
@@ -1771,7 +1775,7 @@ def persist(report: dict[str, Any], dsn: str | None = None) -> None:
                     """,
                     (
                         event["event_id"], event["symbol"] if "symbol" in event else "",
-                        event.get("market", "SPOT"), event["event_type"],
+                        event.get("market") or "UNKNOWN", event["event_type"],
                         event["source_timestamp"], event["received_timestamp"],
                         event["latency_ms"], event.get("price"), event.get("quantity"),
                         event.get("notional"), event.get("direction"),

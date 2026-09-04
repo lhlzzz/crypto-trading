@@ -131,6 +131,30 @@ def test_health_reports_stale_data_as_degraded() -> None:
     assert response.json()["status"] == "degraded"
 
 
+def test_production_api_requires_token(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_ENVIRONMENT", "production")
+    monkeypatch.delenv("BIAN_API_TOKEN", raising=False)
+    import importlib
+
+    importlib.reload(bian_api)
+    with patch.object(bian_api, "read_overview", return_value=_report()):
+        response = TestClient(bian_api.app).get("/health")
+    assert response.status_code == 503
+    monkeypatch.setenv("BIAN_API_TOKEN", "secret-token")
+    importlib.reload(bian_api)
+    with patch.object(bian_api, "read_overview", return_value=_report()):
+        unauthorized = TestClient(bian_api.app).get("/health")
+        authorized = TestClient(bian_api.app).get(
+            "/health",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    monkeypatch.setenv("BIAN_ENVIRONMENT", "development")
+    monkeypatch.delenv("BIAN_API_TOKEN", raising=False)
+    importlib.reload(bian_api)
+
+
 def test_front_data_keeps_empty_database_result_valid() -> None:
     empty_report = {
         "database_status": {

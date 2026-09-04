@@ -127,6 +127,7 @@ def ensure_schema(dsn: str | None = None) -> None:
                     price_change_percent NUMERIC,
                     quote_volume NUMERIC,
                     source_url TEXT NOT NULL,
+                    market TEXT,
                     payload JSONB NOT NULL DEFAULT CAST('{}' AS JSONB)
                 )
                 """
@@ -139,14 +140,43 @@ def ensure_schema(dsn: str | None = None) -> None:
             )
             cursor.execute(
                 """
+                ALTER TABLE bian_market_snapshots
+                ADD COLUMN IF NOT EXISTS market TEXT
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE bian_market_snapshots
+                SET market = CASE
+                    WHEN source_url ILIKE '%fapi.binance%'
+                      OR source_url ILIKE '%fstream.binance%'
+                      OR source_url ILIKE '%binancefuture%'
+                        THEN 'FUTURES'
+                    WHEN source_url ILIKE '%/api/v3%'
+                      OR source_url ILIKE '%data-api.binance.vision%'
+                        THEN 'SPOT'
+                    ELSE 'UNKNOWN'
+                END
+                WHERE market IS NULL OR BTRIM(market) = ''
+                """
+            )
+            cursor.execute(
+                """
                 CREATE INDEX IF NOT EXISTS bian_market_snapshots_symbol_captured_idx
                 ON bian_market_snapshots(symbol, captured_at DESC)
                 """
             )
             cursor.execute(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS bian_market_snapshots_run_symbol_idx
-                ON bian_market_snapshots(run_id, symbol)
+                CREATE INDEX IF NOT EXISTS bian_market_snapshots_symbol_market_captured_idx
+                ON bian_market_snapshots(symbol, market, captured_at DESC)
+                """
+            )
+            cursor.execute("DROP INDEX IF EXISTS bian_market_snapshots_run_symbol_idx")
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS bian_market_snapshots_run_symbol_market_idx
+                ON bian_market_snapshots(run_id, symbol, market)
                 WHERE run_id IS NOT NULL
                 """
             )
@@ -511,23 +541,8 @@ def _create_trading_tables(cursor: Any) -> None:
         ON evidence_snapshots(symbol, observed_at DESC)
         """
     )
-    cursor.execute(
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'trade_intents_evidence_snapshot_id_fkey'
-            ) THEN
-                ALTER TABLE trade_intents
-                ADD CONSTRAINT trade_intents_evidence_snapshot_id_fkey
-                FOREIGN KEY (evidence_snapshot_id)
-                REFERENCES evidence_snapshots(snapshot_id);
-            END IF;
-        END $$
-        """
-    )
+    # evidence_snapshot_id is a content-addressed reference, not a global
+    # foreign key. Session-scoped snapshot uniqueness cannot back an FK.
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS liquidation_events (
@@ -628,10 +643,15 @@ def _create_trading_tables(cursor: Any) -> None:
         ON trades(order_id)
         """
     )
+    cursor.execute("ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_source_event_id_idx")
+    cursor.execute("ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_source_event_id_key")
+    cursor.execute("DROP INDEX IF EXISTS trades_source_event_id_idx")
+    cursor.execute("DROP INDEX IF EXISTS trades_source_event_id_key")
     cursor.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS trades_source_event_id_idx
-        ON trades(source_event_id) WHERE source_event_id IS NOT NULL
+        CREATE UNIQUE INDEX IF NOT EXISTS trades_mode_source_event_id_idx
+        ON trades(mode, source_event_id)
+        WHERE source_event_id IS NOT NULL
         """
     )
     cursor.execute(
@@ -962,7 +982,32 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
     )
     # Snapshot identity is content-addressed. Persistence uniqueness is
     # (snapshot_id, validation_session_id) so two research sessions with the
-    # same evidence cannot overwrite each other.
+    # same evidence cannot overwrite each other. Drop dependent FKs first;
+    # PostgreSQL refuses DROP CONSTRAINT on a referenced primary key.
+    cursor.execute(
+        """
+        DO $$
+        DECLARE
+            rec RECORD;
+        BEGIN
+            FOR rec IN
+                SELECT conrelid::regclass AS table_name, conname
+                FROM pg_constraint
+                WHERE contype = 'f'
+                  AND confrelid IN (
+                      'evidence_snapshots'::regclass,
+                      'positioning_snapshots'::regclass
+                  )
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE %s DROP CONSTRAINT IF EXISTS %I',
+                    rec.table_name,
+                    rec.conname
+                );
+            END LOOP;
+        END $$
+        """
+    )
     cursor.execute(
         "ALTER TABLE positioning_snapshots DROP CONSTRAINT IF EXISTS positioning_snapshots_pkey"
     )
@@ -995,20 +1040,6 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS evidence_snapshots_id_session_idx
         ON evidence_snapshots(snapshot_id, validation_session_id)
         WHERE validation_session_id IS NOT NULL
-        """
-    )
-    cursor.execute(
-        """
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'trade_intents_evidence_snapshot_id_fkey'
-            ) THEN
-                ALTER TABLE trade_intents
-                DROP CONSTRAINT trade_intents_evidence_snapshot_id_fkey;
-            END IF;
-        END $$
         """
     )
 

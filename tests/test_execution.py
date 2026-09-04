@@ -1057,3 +1057,94 @@ def test_uncertain_cancel_unknown_lookup_fails_closed(monkeypatch) -> None:
     assert store.halted is True
     assert any(event[1] == "CANCEL_UNKNOWN" for event in store.events)
     assert not any(event[1] == "CANCEL_RECONCILED" for event in store.events)
+
+
+def test_get_order_unknown_halts(monkeypatch) -> None:
+    class Client:
+        def get_order(self, **kwargs):
+            del kwargs
+            return {"orderId": "42", "status": "WEIRD", "executedQty": "0"}
+
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: Client())
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+    order_id = store.create_order(
+        intent,
+        mode="testnet",
+        status="ACKNOWLEDGED",
+        exchange_order_id="42",
+    )
+    result = executor.get_order(order_id)
+    assert result.status == "UNKNOWN"
+    assert store.orders[order_id]["status"] == "UNKNOWN"
+    assert store.halted is True
+    assert any(event[1] == "ORDER_UNKNOWN" for event in store.events)
+    assert any(event[1] == "ORDER_STATUS_UNKNOWN" for event in store.events)
+
+
+def test_cancel_unknown_halts(monkeypatch) -> None:
+    class Client:
+        def cancel_order(self, **kwargs):
+            del kwargs
+            return {"orderId": "42", "status": "WEIRD", "executedQty": "0"}
+
+        def get_order(self, **kwargs):
+            del kwargs
+            return {"orderId": "42", "status": "WEIRD", "executedQty": "0"}
+
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: Client())
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+    order_id = store.create_order(
+        intent,
+        mode="testnet",
+        status="ACKNOWLEDGED",
+        exchange_order_id="42",
+    )
+    result = executor.cancel(order_id)
+    assert result.status == "UNKNOWN"
+    assert store.halted is True
+    assert any(event[1] == "CANCEL_UNKNOWN" for event in store.events)
+
+
+def test_cancel_still_open_is_not_cancelled(monkeypatch) -> None:
+    from binance_client import BinanceOrderError
+
+    class Client:
+        def cancel_order(self, **kwargs):
+            del kwargs
+            raise BinanceOrderError("Order does not exist")
+
+        def get_order(self, **kwargs):
+            del kwargs
+            return {"orderId": "42", "status": "NEW", "executedQty": "0"}
+
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: Client())
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+    order_id = store.create_order(
+        intent,
+        mode="testnet",
+        status="ACKNOWLEDGED",
+        exchange_order_id="42",
+    )
+    result = executor.cancel(order_id)
+    assert result.status == "ACKNOWLEDGED"
+    assert store.orders[order_id]["status"] == "ACKNOWLEDGED"
+    assert any(event[1] in {"CANCEL_STILL_OPEN", "STILL_OPEN", "CANCEL_REJECTED"} for event in store.events)
+    assert not any(event[1] == "ORDER_CANCELLED" and event[2] == "CANCELLED" for event in store.events)

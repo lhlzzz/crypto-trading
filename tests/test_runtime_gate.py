@@ -477,3 +477,80 @@ def test_account_health_cache_survives_probe_account_false(monkeypatch) -> None:
     assert cached.account_reachable is True
     assert "ACCOUNT_PREFLIGHT_NOT_RUN" not in cached.reasons
     assert "ACCOUNT_HEALTH_EXPIRED" not in cached.reasons
+
+
+def _account_client(*, positions=(), open_orders=()):
+    client = _client()
+    snapshot = client.account_snapshot.return_value
+    client.account_snapshot.return_value = FuturesAccountSnapshot(
+        mode=snapshot.mode,
+        wallet_balance=snapshot.wallet_balance,
+        available_balance=snapshot.available_balance,
+        total_margin=snapshot.total_margin,
+        used_margin=snapshot.used_margin,
+        unrealized_pnl=snapshot.unrealized_pnl,
+        realized_pnl=snapshot.realized_pnl,
+        positions=tuple(positions),
+        open_orders=tuple(open_orders),
+        leverage=snapshot.leverage,
+        margin_mode=snapshot.margin_mode,
+        position_mode=snapshot.position_mode,
+        captured_at=snapshot.captured_at,
+        source=snapshot.source,
+        symbol_leverage=snapshot.symbol_leverage,
+    )
+    return client
+
+
+def test_account_noncanonical_position_blocks_gate(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    gate = evaluate_runtime_gate(
+        mode="testnet",
+        client=_account_client(positions=({"symbol": "DOGEUSDT", "positionAmt": "1"},)),
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+        gate_evidence={"testnet": "PASSED"},
+    )
+    assert gate.exchange_positions_ok is False
+    assert gate.live_allowed is False
+    assert gate.testnet_ready is False
+    assert "UNAUTHORIZED_EXCHANGE_POSITION" in gate.reasons
+
+
+def test_account_noncanonical_open_order_blocks_gate(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    gate = evaluate_runtime_gate(
+        mode="testnet",
+        client=_account_client(open_orders=({"symbol": "SOLUSDT", "orderId": 1},)),
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+        gate_evidence={"testnet": "PASSED"},
+    )
+    assert gate.open_orders_ok is False
+    assert gate.testnet_ready is False
+    assert "UNAUTHORIZED_EXCHANGE_ORDER" in gate.reasons
+
+
+def test_mixed_futures_universe_halts(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "BTCUSDT,DOGEUSDT,SOLUSDT")
+    gate = evaluate_runtime_gate(
+        mode="live",
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=False,
+    )
+    assert gate.live_allowed is False
+    assert "UNAUTHORIZED_SYMBOL" in gate.reasons
+    assert gate.major_universe_ready is False

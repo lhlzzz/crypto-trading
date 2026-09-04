@@ -5,6 +5,8 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
+import pytest
+
 from trading_store import TradingStore
 
 
@@ -100,7 +102,7 @@ def test_trade_and_order_event_persistence_use_idempotent_conflict_keys():
 
     statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "ON CONFLICT (event_id) DO NOTHING" in statements
-    assert "ON CONFLICT (source_event_id) DO UPDATE" in statements
+    assert "ON CONFLICT (mode, source_event_id)" in statements
 
 
 def test_funding_settlement_persistence_is_mode_symbol_time_idempotent():
@@ -293,18 +295,18 @@ def test_market_data_freshness_includes_metadata_for_lifecycle():
 
 def test_market_data_freshness_ignores_synthetic_stale_markers():
     now = datetime.now(timezone.utc)
-    live_received = now - timedelta(seconds=2)
+    live_received = now - timedelta(seconds=1)
     live_source = live_received - timedelta(milliseconds=20)
-    stale_received = now - timedelta(seconds=1)
+    stale_received = now - timedelta(seconds=30)
     cursor = MagicMock()
     cursor.fetchall.return_value = [
         (
-            "BTCUSDT", "FUTURES", "BOOK_TICKER", stale_received, stale_received, 0,
-            {"health": "STALE", "health_status": "STALE", "metadata": {"health_status": "STALE"}},
-        ),
-        (
             "BTCUSDT", "FUTURES", "BOOK_TICKER", live_source, live_received, 20,
             {"source": "binance_futures_book_ticker"},
+        ),
+        (
+            "BTCUSDT", "FUTURES", "BOOK_TICKER", stale_received, stale_received, 0,
+            {"health": "STALE", "health_status": "STALE", "metadata": {"health_status": "STALE"}},
         ),
     ]
     connection = MagicMock()
@@ -773,3 +775,154 @@ def test_migration_does_not_fabricate_liquidation_price():
     statements = "\n".join(str(call.args[0]) for call in cursor.execute.call_args_list)
     assert "liquidation_price = entry_price" not in statements
     assert "positions_active_liquidation_positive" not in statements or "DROP CONSTRAINT" in statements
+
+
+def test_positioning_events_ignore_spot():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    now = datetime.now(timezone.utc)
+    with patch("psycopg2.connect", return_value=connection):
+        TradingStore("postgresql://test").positioning_events("BTCUSDT", as_of=now)
+    statement = cursor.execute.call_args.args[0]
+    assert "market = 'FUTURES'" in statement
+    assert "symbol = %s" in statement
+
+
+def test_latest_market_observation_uses_futures_only():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection), pytest.raises(RuntimeError):
+        TradingStore("postgresql://test").latest_market_observation("BTCUSDT")
+    statement = cursor.execute.call_args.args[0]
+    assert "FROM bian_market_snapshots" in statement
+    assert "market = 'FUTURES'" in statement
+
+
+def test_market_universe_context_uses_futures_only():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    now = datetime.now(timezone.utc)
+    with patch("psycopg2.connect", return_value=connection):
+        TradingStore("postgresql://test").market_universe_context("BTCUSDT", as_of=now)
+    statement = cursor.execute.call_args.args[0]
+    assert "market = 'FUTURES'" in statement
+    assert "UNIVERSE_BREADTH" in statement
+
+
+def test_latest_stale_row_cannot_fall_back_to_previous_fresh():
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(seconds=1)
+    fresh = now - timedelta(seconds=30)
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        (
+            "BTCUSDT", "FUTURES", "ORDERBOOK", stale, stale, 0,
+            {"health": "STALE", "health_status": "STALE"},
+        ),
+    ]
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    with patch("psycopg2.connect", return_value=connection), patch(
+        "trading_store._now", return_value=now
+    ):
+        rows = TradingStore("postgresql://test").market_data_freshness(
+            max_age_sec=60, symbols=["BTCUSDT"]
+        )
+    by_source = {row["source"]: row for row in rows}
+    assert by_source["FUTURES_DEPTH"]["status"] == "STALE"
+    statement = cursor.execute.call_args.args[0]
+    assert "IS DISTINCT FROM 'STALE'" not in statement
+    assert "DISTINCT ON (symbol, event_type)" in statement
+    del fresh
+
+
+def test_replay_frames_requires_dataset_scope():
+    store = TradingStore("postgresql://test")
+    with pytest.raises(ValueError, match="validation_session_id"):
+        store.positioning_replay_frames()
+
+
+def test_source_event_id_is_mode_scoped():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("00000000-0000-0000-0000-000000000002",)
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection):
+        for mode in ("paper", "testnet", "live"):
+            store.record_trade(
+                UUID("00000000-0000-0000-0000-000000000001"),
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                fee=Decimal("0.1"),
+                fee_asset="USDT",
+                source_event_id="shared-event",
+                mode=mode,
+            )
+    statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "ON CONFLICT (mode, source_event_id)" in statements
+    assert "ON CONFLICT (source_event_id) DO UPDATE" not in statements
+    modes = [call.args[1][11] for call in cursor.execute.call_args_list]
+    assert modes == ["paper", "testnet", "live"]
+
+
+def test_exchange_trade_id_is_mode_scoped():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("00000000-0000-0000-0000-000000000003",)
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    with patch("psycopg2.connect", return_value=connection):
+        for mode in ("paper", "testnet", "live"):
+            store.record_trade(
+                UUID("00000000-0000-0000-0000-000000000001"),
+                symbol="BTCUSDT",
+                side="BUY",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                fee=Decimal("0.1"),
+                fee_asset="USDT",
+                exchange_trade_id="X",
+                mode=mode,
+            )
+    statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "ON CONFLICT (mode, exchange_trade_id)" in statements
+    modes = [call.args[1][11] for call in cursor.execute.call_args_list]
+    assert modes == ["paper", "testnet", "live"]
+
+
+def test_schema_migration_is_idempotent():
+    from scripts.database import ensure_schema
+
+    first = MagicMock()
+    second = MagicMock()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.side_effect = [first, second]
+    with patch("psycopg2.connect", return_value=connection):
+        ensure_schema("postgresql://test")
+        ensure_schema("postgresql://test")
+    first_sql = "\n".join(str(call.args[0]) for call in first.execute.call_args_list)
+    second_sql = "\n".join(str(call.args[0]) for call in second.execute.call_args_list)
+    assert "DROP INDEX IF EXISTS trades_source_event_id_idx" in first_sql
+    assert "trades_mode_source_event_id_idx" in first_sql
+    assert "ADD COLUMN IF NOT EXISTS market TEXT" in first_sql
+    assert "DROP CONSTRAINT IF EXISTS %I" in first_sql
+    assert "evidence_snapshots_pkey" in first_sql
+    assert "DROP INDEX IF EXISTS trades_source_event_id_idx" in second_sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS trades_mode_source_event_id_idx" in second_sql
+    assert "DROP CONSTRAINT IF EXISTS %I" in second_sql

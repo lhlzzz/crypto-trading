@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from uuid import UUID, uuid4
 
 from scripts.database import configured_dsn, ensure_schema
-from trade_intent import TradeIntent
+from trade_intent import TradeIntent, is_canonical_futures_symbol
 
 
 def _json(value: Any) -> str:
@@ -1405,112 +1405,129 @@ class TradingStore:
                     WHERE validation_session_id IS NULL
             """
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO positioning_snapshots(
-                        snapshot_id, symbol, observed_at, state, transition,
-                        direction, confidence, long_score, short_score,
-                        crowding_score, liquidity_score, data_quality_score,
-                        strategy_version, reason_codes, episode_id,
-                        episode_direction, episode_status, episode_started_at,
-                        episode_ended_at, evidence_sufficiency, is_meme,
-                        meme_classification_source, meme_classification_version,
-                        meme_classified_at, meme_reason_codes, payload
-                        , validation_session_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                              %s, %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB), %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
-                    """
-                    + snapshot_conflict
-                    + """
-                    DO UPDATE SET
-                        episode_id = EXCLUDED.episode_id,
-                        episode_direction = EXCLUDED.episode_direction,
-                        episode_status = EXCLUDED.episode_status,
-                        episode_started_at = EXCLUDED.episode_started_at,
-                        episode_ended_at = EXCLUDED.episode_ended_at,
-                        evidence_sufficiency = EXCLUDED.evidence_sufficiency,
-                        is_meme = EXCLUDED.is_meme,
-                        meme_classification_source = EXCLUDED.meme_classification_source,
-                        meme_classification_version = EXCLUDED.meme_classification_version,
-                        meme_classified_at = EXCLUDED.meme_classified_at,
-                        meme_reason_codes = EXCLUDED.meme_reason_codes,
-                        payload = EXCLUDED.payload
-                    """,
-                    (
-                        str(snapshot_id), decision.symbol, decision.timestamp,
-                        decision.state, decision.transition, decision.direction,
-                        decision.confidence, decision.long_score, decision.short_score,
-                        decision.crowding_score, decision.liquidity_score,
-                        decision.data_quality_score, strategy_version,
-                        _json(list(decision.reason_codes)),
-                        str(decision.episode_id) if decision.episode_id else None,
-                        decision.episode_direction, decision.episode_status,
-                        decision.episode_started_at, decision.episode_ended_at,
-                        _json(decision.evidence_sufficiency.as_dict()),
-                        decision.is_meme, decision.meme_classification_source,
-                        decision.meme_classification_version,
-                        decision.meme_classified_at,
-                        _json(list(decision.meme_reason_codes)), _json(payload),
-                        session_id,
-                    ),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO evidence_snapshots(
-                        snapshot_id, symbol, observed_at, source_timestamps,
-                        evidence, data_quality, episode_id, episode_started_at,
-                        episode_ended_at, episode_direction, episode_status,
-                        universe_classification, payload, validation_session_id
-                    ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
-                              CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
-                              CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
-                    """
-                    + snapshot_conflict
-                    + """
-                    DO UPDATE SET
-                        source_timestamps = EXCLUDED.source_timestamps,
-                        evidence = EXCLUDED.evidence,
-                        data_quality = EXCLUDED.data_quality,
-                        episode_id = EXCLUDED.episode_id,
-                        episode_started_at = EXCLUDED.episode_started_at,
-                        episode_ended_at = EXCLUDED.episode_ended_at,
-                        episode_direction = EXCLUDED.episode_direction,
-                        episode_status = EXCLUDED.episode_status,
-                        universe_classification = EXCLUDED.universe_classification,
-                        payload = EXCLUDED.payload
-                    """,
-                    (
-                        str(snapshot_id), decision.symbol, decision.timestamp,
-                        _json(dict(decision.source_timestamps)),
-                        _json(decision.input_features),
-                        _json({
-                            "quality": decision.data_quality_score,
-                            "freshness": decision.evidence.freshness,
-                            "sufficiency": decision.evidence_sufficiency.as_dict(),
-                        }),
-                        str(decision.episode_id) if decision.episode_id else None,
-                        decision.episode_started_at, decision.episode_ended_at,
-                        decision.episode_direction, decision.episode_status,
-                        _json({
-                            "is_meme": decision.is_meme,
-                            "source": decision.meme_classification_source,
-                            "version": decision.meme_classification_version,
-                            "classified_at": decision.meme_classified_at,
-                            "reason_codes": list(decision.meme_reason_codes),
-                        }),
-                        _json(payload),
-                        self._session_id(),
-                    ),
-                )
-        self.record_session_observation(
-            symbol=decision.symbol,
-            observed_at=decision.timestamp,
-            observation_id=str(snapshot_id),
-            source="positioning_pipeline",
-        )
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO positioning_snapshots(
+                            snapshot_id, symbol, observed_at, state, transition,
+                            direction, confidence, long_score, short_score,
+                            crowding_score, liquidity_score, data_quality_score,
+                            strategy_version, reason_codes, episode_id,
+                            episode_direction, episode_status, episode_started_at,
+                            episode_ended_at, evidence_sufficiency, is_meme,
+                            meme_classification_source, meme_classification_version,
+                            meme_classified_at, meme_reason_codes, payload
+                            , validation_session_id
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                  %s, %s, %s, %s, %s, %s, %s,
+                                  CAST(%s AS JSONB), %s, %s, %s, %s, %s,
+                                  CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
+                        """
+                        + snapshot_conflict
+                        + """
+                        DO UPDATE SET
+                            episode_id = EXCLUDED.episode_id,
+                            episode_direction = EXCLUDED.episode_direction,
+                            episode_status = EXCLUDED.episode_status,
+                            episode_started_at = EXCLUDED.episode_started_at,
+                            episode_ended_at = EXCLUDED.episode_ended_at,
+                            evidence_sufficiency = EXCLUDED.evidence_sufficiency,
+                            is_meme = EXCLUDED.is_meme,
+                            meme_classification_source = EXCLUDED.meme_classification_source,
+                            meme_classification_version = EXCLUDED.meme_classification_version,
+                            meme_classified_at = EXCLUDED.meme_classified_at,
+                            meme_reason_codes = EXCLUDED.meme_reason_codes,
+                            payload = EXCLUDED.payload
+                        """,
+                        (
+                            str(snapshot_id), decision.symbol, decision.timestamp,
+                            decision.state, decision.transition, decision.direction,
+                            decision.confidence, decision.long_score, decision.short_score,
+                            decision.crowding_score, decision.liquidity_score,
+                            decision.data_quality_score, strategy_version,
+                            _json(list(decision.reason_codes)),
+                            str(decision.episode_id) if decision.episode_id else None,
+                            decision.episode_direction, decision.episode_status,
+                            decision.episode_started_at, decision.episode_ended_at,
+                            _json(decision.evidence_sufficiency.as_dict()),
+                            decision.is_meme, decision.meme_classification_source,
+                            decision.meme_classification_version,
+                            decision.meme_classified_at,
+                            _json(list(decision.meme_reason_codes)), _json(payload),
+                            session_id,
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO evidence_snapshots(
+                            snapshot_id, symbol, observed_at, source_timestamps,
+                            evidence, data_quality, episode_id, episode_started_at,
+                            episode_ended_at, episode_direction, episode_status,
+                            universe_classification, payload, validation_session_id
+                        ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
+                                  CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
+                                  CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
+                        """
+                        + snapshot_conflict
+                        + """
+                        DO UPDATE SET
+                            source_timestamps = EXCLUDED.source_timestamps,
+                            evidence = EXCLUDED.evidence,
+                            data_quality = EXCLUDED.data_quality,
+                            episode_id = EXCLUDED.episode_id,
+                            episode_started_at = EXCLUDED.episode_started_at,
+                            episode_ended_at = EXCLUDED.episode_ended_at,
+                            episode_direction = EXCLUDED.episode_direction,
+                            episode_status = EXCLUDED.episode_status,
+                            universe_classification = EXCLUDED.universe_classification,
+                            payload = EXCLUDED.payload
+                        """,
+                        (
+                            str(snapshot_id), decision.symbol, decision.timestamp,
+                            _json(dict(decision.source_timestamps)),
+                            _json(decision.input_features),
+                            _json({
+                                "quality": decision.data_quality_score,
+                                "freshness": decision.evidence.freshness,
+                                "sufficiency": decision.evidence_sufficiency.as_dict(),
+                            }),
+                            str(decision.episode_id) if decision.episode_id else None,
+                            decision.episode_started_at, decision.episode_ended_at,
+                            decision.episode_direction, decision.episode_status,
+                            _json({
+                                "is_meme": decision.is_meme,
+                                "source": decision.meme_classification_source,
+                                "version": decision.meme_classification_version,
+                                "classified_at": decision.meme_classified_at,
+                                "reason_codes": list(decision.meme_reason_codes),
+                            }),
+                            _json(payload),
+                            session_id,
+                        ),
+                    )
+                    if session_id:
+                        observed_at = _as_utc(decision.timestamp)
+                        identity = str(snapshot_id)
+                        cursor.execute(
+                            """
+                            INSERT INTO validation_session_observations(
+                                session_id, observation_id, symbol, observed_at, source
+                            ) VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (session_id, observation_id) DO NOTHING
+                            """,
+                            (
+                                session_id,
+                                identity,
+                                str(decision.symbol).upper(),
+                                observed_at,
+                                "positioning_pipeline",
+                            ),
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return snapshot_id
 
     def record_liquidation_event(
@@ -1661,6 +1678,7 @@ class TradingStore:
                            notional, direction, metadata
                     FROM market_flow_events
                     WHERE symbol = %s
+                      AND market = 'FUTURES'
                       AND event_timestamp >= %s
                       AND event_timestamp <= %s
                       AND received_timestamp <= %s
@@ -1696,6 +1714,7 @@ class TradingStore:
                     SELECT captured_at, last_price, quote_volume
                     FROM bian_market_snapshots
                     WHERE symbol = %s
+                      AND market = 'FUTURES'
                     ORDER BY captured_at DESC, id DESC
                     LIMIT 100
                     """,
@@ -1820,10 +1839,6 @@ class TradingStore:
                         FROM market_flow_events
                         WHERE market = 'FUTURES'
                           AND symbol = ANY(%s)
-                          AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
                         ORDER BY symbol, event_type, received_timestamp DESC,
                                  event_timestamp DESC
                         """,
@@ -1837,10 +1852,6 @@ class TradingStore:
                                received_timestamp, latency_ms, metadata
                         FROM market_flow_events
                         WHERE market = 'FUTURES'
-                          AND COALESCE(metadata->>'health', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->>'health_status', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->'metadata'->>'health', '') IS DISTINCT FROM 'STALE'
-                          AND COALESCE(metadata->'metadata'->>'health_status', '') IS DISTINCT FROM 'STALE'
                         ORDER BY symbol, event_type, received_timestamp DESC,
                                  event_timestamp DESC
                         """
@@ -1868,16 +1879,6 @@ class TradingStore:
                 continue
             symbols.add(normalized_symbol)
             payload = metadata if isinstance(metadata, dict) else {}
-            nested = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            marker = str(
-                payload.get("health")
-                or payload.get("health_status")
-                or nested.get("health")
-                or nested.get("health_status")
-                or ""
-            ).upper()
-            if marker == "STALE":
-                continue
             aliases = {
                 **source_events,
                 "FORCE_ORDER": (),
@@ -1927,6 +1928,12 @@ class TradingStore:
                 reported_state = str(
                     payload.get("state") or nested.get("state") or ""
                 ).upper()
+                reported_unhealthy = reported_status in {
+                    "GAP", "UNSAFE", "ERROR", "STALE", "SYNCING", "UNINITIALIZED",
+                    "FAILED", "RECONNECTING", "STARTING",
+                } or reported_state in {
+                    "GAP", "UNSAFE", "ERROR", "SYNCING", "UNINITIALIZED", "FAILED",
+                }
                 if reported_status in {
                     "GAP", "UNSAFE", "ERROR", "STALE", "SYNCING", "UNINITIALIZED",
                     "FAILED", "RECONNECTING", "STARTING",
@@ -1963,6 +1970,7 @@ class TradingStore:
                     spec is not None
                     and spec.event_driven
                     and status == "STALE"
+                    and not reported_unhealthy
                     and age_sec <= max(1, ttl_sec)
                 ):
                     status = "FRESH"
@@ -2092,6 +2100,7 @@ class TradingStore:
                     SELECT event_timestamp, received_timestamp, latency_ms, metadata
                     FROM market_flow_events
                     WHERE symbol = '__MARKET__'
+                      AND market = 'FUTURES'
                       AND event_type = 'UNIVERSE_BREADTH'
                       AND event_timestamp <= %s
                       AND received_timestamp <= %s
@@ -2115,13 +2124,16 @@ class TradingStore:
                         WITH current AS (
                             SELECT last_price, captured_at
                             FROM bian_market_snapshots
-                            WHERE symbol = %s AND captured_at <= %s
+                            WHERE symbol = %s
+                              AND market = 'FUTURES'
+                              AND captured_at <= %s
                             ORDER BY captured_at DESC, id DESC
                             LIMIT 1
                         ), baseline AS (
                             SELECT snapshot.last_price
                             FROM bian_market_snapshots snapshot, current
                             WHERE snapshot.symbol = %s
+                              AND snapshot.market = 'FUTURES'
                               AND snapshot.captured_at <= current.captured_at
                                   - make_interval(secs => %s)
                             ORDER BY snapshot.captured_at DESC, snapshot.id DESC
@@ -2143,6 +2155,7 @@ class TradingStore:
                             SELECT DISTINCT ON (symbol) symbol, last_price, captured_at
                             FROM bian_market_snapshots
                             WHERE captured_at <= %s
+                              AND market = 'FUTURES'
                             ORDER BY symbol, captured_at DESC, id DESC
                         ), returns AS (
                             SELECT (current.last_price - baseline.last_price)
@@ -2152,6 +2165,7 @@ class TradingStore:
                                 SELECT last_price
                                 FROM bian_market_snapshots snapshot
                                 WHERE snapshot.symbol = current.symbol
+                                  AND snapshot.market = 'FUTURES'
                                   AND snapshot.captured_at <= current.captured_at
                                       - make_interval(secs => %s)
                                 ORDER BY snapshot.captured_at DESC, snapshot.id DESC
@@ -2353,40 +2367,97 @@ class TradingStore:
         *,
         limit: int = 10_000,
         source_ttl_sec: int = 900,
+        validation_session_id: str | None = None,
+        research_session_ids: Iterable[str] | None = None,
     ) -> list[Any]:
-        """Load historical normalized frames in deterministic timestamp order."""
+        """Load historical normalized frames for one explicit dataset scope.
+
+        An explicit ``validation_session_id`` reads that session only. A
+        research session list is the only allowed multi-session scope. The
+        bound store session is used when neither is supplied. Mixing every
+        snapshot in the table is forbidden.
+        """
         import psycopg2
         from engine import MarketFrame
 
         bounded_limit = max(1, min(int(limit), 100_000))
+        if research_session_ids is not None:
+            session_ids = tuple(
+                str(value).strip()
+                for value in research_session_ids
+                if str(value).strip()
+            )
+            if not session_ids:
+                raise ValueError("research_session_ids must not be empty")
+        elif validation_session_id is not None:
+            session_id = str(validation_session_id).strip()
+            if not session_id:
+                raise ValueError("validation_session_id is required")
+            session_ids = (session_id,)
+        else:
+            bound = self._session_id()
+            if not bound:
+                raise ValueError(
+                    "positioning_replay_frames requires validation_session_id"
+                )
+            session_ids = (bound,)
+        clauses = ["validation_session_id = ANY(%s)"]
+        params: list[Any] = [list(session_ids)]
+        if symbol:
+            clauses.append("symbol = %s")
+            params.append(symbol.upper())
+        params.append(bounded_limit)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
-                if symbol:
-                    cursor.execute(
-                        """
-                        SELECT payload
-                        FROM positioning_snapshots
-                        WHERE symbol = %s
-                        ORDER BY observed_at, snapshot_id
-                        LIMIT %s
-                        """,
-                        (symbol.upper(), bounded_limit),
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        SELECT payload
-                        FROM positioning_snapshots
-                        ORDER BY observed_at, snapshot_id
-                        LIMIT %s
-                        """,
-                        (bounded_limit,),
-                    )
-                payloads = [dict(row[0]) for row in cursor.fetchall() if isinstance(row[0], dict)]
-        return [
-            MarketFrame.from_evidence_snapshot(payload, source_ttl_sec=source_ttl_sec)
-            for payload in payloads
-        ]
+                cursor.execute(
+                    """
+                    SELECT payload, strategy_version, symbol
+                    FROM positioning_snapshots
+                    WHERE """
+                    + " AND ".join(clauses)
+                    + """
+                    ORDER BY observed_at, snapshot_id
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        versions: set[str] = set()
+        markets: set[str] = set()
+        frames: list[Any] = []
+        for payload, strategy_version, stored_symbol in rows:
+            if not isinstance(payload, dict):
+                continue
+            if not is_canonical_futures_symbol(stored_symbol):
+                raise ValueError("ALPHA_DATASET_UNAUTHORIZED_SYMBOL")
+            market = str(payload.get("market") or "").upper()
+            inputs = payload.get("input_features") or {}
+            if isinstance(inputs, dict) and not market:
+                market = str(inputs.get("market") or "").upper()
+            timestamps = payload.get("source_timestamps") or {}
+            if (
+                not market
+                and isinstance(timestamps, dict)
+                and "spot_trade" in timestamps
+                and "futures_trade_flow" not in timestamps
+            ):
+                market = "SPOT"
+            if market in {"SPOT", "UNKNOWN"}:
+                raise ValueError("ALPHA_DATASET_WRONG_MARKET")
+            if market:
+                markets.add(market)
+            if strategy_version:
+                versions.add(str(strategy_version))
+            frames.append(
+                MarketFrame.from_evidence_snapshot(
+                    payload, source_ttl_sec=source_ttl_sec
+                )
+            )
+        if len(versions) > 1:
+            raise ValueError("ALPHA_DATASET_MIXED_STRATEGY_VERSION")
+        if any(item and item != "FUTURES" for item in markets):
+            raise ValueError("ALPHA_DATASET_WRONG_MARKET")
+        return frames
 
     def update_intent_status(self, intent_id: UUID, status: str) -> None:
         import psycopg2
@@ -2599,18 +2670,20 @@ class TradingStore:
 
         trade_id = uuid4()
         mode = self._mode(mode)
-        conflict_sql = (
-            """
+        if exchange_trade_id:
+            conflict_sql = """
                     ON CONFLICT (mode, exchange_trade_id)
                     WHERE exchange_trade_id IS NOT NULL
                     DO UPDATE SET exchange_trade_id = EXCLUDED.exchange_trade_id
             """
-            if exchange_trade_id
-            else """
-                    ON CONFLICT (source_event_id) DO UPDATE
-                    SET source_event_id = EXCLUDED.source_event_id
+        elif source_event_id:
+            conflict_sql = """
+                    ON CONFLICT (mode, source_event_id)
+                    WHERE source_event_id IS NOT NULL
+                    DO UPDATE SET source_event_id = EXCLUDED.source_event_id
             """
-        )
+        else:
+            conflict_sql = ""
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(

@@ -1040,10 +1040,7 @@ class StrategyEngine:
         else:
             frame = evidence
         current = current_position or CurrentPosition()
-        if (
-            current.meme_risk_tier in {"BLOCK", "OBSERVE"}
-            or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
-        ):
+        if not is_canonical_futures_symbol(frame.symbol):
             return None
         if not self.config.positioning_decision_enabled:
             return None
@@ -1331,14 +1328,9 @@ class StrategyEngine:
         current_position: CurrentPosition | None = None,
     ) -> TradeIntent | None:
         current = current_position or CurrentPosition()
-        if (
-            current.meme_risk_tier in {"BLOCK", "OBSERVE"}
-            or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
-        ):
-            return None
         if not is_canonical_futures_symbol(decision.symbol):
             return None
-        if frame.is_meme is True:
+        if not is_canonical_futures_symbol(frame.symbol):
             return None
         return self._intent_for_action(
             symbol=decision.symbol,

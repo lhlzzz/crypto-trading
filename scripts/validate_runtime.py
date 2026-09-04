@@ -30,6 +30,7 @@ if PROJECT_ROOT not in sys.path:
 from engine import runtime_required_sources
 from runtime_gate import evaluate_runtime_gate, max_data_age_sec, trading_symbols_for_mode
 from scripts.bian_market import observe
+from trade_intent import is_canonical_futures_symbol
 from trading_store import TradingStore
 
 STAGE_SPECS = {
@@ -1713,27 +1714,113 @@ def run_shadow_stage(
     }
 
 
+def _alpha_dataset_scope() -> dict[str, Any]:
+    research_raw = os.environ.get("BIAN_ALPHA_DATASET_SESSION_IDS", "").strip()
+    research_ids = [item.strip() for item in research_raw.split(",") if item.strip()]
+    session_id = os.environ.get("BIAN_VALIDATION_SESSION_ID", "").strip()
+    if research_ids:
+        return {
+            "dataset_scope": "research_sessions",
+            "dataset_session_ids": research_ids,
+        }
+    if session_id:
+        return {
+            "dataset_scope": "validation_session",
+            "dataset_session_ids": [session_id],
+        }
+    return {"dataset_scope": None, "dataset_session_ids": []}
+
+
+def _assert_alpha_dataset_homogeneous(frames: list[Any]) -> None:
+    versions: set[str] = set()
+    config_hashes: set[str] = set()
+    markets: set[str] = set()
+    for frame in frames:
+        if isinstance(frame, str):
+            return
+        symbol = str(getattr(frame, "symbol", "")).upper()
+        if symbol and not is_canonical_futures_symbol(symbol):
+            raise ValueError("ALPHA_DATASET_UNAUTHORIZED_SYMBOL")
+        version = getattr(frame, "strategy_version", None)
+        if version:
+            versions.add(str(version))
+        config_hash = getattr(frame, "config_hash", None)
+        if config_hash:
+            config_hashes.add(str(config_hash))
+        market = str(getattr(frame, "market", "") or "").upper()
+        timestamps = getattr(frame, "source_timestamps", {}) or {}
+        if not market and isinstance(timestamps, dict) and "spot_trade" in timestamps and "futures_trade_flow" not in timestamps:
+            market = "SPOT"
+        if market:
+            markets.add(market)
+        if market in {"SPOT", "UNKNOWN"}:
+            raise ValueError("ALPHA_DATASET_WRONG_MARKET")
+        is_meme = getattr(frame, "is_meme", None)
+        if is_meme is True and symbol and not is_canonical_futures_symbol(symbol):
+            raise ValueError("ALPHA_DATASET_WRONG_MARKET")
+    if len(versions) > 1:
+        raise ValueError("ALPHA_DATASET_MIXED_STRATEGY_VERSION")
+    if len(config_hashes) > 1:
+        raise ValueError("ALPHA_DATASET_MIXED_CONFIG_HASH")
+    if any(item != "FUTURES" for item in markets):
+        raise ValueError("ALPHA_DATASET_WRONG_MARKET")
+
+
 def _load_alpha_frames() -> list[Any]:
+    scope = _alpha_dataset_scope()
+    session_ids = list(scope["dataset_session_ids"])
+    if not session_ids:
+        raise RuntimeError("ALPHA_NOT_SUPPORTED")
     store = TradingStore()
     getter = getattr(store, "positioning_replay_frames", None)
     if getter is None:
-        return []
-    try:
-        return list(getter())
-    except Exception:
-        return []
+        raise RuntimeError("ALPHA_NOT_SUPPORTED")
+    if scope["dataset_scope"] == "research_sessions":
+        frames = list(getter(research_session_ids=session_ids))
+    else:
+        frames = list(getter(validation_session_id=session_ids[0]))
+    _assert_alpha_dataset_homogeneous(frames)
+    return frames
 
 
 def run_alpha_stage() -> dict[str, Any]:
     from backtesting import evaluate_alpha_gate
 
+    scope = _alpha_dataset_scope()
     try:
         frames = _load_alpha_frames()
+    except RuntimeError as exc:
+        reason = str(exc)
+        if reason == "ALPHA_NOT_SUPPORTED":
+            return {
+                "status": "FAILED",
+                "reason": "ALPHA_NOT_SUPPORTED",
+                "alpha_status": "ALPHA_NOT_SUPPORTED",
+                "dataset_scope": scope["dataset_scope"],
+                "dataset_session_ids": list(scope["dataset_session_ids"]),
+            }
+        return {
+            "status": "FAILED",
+            "reason": f"ALPHA_PERSISTENCE_UNAVAILABLE:{type(exc).__name__}",
+            "alpha_status": "INSUFFICIENT_SAMPLE",
+            "dataset_scope": scope["dataset_scope"],
+            "dataset_session_ids": list(scope["dataset_session_ids"]),
+        }
+    except ValueError as exc:
+        return {
+            "status": "FAILED",
+            "reason": str(exc),
+            "alpha_status": "ALPHA_NOT_SUPPORTED",
+            "dataset_scope": scope["dataset_scope"],
+            "dataset_session_ids": list(scope["dataset_session_ids"]),
+        }
     except Exception as exc:
         return {
             "status": "FAILED",
             "reason": f"ALPHA_PERSISTENCE_UNAVAILABLE:{type(exc).__name__}",
             "alpha_status": "INSUFFICIENT_SAMPLE",
+            "dataset_scope": scope["dataset_scope"],
+            "dataset_session_ids": list(scope["dataset_session_ids"]),
         }
     result = evaluate_alpha_gate(frames)
     long_episodes = int(result.oos_metrics.get("long_episodes") or getattr(result, "long_episodes", 0) or 0)
@@ -1776,6 +1863,8 @@ def run_alpha_stage() -> dict[str, Any]:
         "frozen_strategy": True,
         "frozen_parameter_config": True,
         "model_training_completed": False,
+        "dataset_scope": scope["dataset_scope"],
+        "dataset_session_ids": list(scope["dataset_session_ids"]),
     }
 
 

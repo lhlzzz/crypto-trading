@@ -63,7 +63,7 @@ def test_engine_does_not_create_intent_without_tradeable_meme_evidence() -> None
     ).evaluate(frame) is None
 
 
-def test_positioning_open_rejects_meme_membership() -> None:
+def test_positioning_open_rejects_noncanonical_symbol() -> None:
     frame = _positioning_frame()
     engine = StrategyEngine(
         StrategyConfig(positioning_decision_enabled=True)
@@ -71,7 +71,7 @@ def test_positioning_open_rejects_meme_membership() -> None:
 
     assert engine.evaluate(frame) is not None
     assert engine.evaluate(
-        MarketFrame(**{**frame.__dict__, "is_meme": True})
+        MarketFrame(**{**frame.__dict__, "symbol": "DOGEUSDT"})
     ) is None
 
 

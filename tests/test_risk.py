@@ -434,16 +434,13 @@ def test_unknown_position_mark_halts_new_open() -> None:
     assert "position mark price" in decision.reason
 
 
-def test_blocked_meme_tier_is_denied() -> None:
-    decision = RiskGate().evaluate(_intent(), _context(meme_risk_tier="BLOCK"))
-    assert decision.decision == "DENY"
-    assert "blocked" in decision.reason
-
-
-def test_meme_membership_cannot_open() -> None:
-    decision = RiskGate().evaluate(_intent(), _context(is_meme=True))
-    assert decision.decision == "DENY"
-    assert "canonical universe" in decision.reason
+def test_legacy_meme_fields_are_not_runtime_policy() -> None:
+    blocked = RiskGate().evaluate(_intent(), _context(meme_risk_tier="BLOCK"))
+    observed = RiskGate().evaluate(_intent(), _context(is_meme=True))
+    assert blocked.decision != "DENY" or "blocked" not in blocked.reason
+    assert observed.decision != "DENY" or "canonical universe" not in observed.reason
+    assert blocked.decision in {"ALLOW", "REDUCE"}
+    assert observed.decision in {"ALLOW", "REDUCE"}
 
 
 def test_symbol_notional_cap() -> None:
