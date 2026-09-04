@@ -1227,17 +1227,11 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
 
     These are cross-sectional observations, not a replacement for the
     timestamp-aligned intraday flow features used by positioning decisions.
+    First-phase membership is BTCUSDT, ETHUSDT, and BNBUSDT only.
     """
-    allowlist = {
-        item.strip().upper()
-        for item in os.environ.get("MEME_ALLOWLIST", "").split(",")
-        if item.strip()
-    }
-    blocklist = {
-        item.strip().upper()
-        for item in os.environ.get("MEME_BLOCKLIST", "").split(",")
-        if item.strip()
-    }
+    from risk import classify_futures_risk_tier
+    from trade_intent import CANONICAL_FUTURES_SYMBOLS, is_canonical_futures_symbol
+
     raw_volume_values = [
         volume for row in rows
         if (volume := _decimal(row.get("quoteVolume"))) is not None and volume > 0
@@ -1255,22 +1249,13 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             quote_asset = str(row.get("quoteAsset", "USDT")).upper()
             trading = str(row.get("status", "TRADING")).upper() == "TRADING"
             reason_codes: list[str] = []
-            if symbol in blocklist:
-                is_meme: bool | None = False
-                meme_source = "MEME_BLOCKLIST"
-                reason_codes.append("BLOCKLIST")
-            elif allowlist:
-                is_meme = symbol in allowlist
-                meme_source = "MEME_ALLOWLIST"
-                if not is_meme:
-                    reason_codes.append("NOT_ALLOWLISTED")
-            else:
-                is_meme = None
-                meme_source = "MEME_CLASSIFICATION_UNAVAILABLE"
-                reason_codes.append("CLASSIFICATION_UNAVAILABLE")
-            if is_meme is False or (
-                not trading or contract_type != "PERPETUAL" or quote_asset != "USDT"
-            ):
+            canonical = is_canonical_futures_symbol(symbol)
+            classification_source = (
+                "CANONICAL_FUTURES_UNIVERSE" if canonical else "NON_CANONICAL_SYMBOL"
+            )
+            if not canonical:
+                reason_codes.append("NOT_CANONICAL")
+            if not trading or contract_type != "PERPETUAL" or quote_asset != "USDT":
                 tier = "BLOCK"
                 if not trading:
                     reason_codes.append("NOT_TRADING")
@@ -1278,15 +1263,14 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
                     reason_codes.append("NOT_PERPETUAL")
                 if quote_asset != "USDT":
                     reason_codes.append("NOT_USDT_QUOTE")
-            elif is_meme is None:
-                tier = "OBSERVE"
+            elif not canonical:
+                tier = "BLOCK"
             else:
-                from risk import classify_meme_risk_tier
                 liquidity_score = (
                     quote_volume / maximum_quote_volume
                     if maximum_quote_volume > 0 else None
                 )
-                tier = classify_meme_risk_tier(
+                tier = classify_futures_risk_tier(
                     liquidity_score=liquidity_score,
                     data_quality_score=Decimal("1"),
                     spread_bps=_decimal(row.get("spreadBps")),
@@ -1315,16 +1299,14 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
             row["meme_risk_tier"] = tier
             classified_at = datetime.now(timezone.utc).isoformat()
             version = os.environ.get(
-                "MEME_CLASSIFICATION_VERSION", "meme-universe-v1"
+                "FUTURES_CLASSIFICATION_VERSION", "major-futures-v1"
             )
-            row["is_meme"] = is_meme
-            row["meme_classification_source"] = meme_source
+            row["is_meme"] = False
+            row["meme_classification_source"] = classification_source
             row["meme_classification_version"] = version
             row["meme_classified_at"] = classified_at
             row["meme_reason_codes"] = reason_codes
-            # Retain the old names as read-only output aliases for API
-            # consumers; membership uses only the canonical meme_* fields.
-            row["classification_source"] = meme_source
+            row["classification_source"] = classification_source
             row["classification_version"] = version
             row["classified_at"] = classified_at
             row["reason_codes"] = reason_codes
@@ -1358,20 +1340,25 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         eth_return_pct=by_symbol.get("ETHUSDT"),
         breadth_score=breadth_score,
     )
+    major_rows = [
+        item for item in normalized
+        if str(item[0].get("symbol", "")).upper() in CANONICAL_FUTURES_SYMBOLS
+    ]
     candidates = sorted(
-        normalized,
+        major_rows,
         key=lambda item: (item[2], abs(item[1]), str(item[0].get("symbol", ""))),
         reverse=True,
-    )[:max(1, candidate_limit)]
+    )[:max(1, min(candidate_limit, len(CANONICAL_FUTURES_SYMBOLS)))]
+    if not candidates:
+        candidates = major_rows[: len(CANONICAL_FUTURES_SYMBOLS)]
     tier_rows = {
         tier: [str(row["symbol"]).upper() for row, _, _ in normalized if row.get("meme_risk_tier") == tier]
         for tier in ("BLOCK", "OBSERVE", "REDUCED", "TRADEABLE")
     }
     tradeable_candidates = [
         row for row, _, _ in candidates
-        if row.get("is_meme") is True
-        and row.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
-    ][: max(1, candidate_limit)]
+        if row.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
+    ]
     return {
         "market": "FUTURES",
         "observation_window": "24h",
@@ -1391,7 +1378,8 @@ def universe_features(rows: list[dict[str, Any]], *, candidate_limit: int) -> di
         "candidate_symbols": [
             str(row["symbol"]).upper() for row, _, _ in candidates
         ],
-        "meme_candidate_symbols": [
+        "meme_candidate_symbols": [],
+        "major_candidate_symbols": [
             str(row["symbol"]).upper() for row in tradeable_candidates
         ],
         "tiers": tier_rows,
@@ -1489,7 +1477,7 @@ def collect(limit: int = 20, *, run_id: str | None = None) -> dict[str, Any]:
     received_timestamp = _event_datetime(captured_at)
     scanner = universe_features(universe, candidate_limit=limit)
     candidate_symbols = set(scanner["candidate_symbols"])
-    candidate_symbols.update({"BTCUSDT", "ETHUSDT"})
+    candidate_symbols.update({"BTCUSDT", "ETHUSDT", "BNBUSDT"})
     markets = [
         row for row in universe
         if str(row.get("symbol", "")).upper() in candidate_symbols
@@ -3165,6 +3153,7 @@ class FuturesStreamSupervisor:
                     True,
                     reason=f"GLOBAL_HALT:{type(exc).__name__}",
                     source="futures_stream",
+                    mode="paper",
                 )
             except Exception:
                 pass
@@ -3534,90 +3523,31 @@ async def stream_futures_liquidations(
     ).run()
 
 
-@dataclass(frozen=True)
-class MemeUniverseMember:
-    symbol: str
-    rank: int
-    membership: bool
-    volume: Decimal
-    liquidity: Decimal
-    volatility: Decimal
-    risk_score: Decimal
-
-
-class MemeUniverse:
-    """Single owner for dynamic USD-M meme membership and rank."""
-
-    def rank(
-        self,
-        rows: list[dict[str, Any]],
-        *,
-        limit: int = 20,
-    ) -> list[MemeUniverseMember]:
-        scored: list[MemeUniverseMember] = []
-        for row in rows:
-            symbol = str(row.get("symbol") or "").upper().replace("-", "")
-            if not symbol.endswith("USDT") or len(symbol) <= 4:
-                continue
-            volume = _decimal(row.get("quoteVolume") or row.get("volume") or 0) or Decimal("0")
-            open_interest = _decimal(row.get("openInterest") or 0) or Decimal("0")
-            spread = _decimal(row.get("spread_bps") or 0) or Decimal("0")
-            change = abs(_decimal(row.get("priceChangePercent") or 0) or Decimal("0"))
-            if volume <= 0:
-                continue
-            liquidity = volume + open_interest
-            volatility = min(Decimal("1"), change / Decimal("20"))
-            crowding = min(Decimal("1"), spread / Decimal("50"))
-            risk_score = min(Decimal("1"), (volatility + crowding) / Decimal("2"))
-            scored.append(
-                MemeUniverseMember(
-                    symbol=symbol,
-                    rank=0,
-                    membership=True,
-                    volume=volume,
-                    liquidity=liquidity,
-                    volatility=volatility,
-                    risk_score=risk_score,
-                )
-            )
-        scored.sort(key=lambda item: item.liquidity, reverse=True)
-        limited = scored[: max(1, min(limit, 100))]
-        return [
-            MemeUniverseMember(
-                symbol=item.symbol,
-                rank=index + 1,
-                membership=True,
-                volume=item.volume,
-                liquidity=item.liquidity,
-                volatility=item.volatility,
-                risk_score=item.risk_score,
-            )
-            for index, item in enumerate(limited)
-        ]
-
-
 def _candidate_stream_symbols(
     report: dict[str, Any], *, fallback_symbols: list[str]
 ) -> list[str]:
     """Select Tier 2 symbols from a persisted Tier 1 scanner report.
 
-    BTC and ETH remain explicit benchmarks even if a scanner response is
-    incomplete. The returned exchange symbols are stable and deduplicated so
-    an observer only reconnects streams when the actual candidate set changes.
+    First-phase observation is BTC, ETH, and BNB only. Scanner extras such as
+    SOL or ADA cannot expand the stream set. The returned exchange symbols are
+    stable and deduplicated so an observer only reconnects streams when the
+    actual candidate set changes.
     """
+    from trade_intent import is_canonical_futures_symbol
+
     scanner = report.get("universe") or {}
     scanned = scanner.get("candidate_symbols") if isinstance(scanner, dict) else []
-    raw_symbols = ["BTCUSDT", "ETHUSDT", *(scanned or [])]
+    raw_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", *(scanned or [])]
     raw_symbols.extend(symbol.replace("-", "") for symbol in fallback_symbols)
     normalized: list[str] = []
     for raw_symbol in raw_symbols:
         symbol = str(raw_symbol).upper().replace("-", "").strip()
-        if not symbol.endswith("USDT") or len(symbol) <= 4:
+        if not is_canonical_futures_symbol(symbol):
             continue
         stream_symbol = f"{symbol[:-4]}-USDT"
         if stream_symbol not in normalized:
             normalized.append(stream_symbol)
-    return normalized or list(fallback_symbols)
+    return normalized or ["BTC-USDT", "ETH-USDT", "BNB-USDT"]
 
 
 def collect_positioning_observations(
@@ -3713,7 +3643,12 @@ async def observe(
     Tier 2 Futures trade/book/mark/index/liquidation streams are restarted
     only when the selected candidate universe materially changes.
     """
-    fallback = list(dict.fromkeys(fallback_symbols))
+    from trade_intent import is_canonical_futures_symbol
+
+    fallback = [
+        symbol for symbol in dict.fromkeys(fallback_symbols)
+        if is_canonical_futures_symbol(symbol.replace("-", ""))
+    ] or ["BTC-USDT", "ETH-USDT", "BNB-USDT"]
     active_symbols: tuple[str, ...] = tuple(fallback)
 
     def _spawn_stream(target: tuple[str, ...]) -> asyncio.Task[None]:
@@ -3817,7 +3752,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=_int_env("BIAN_MARKET_LIMIT", 20))
     parser.add_argument(
         "--stream-symbols",
-        default=os.environ.get("BIAN_STREAM_SYMBOLS", "BTC-USDT,ETH-USDT"),
+        default=os.environ.get("BIAN_STREAM_SYMBOLS", "BTC-USDT,ETH-USDT,BNB-USDT"),
     )
     parser.add_argument(
         "--stream-flush-sec",

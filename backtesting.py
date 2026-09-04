@@ -252,10 +252,20 @@ class _BacktestStore:
     def initialize(self) -> None:
         return None
 
-    def is_halted(self) -> bool:
+    def is_halted(self, *, mode: str | None = None, market: str = "FUTURES") -> bool:
+        del mode, market
         return self.halted
 
-    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+    def set_halt(
+        self,
+        halted: bool,
+        *,
+        reason: str,
+        source: str,
+        mode: str | None = None,
+        market: str = "FUTURES",
+    ) -> None:
+        del mode, market
         self.halted = halted
         self.events.append({"event_type": "HALT", "reason": reason, "source": source})
 
@@ -298,16 +308,23 @@ class _BacktestStore:
     def append_order_event(self, order_id: UUID, **fields: Any) -> None:
         self.events.append({"order_id": order_id, **fields})
 
-    def get_order(self, order_id: UUID) -> dict[str, Any] | None:
+    def get_order(self, order_id: UUID, *, mode: str | None = None) -> dict[str, Any] | None:
+        del mode
         return self.orders.get(order_id)
 
-    def get_order_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+    def get_order_by_client_order_id(
+        self, client_order_id: str, *, mode: str | None = None
+    ) -> dict[str, Any] | None:
+        del mode
         return next(
             (row for row in self.orders.values() if row["client_order_id"] == client_order_id),
             None,
         )
 
-    def list_open_local_orders(self) -> list[dict[str, Any]]:
+    def list_open_local_orders(
+        self, *, mode: str | None = None, market: str = "FUTURES"
+    ) -> list[dict[str, Any]]:
+        del mode, market
         return [
             row for row in self.orders.values()
             if row["status"] in {
@@ -315,6 +332,12 @@ class _BacktestStore:
                 "PARTIALLY_FILLED", "UNKNOWN",
             }
         ]
+
+    def list_positions(
+        self, *, mode: str | None = None, market: str = "FUTURES"
+    ) -> list[dict[str, Any]]:
+        del mode, market
+        return list(self.positions.values())
 
     def record_trade(self, order_id: UUID, **fields: Any) -> UUID:
         trade_id = uuid4()
@@ -330,7 +353,8 @@ class _BacktestStore:
     def upsert_balance(self, asset: str, **fields: Any) -> None:
         self.balances[asset.upper()] = {"asset": asset.upper(), **fields}
 
-    def get_balance(self, asset: str) -> dict[str, Any] | None:
+    def get_balance(self, asset: str, *, mode: str | None = None) -> dict[str, Any] | None:
+        del mode
         return self.balances.get(asset.upper())
 
 

@@ -454,7 +454,10 @@ class TradingStore:
 
     @staticmethod
     def _mode(mode: str | None = None) -> str:
-        return (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+        resolved = str(mode or "").strip().lower()
+        if resolved not in {"paper", "shadow", "testnet", "live"}:
+            raise ValueError("store operations require an explicit mode")
+        return resolved
 
     def _session_id(self) -> str | None:
         bound = getattr(self, "validation_session_id", None)
@@ -1038,9 +1041,17 @@ class TradingStore:
                 "mode": resolved_mode,
                 "market": resolved_market,
             },
+            mode=resolved_mode,
         )
 
-    def set_user_stream_health(self, status: str, *, reason: str | None = None) -> None:
+    def set_user_stream_health(
+        self,
+        status: str,
+        *,
+        reason: str | None = None,
+        mode: str,
+    ) -> None:
+        resolved_mode = self._mode(mode)
         normalized = str(status or "UNKNOWN").strip().upper() or "UNKNOWN"
         previous = str(getattr(self, "_user_stream_health", "") or "").upper()
         self._user_stream_health = normalized
@@ -1050,7 +1061,13 @@ class TradingStore:
             event_type="USER_STREAM_HEALTH",
             severity="CRITICAL" if normalized in {"FAILED", "DEGRADED", "UNKNOWN"} else "INFO",
             message=reason or f"user stream {normalized}",
-            payload={"status": normalized, "health": normalized, "reason": reason},
+            payload={
+                "status": normalized,
+                "health": normalized,
+                "reason": reason,
+                "mode": resolved_mode,
+            },
+            mode=resolved_mode,
         )
 
     def user_stream_health(self) -> str:
@@ -3371,7 +3388,14 @@ class TradingStore:
             "restart_comparison": comparison,
         }
 
-    def record_runtime_gate_status(self, gate: str, status: str, *, detail: dict[str, Any] | None = None) -> UUID:
+    def record_runtime_gate_status(
+        self,
+        gate: str,
+        status: str,
+        *,
+        detail: dict[str, Any] | None = None,
+        mode: str | None = None,
+    ) -> UUID:
         """Persist externally verified readiness evidence for one gate."""
         normalized_gate = gate.strip().lower()
         normalized_status = status.strip().upper()
@@ -3401,6 +3425,7 @@ class TradingStore:
             severity="INFO" if normalized_status != "FAILED" else "CRITICAL",
             message=f"runtime gate {normalized_gate} is {normalized_status}",
             payload=payload,
+            mode=self._mode(mode if mode is not None else payload.get("mode")),
         )
 
     def runtime_gate_statuses(self) -> dict[str, str]:
@@ -3483,13 +3508,14 @@ class TradingStore:
                         }
         return values
 
-    def trading_summary(self) -> dict[str, Any]:
+    def trading_summary(self, *, mode: str) -> dict[str, Any]:
         from datetime import datetime, timezone
 
-        balances = self.list_balances()
+        resolved_mode = self._mode(mode)
+        balances = self.list_balances(mode=resolved_mode)
         usdt = next((row for row in balances if row["asset"] == "USDT"), None)
-        trades = self.list_trades(limit=200)
-        positions = self.list_positions()
+        trades = self.list_trades(limit=200, mode=resolved_mode)
+        positions = self.list_positions(mode=resolved_mode)
         now = datetime.now(timezone.utc)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -3559,11 +3585,12 @@ class TradingStore:
         decision: str,
         reason: str,
         payload: dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> UUID:
         import psycopg2
 
         event_id = uuid4()
-        mode = self._mode((payload or {}).get("mode"))
+        mode = self._mode(mode if mode is not None else (payload or {}).get("mode"))
         market = str((payload or {}).get("market", "FUTURES")).upper()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
@@ -3596,11 +3623,12 @@ class TradingStore:
         severity: str,
         message: str,
         payload: dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> UUID:
         import psycopg2
 
         event_id = uuid4()
-        mode = self._mode((payload or {}).get("mode"))
+        mode = self._mode(mode if mode is not None else (payload or {}).get("mode"))
         market = str((payload or {}).get("market", "FUTURES")).upper()
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:

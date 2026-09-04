@@ -35,8 +35,10 @@ Testnet credentials use `BIAN_TESTNET_API_KEY` and
 `BIAN_LIVE_API_KEY` and `BIAN_LIVE_API_SECRET`. Secrets are only read from
 secret configuration, never stored in the database or returned by the API.
 
-Production execution market is Binance USD-M USDT-margined perpetual. Spot is
-public confirmation only; `PrivateClient` cannot place Spot orders.
+Production execution market is Binance USD-M USDT-margined perpetual. First-phase
+universe is `BTCUSDT`, `ETHUSDT`, and `BNBUSDT` only. Spot is public confirmation
+only; `PrivateClient` cannot place Spot orders. Web3 and DEX trading live in a
+separate workspace.
 
 The read-only API exposes `/health` and
 `/api/os/front-data`. Financial OS proxies that contract through
@@ -81,7 +83,7 @@ PaperExecutor contract in an ephemeral ledger; close-only SMA input remains a
 baseline and fails closed when Futures evidence is absent.
 
 Live remains blocked until the persisted observation, shadow, Testnet,
-reconciliation, data-health, risk, Meme, and explicit operator gates pass.
+reconciliation, data-health, risk, major-universe, and explicit operator gates pass.
 Testnet requires separate credentials and a real account preflight; without
 them its lifecycle is `TESTNET_BLOCKED_BY_EXTERNAL_CREDENTIALS`.
 

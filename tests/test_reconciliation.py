@@ -100,7 +100,8 @@ class StoreStub:
     def append_order_event(self, order_id, **fields):
         self.events.append((order_id, fields))
 
-    def get_order_by_client_order_id(self, client_order_id):
+    def get_order_by_client_order_id(self, client_order_id, *, mode=None):
+        del mode
         return next((row for row in self.orders if row["client_order_id"] == client_order_id), None)
 
     def record_system_event(self, **fields):
@@ -234,7 +235,7 @@ def test_user_stream_preserves_binance_trade_id() -> None:
             },
         }
     )
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
     trade = next(item for item in store.trades if item.get("exchange_trade_id") == "77")
     assert trade["exchange_trade_id"] == "77"
 
@@ -303,7 +304,7 @@ def test_account_update_testnet_does_not_mutate_live_position(monkeypatch) -> No
             "a": {"P": [{"s": "BTCUSDT", "pa": "9", "ep": "100", "up": "0", "cr": "0", "mt": "isolated", "ps": "BOTH"}]},
         }
     )
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
     live = next(row for row in store.positions if row.get("mode") == "live")
     assert str(live["quantity"]) == "1"
     assert store.positions[-1].get("mode") == "testnet"
@@ -358,7 +359,7 @@ def test_user_stream_unknown_order_halts() -> None:
     event = normalize_user_event(
         {"e": "ORDER_TRADE_UPDATE", "o": {"c": "MISSING", "X": "FILLED", "s": "BTCUSDT"}}
     )
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
     assert store.halt_calls
 
 
@@ -391,8 +392,8 @@ def test_user_stream_duplicate_trade_event_is_idempotent() -> None:
         },
     }
     event = normalize_user_event(payload)
-    apply_user_stream_event(store, event)
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
+    apply_user_stream_event(store, event, mode="testnet")
 
     assert len(store.updated) == 1
     assert len(store.events) == 1
@@ -403,7 +404,7 @@ def test_user_stream_account_update_is_observation_only() -> None:
     event = normalize_user_event(
         {"e": "ACCOUNT_UPDATE", "a": {"B": [{"a": "USDT", "wb": "50", "cw": "40"}]}}
     )
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
     assert store.balances[0]["wallet_balance"] == Decimal("50")
     assert store.halt_calls == []
 
@@ -445,7 +446,7 @@ def test_account_update_patches_position_and_does_not_replace_unobserved_balance
         }
     )
 
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
 
     balance = store.balances[-1]
     assert balance["available_balance"] == Decimal("81")
@@ -795,7 +796,7 @@ def test_user_stream_and_rest_same_trade_is_one_trade() -> None:
             },
         }
     )
-    apply_user_stream_event(store, event)
+    apply_user_stream_event(store, event, mode="testnet")
     client = _trade_client([
         {
             "id": 88,

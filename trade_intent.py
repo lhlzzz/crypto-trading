@@ -14,7 +14,14 @@ Action = Literal["OPEN", "REDUCE", "CLOSE"]
 MarginType = Literal["ISOLATED"]
 PositionMode = Literal["ONE_WAY"]
 ExchangeSide = Literal["BUY", "SELL"]
-MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
+FuturesRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
+MemeRiskTier = FuturesRiskTier
+CANONICAL_FUTURES_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT", "BNBUSDT"})
+
+
+def is_canonical_futures_symbol(symbol: str | None) -> bool:
+    """First-phase Binance USD-M universe: BTC, ETH, and BNB only."""
+    return str(symbol or "").strip().upper() in CANONICAL_FUTURES_SYMBOLS
 
 
 def _utc_now() -> datetime:

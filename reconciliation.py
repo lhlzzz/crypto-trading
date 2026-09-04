@@ -51,10 +51,7 @@ class Reconciler:
         self.mode = mode
 
     def recover(self) -> ReconciliationResult:
-        try:
-            halted = self.store.is_halted(mode=self.mode)
-        except TypeError:
-            halted = self.store.is_halted()
+        halted = self.store.is_halted(mode=self.mode)
         if halted:
             return ReconciliationResult("HALTED", False, ("trading is halted",))
         try:
@@ -222,10 +219,7 @@ class Reconciler:
         local_rows = []
         lister = getattr(self.store, "list_positions", None)
         if lister is not None:
-            try:
-                local_rows = lister(mode=self.mode)
-            except TypeError:
-                local_rows = lister()
+            local_rows = lister(mode=self.mode)
         recovered = 0
         local_by_symbol = {str(row["symbol"]): row for row in local_rows}
         for symbol in set(broker) | set(local_by_symbol):
@@ -333,21 +327,12 @@ class Reconciler:
             lister = getattr(self.store, name, None)
             if not callable(lister):
                 continue
-            try:
-                rows = lister(mode=self.mode, market="FUTURES")
-            except TypeError:
-                try:
-                    rows = lister(mode=self.mode)
-                except TypeError:
-                    continue
+            rows = lister(mode=self.mode, market="FUTURES")
             return [row for row in list(rows or []) if isinstance(row, dict)]
         lister = getattr(self.store, "list_open_local_orders", None)
         if not callable(lister):
             raise RuntimeError("canonical order loader is unavailable")
-        try:
-            rows = lister(mode=self.mode)
-        except TypeError:
-            rows = lister()
+        rows = lister(mode=self.mode)
         return [row for row in list(rows or []) if isinstance(row, dict)]
 
     def _trade_reconciliation_symbols(self, local_orders: list[dict[str, Any]]) -> list[str]:
@@ -358,10 +343,7 @@ class Reconciler:
                 symbols.add(symbol)
         lister = getattr(self.store, "list_positions", None)
         if callable(lister):
-            try:
-                rows = lister(mode=self.mode)
-            except TypeError:
-                rows = lister()
+            rows = lister(mode=self.mode)
             for row in rows or []:
                 if not isinstance(row, dict):
                     continue
@@ -380,10 +362,7 @@ class Reconciler:
         lister = getattr(self.store, "list_trades", None)
         rows: list[Any]
         if callable(lister):
-            try:
-                rows = list(lister(mode=self.mode) or [])
-            except TypeError:
-                rows = list(lister() or [])
+            rows = list(lister(mode=self.mode) or [])
         else:
             rows = list(getattr(self.store, "trades", None) or [])
         found: set[str] = set()
@@ -529,15 +508,15 @@ class Reconciler:
             )
 
     def _fail(self, reason: str) -> ReconciliationResult:
-        try:
-            self.store.set_halt(True, reason=reason, source="reconciliation", mode=self.mode)
-        except TypeError:
-            self.store.set_halt(True, reason=reason, source="reconciliation")
+        self.store.set_halt(True, reason=reason, source="reconciliation", mode=self.mode)
         return ReconciliationResult("HALT", False, (reason,))
 
 
-def apply_user_stream_event(store: TradingStore, event: Any) -> None:
+def apply_user_stream_event(store: TradingStore, event: Any, *, mode: str) -> None:
     """Apply a private futures event as a local observation, never as final truth."""
+    resolved_mode = str(mode or "").strip().lower()
+    if resolved_mode not in {"paper", "shadow", "testnet", "live"}:
+        raise ValueError("user stream observations require an explicit mode")
     event_id = getattr(event, "event_id", None)
     if event_id:
         seen = getattr(store, "_user_stream_event_ids", None)
@@ -553,16 +532,20 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
         raw_payload = getattr(event, "raw", None)
         if isinstance(raw_payload, dict):
             payload_mode = raw_payload.get("mode")
-        mode = str(payload_mode or os.environ.get("BIAN_MODE", "testnet")).strip().lower()
+        if payload_mode and str(payload_mode).strip().lower() != resolved_mode:
+            store.set_halt(
+                True,
+                reason="user stream mode does not match runtime mode",
+                source="user_stream",
+                mode=resolved_mode,
+            )
+            return
         for balance in getattr(event, "balance_updates", ()):
             asset = str(balance.get("asset") or "").upper()
             if not asset:
                 continue
             getter = getattr(store, "get_balance", None)
-            try:
-                current = getter(asset, mode=mode) if callable(getter) else None
-            except TypeError:
-                current = getter(asset) if callable(getter) else None
+            current = getter(asset, mode=resolved_mode) if callable(getter) else None
             current = current or {}
             payload = dict(current.get("payload") or {})
             payload.update({
@@ -581,7 +564,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 margin_balance=Decimal(str(current.get("margin_balance") or wallet)),
                 used_margin=Decimal(str(current.get("used_margin") or max(Decimal("0"), wallet - available))),
                 unrealized_pnl=Decimal(str(current.get("unrealized_pnl") or "0")),
-                mode=mode,
+                mode=resolved_mode,
                 payload=payload,
             )
         for position in getattr(event, "position_updates", ()):
@@ -590,7 +573,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 continue
             amount = Decimal(str(position.get("quantity") or "0"))
             getter = getattr(store, "get_position", None)
-            current = getter(symbol, mode=mode) if callable(getter) else {}
+            current = getter(symbol, mode=resolved_mode) if callable(getter) else {}
             current = current or {}
             direction, quantity = _exchange_position({
                 "positionAmt": str(amount),
@@ -617,7 +600,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 maintenance_margin=current.get("maintenance_margin"),
                 liquidation_price=current.get("liquidation_price"),
                 funding_pnl=Decimal(str(current.get("funding_pnl") or "0")),
-                mode=mode,
+                mode=resolved_mode,
                 payload={
                     **(current.get("payload") or {}),
                     "source": getattr(event, "source", "USER_STREAM"),
@@ -662,19 +645,16 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
     client_order_id = getattr(event, "client_order_id", None)
     if not client_order_id:
         return
-    order_mode = str(os.environ.get("BIAN_MODE", "")).strip().lower() or None
     getter = getattr(store, "get_order_by_client_order_id", None)
     local = None
     if callable(getter):
-        try:
-            local = getter(str(client_order_id), mode=order_mode) if order_mode else getter(str(client_order_id))
-        except TypeError:
-            local = getter(str(client_order_id))
+        local = getter(str(client_order_id), mode=resolved_mode)
     if local is None:
         store.set_halt(
             True,
             reason=f"user stream order has no local record: {client_order_id}",
             source="user_stream",
+            mode=resolved_mode,
         )
         return
     status = _normal_status(str(getattr(event, "order_status", "UNKNOWN")))
@@ -683,6 +663,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
             True,
             reason=f"user stream order status unknown: {client_order_id}",
             source="user_stream",
+            mode=resolved_mode,
         )
         return
     position_side = str(getattr(event, "position_side", "") or "").upper()
@@ -742,7 +723,7 @@ def apply_user_stream_event(store: TradingStore, event: Any) -> None:
                 position_side=position_side or None,
                 source_event_id=event_id,
                 exchange_trade_id=getattr(event, "trade_id", None),
-                mode=str(local.get("mode") or order_mode or os.environ.get("BIAN_MODE", "testnet")),
+                mode=resolved_mode,
                 payload={
                     "source": "user_stream",
                     "event_id": event_id,

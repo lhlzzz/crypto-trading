@@ -30,19 +30,34 @@ calling Risk, Execution, TradeIntent creation, or order submission.
 `runtime_gate.py` is the canonical readiness owner. Its `live_allowed` result
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
+The gate is re-evaluated every trading cycle; a startup snapshot cannot be
+reused forever. HALT, DEGRADED, RECONCILIATION_FAILED, USERSTREAM_FAILED,
+DATA_STALE, and RISK_FAILED block new OPEN. Stale, UNKNOWN, UNSAFE, or
+MISSING evidence cannot produce a strategy CLOSE; emergency flatten remains
+a separate semantic.
 
-Current validation status on 2026-09-03, commit `d1fd55dde97cab5cf7f0ce22475ca46205119b63`:
-code checks are `409` pytest tests passed, `compileall` PASS, `git diff --check`
-PASS. PostgreSQL schema/status remains healthy. `LIVE_ALLOWED=false`.
-`TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`. UserStream failure blocks OPEN;
-REDUCE/CLOSE remains available under current risk/reconciliation rules.
-Gate evidence is current-session scoped. `exchange_trade_id` is persisted.
-Positions are isolated by `(mode, market, symbol)`. Validation episodes are
-session-scoped. Startup recomputes the canonical gate after reconciliation.
-Canonical symbols come from `trading_symbols_for_mode()`. Unknown Binance exchange trades HALT. FILLED local orders remain visible to trade recovery. Reconciler queries use explicit `mode=self.mode`. Freeze-path and
-runtime-safety files changed, so prior realtime evidence remains `EXPIRED`
-and must not be reused: `REALTIME_30M=EXPIRED`, `REALTIME_2H=EXPIRED`,
-`REALTIME_6H=NOT_STARTED`, `REALTIME_24H=NOT_STARTED`. `PAPER_24H=NOT_STARTED`,
-`SHADOW_7D=NOT_STARTED`, `ALPHA=INSUFFICIENT_SAMPLE` until a later persisted
-OOS session exists, `LIVE_PREFLIGHT` is live-mode only and still blocked,
-`LIVE=BLOCKED`. Do not treat historical 30M/2H PASS as current.
+Production execution market is Binance USD-M Futures. First-phase universe is
+only `BTCUSDT`, `ETHUSDT`, and `BNBUSDT` via `trading_symbols_for_mode()`.
+Any other live symbol is REJECT/HALT. Universe expansion is a new release,
+not a config change. Spot is confirmation only and has no private trading.
+Web3/DEX/Spot private trading is out of this workspace. Store trading-state
+calls require explicit `mode=`; implicit `BIAN_MODE` fallback is banned.
+Live CREATE, CANCEL, and CANCEL_ALL all require `authorize_live_order_mutation`.
+
+Current validation status on 2026-09-04 after major-coin and meme
+convergence: `449` pytest tests passed, `compileall` PASS,
+`git diff --check` PASS.
+Prior 409-test evidence and commit
+`d1fd55dde97cab5cf7f0ce22475ca46205119b63` are expired and must not be reused.
+`LIVE_ALLOWED=false`. `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`.
+UserStream failure blocks OPEN. Gate evidence is current-session scoped.
+`exchange_trade_id` is persisted. Positions are isolated by
+`(mode, market, symbol)`. Unknown Binance exchange trades HALT. FILLED local
+orders remain visible to trade recovery. Reconciler queries use explicit
+`mode=self.mode`. Freeze-path and runtime-safety files changed, so prior
+realtime evidence remains `EXPIRED`: `REALTIME_30M=EXPIRED`,
+`REALTIME_2H=EXPIRED`, `REALTIME_6H=NOT_STARTED`, `REALTIME_24H=NOT_STARTED`.
+`PAPER_24H=NOT_STARTED`, `SHADOW_7D=NOT_STARTED`,
+`ALPHA=INSUFFICIENT_SAMPLE` until a later persisted OOS session exists,
+`LIVE_PREFLIGHT` is live-mode only and still blocked, `LIVE=BLOCKED`.
+Do not treat historical 30M/2H PASS as current.

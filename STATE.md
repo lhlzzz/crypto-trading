@@ -5,7 +5,8 @@ the `bian` PostgreSQL database on port `5446`. Its read-only FastAPI contract
 runs on port `8001` and is consumed by Financial OS; `bian` remains the sole
 database owner.
 
-Current target: Binance USD-M Meme Futures capital positioning. Legacy SMA is
+Current target: Binance USD-M Major Futures capital positioning for
+`BTCUSDT`, `ETHUSDT`, and `BNBUSDT`. Legacy SMA is
 research baseline only; Capital Positioning remains disabled by default until
 shadow, paper, testnet, and recovery gates pass.
 `POSITIONING_DECISION_ENABLED` defaults to `false`.
@@ -61,7 +62,7 @@ for audit history, not as the current implementation state:
 2. Paper accounting is isolated futures margin: mark-price PnL, funding,
    fees, slippage, partial fill, and mark-price liquidation HALT.
 3. Risk validates margin, leverage, liquidation buffer, reverse-position,
-   reduce-only, and meme `BLOCK`/`OBSERVE`/`REDUCED`/`TRADEABLE`.
+   reduce-only, and futures quality `BLOCK`/`OBSERVE`/`REDUCED`/`TRADEABLE`.
 4. Universe ranking is Spot 24h quote-volume/price-change. There is no
    `MEME_ALLOWLIST` / `MEME_BLOCKLIST` or `TRADEABLE`/`REDUCED`/`OBSERVE`/
    `BLOCK` quality tier.
@@ -197,14 +198,19 @@ research baseline until positioning gates pass.
 - Validation is a persisted session in `runtime_validation_report.json` with
   stage states `NOT_STARTED`/`RUNNING`/`PASSED`/`FAILED`/`BLOCKED`/`EXPIRED`.
 
-## Current verification (2026-09-03)
+## Current verification (2026-09-04)
 
-Final commit: `d1fd55dde97cab5cf7f0ce22475ca46205119b63`.
-Base: `c35379a38f8d6defd613ac66e4618f7553cc8867`.
+Prior commit `d1fd55dde97cab5cf7f0ce22475ca46205119b63` and its 409-test
+evidence are expired after freeze-path and runtime-safety changes.
 
-This round closed remaining exchange-trade reconciliation gaps. `409` pytest
-tests passed. `compileall` PASS. `git diff --check` PASS.
+This round converges bian onto Binance USD-M major futures:
+`BTCUSDT`, `ETHUSDT`, `BNBUSDT`. Store trading-state calls require explicit
+`mode=`. Live CREATE/CANCEL/CANCEL_ALL share `authorize_live_order_mutation`.
+Runtime gate is re-evaluated every cycle. Stale/UNKNOWN evidence cannot
+produce a strategy CLOSE.
+
 `LIVE_ALLOWED=false`. `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`.
+Do not treat historical 30M/2H PASS as current.
 
 P0/P1 results:
 

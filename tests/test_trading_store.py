@@ -95,6 +95,7 @@ def test_trade_and_order_event_persistence_use_idempotent_conflict_keys():
             fee=Decimal("0.1"),
             fee_asset="USDT",
             source_event_id="exchange-event-1",
+            mode="paper",
         )
 
     statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
@@ -504,6 +505,7 @@ def test_duplicate_exchange_trade_id_is_idempotent():
             fee=Decimal("0"),
             fee_asset="USDT",
             exchange_trade_id="77",
+            mode="paper",
         )
         second = store.record_trade(
             UUID("00000000-0000-0000-0000-000000000001"),
@@ -514,6 +516,7 @@ def test_duplicate_exchange_trade_id_is_idempotent():
             fee=Decimal("0"),
             fee_asset="USDT",
             exchange_trade_id="77",
+            mode="paper",
         )
     statement = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "ON CONFLICT (mode, exchange_trade_id)" in statement
@@ -596,7 +599,7 @@ def test_record_trade_uses_canonical_mode_not_payload():
     connection.cursor.return_value.__enter__.return_value = cursor
     store = TradingStore("postgresql://test")
     with patch("psycopg2.connect", return_value=connection), patch.dict(
-        "os.environ", {"BIAN_MODE": "testnet"}, clear=False
+        "os.environ", {"BIAN_MODE": "live"}, clear=False
     ):
         store.record_trade(
             UUID("00000000-0000-0000-0000-000000000001"),
@@ -608,6 +611,7 @@ def test_record_trade_uses_canonical_mode_not_payload():
             fee_asset="USDT",
             exchange_trade_id="91",
             payload={"mode": "live"},
+            mode="testnet",
         )
     args = cursor.execute.call_args.args[1]
     assert args[11] == "testnet"

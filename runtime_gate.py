@@ -13,6 +13,7 @@ import os
 from binance_client import ClientConfig
 from engine import ObservationFreshnessPolicy, runtime_required_sources, validate_source_timestamps
 from risk import FuturesAccountSnapshot, RiskLimits
+from trade_intent import CANONICAL_FUTURES_SYMBOLS, is_canonical_futures_symbol
 
 
 def _enabled(name: str, *, default: bool = False) -> bool:
@@ -62,9 +63,9 @@ USER_STREAM_BLOCKED_STATES = frozenset(
 )
 
 
-def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
-    """Canonical symbol universe for one runtime mode. No cross-mode fallback."""
-    resolved = (mode or _mode()).strip().lower()
+def requested_symbols_for_mode(mode: str) -> tuple[str, ...]:
+    """Mode-local symbol request. Never falls back to another mode's env."""
+    resolved = str(mode or "").strip().lower()
     env_name = {
         "paper": "BIAN_PAPER_SYMBOLS",
         "shadow": "BIAN_PAPER_SYMBOLS",
@@ -76,7 +77,7 @@ def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
     raw = os.environ.get(env_name, "")
     if not str(raw).strip():
         if resolved in {"paper", "shadow"}:
-            raw = "BTCUSDT"
+            raw = ",".join(sorted(CANONICAL_FUTURES_SYMBOLS))
         else:
             return ()
     return tuple(
@@ -88,7 +89,27 @@ def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
     )
 
 
-def _symbols(symbols: Iterable[str] | None, *, mode: str | None = None) -> tuple[str, ...]:
+def unauthorized_symbols_for_mode(mode: str) -> tuple[str, ...]:
+    """Symbols requested for a mode that are outside the major-coin universe."""
+    return tuple(
+        symbol
+        for symbol in requested_symbols_for_mode(mode)
+        if not is_canonical_futures_symbol(symbol)
+    )
+
+
+def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
+    """Canonical major-coin universe for one runtime mode. No cross-mode fallback."""
+    if mode is None or not str(mode).strip():
+        raise ValueError("trading_symbols_for_mode requires an explicit mode")
+    return tuple(
+        symbol
+        for symbol in requested_symbols_for_mode(mode)
+        if is_canonical_futures_symbol(symbol)
+    )
+
+
+def _symbols(symbols: Iterable[str] | None, *, mode: str) -> tuple[str, ...]:
     if symbols is not None:
         return tuple(
             dict.fromkeys(
@@ -305,6 +326,7 @@ class GateResult:
     paper_db_ok: bool = False
     paper_accounting_ok: bool = False
     alpha_gate_status: str = "INSUFFICIENT_SAMPLE"
+    major_universe_ready: bool = False
     meme_universe_ready: bool = False
     evaluated_at: str | None = None
     evidence_verified_at: str | None = None
@@ -420,6 +442,7 @@ class GateResult:
             "paper_db_ok": self.paper_db_ok,
             "paper_accounting_ok": self.paper_accounting_ok,
             "alpha_gate_status": self.alpha_gate_status,
+            "major_universe_ready": self.major_universe_ready,
             "meme_universe_ready": self.meme_universe_ready,
             "evaluated_at": self.evaluated_at,
             "evidence_verified_at": self.evidence_verified_at,
@@ -482,6 +505,7 @@ class GateResult:
             "account_health": self.current_account_health,
             "user_stream": self.current_user_stream,
             "risk": self.risk_status,
+            "major_universe": self.major_universe_ready,
             "meme_universe": self.meme_universe_ready,
             "reasons": list(self.reasons),
         }
@@ -541,7 +565,7 @@ def evaluate_runtime_gate(
     probe_account: bool = False,
     gate_evidence: Mapping[str, str] | None = None,
     alpha_gate_status: str | None = None,
-    meme_universe_ready: bool | None = None,
+    major_universe_ready: bool | None = None,
 ) -> GateResult:
     """Evaluate the canonical runtime gate from configuration and evidence."""
     resolved_mode = (mode or _mode()).strip().lower()
@@ -570,13 +594,20 @@ def evaluate_runtime_gate(
     ).upper()
     if alpha_status not in {"INSUFFICIENT_SAMPLE", "ALPHA_NOT_SUPPORTED", "ALPHA_SUPPORTED"}:
         alpha_status = "ALPHA_NOT_SUPPORTED"
-    meme_ready = (
-        _enabled("MEME_UNIVERSE_READY")
-        if meme_universe_ready is None
-        else bool(meme_universe_ready)
+    unauthorized = tuple(
+        symbol for symbol in selected_symbols if not is_canonical_futures_symbol(symbol)
     )
-    if resolved_mode == "live" and not meme_ready:
-        reasons.append("MEME_UNIVERSE_NOT_READY")
+    if unauthorized:
+        reasons.append("UNAUTHORIZED_SYMBOL")
+    if resolved_mode == "live" and not selected_symbols:
+        reasons.append("MAJOR_UNIVERSE_EMPTY")
+    major_ready = (
+        bool(major_universe_ready)
+        if major_universe_ready is not None
+        else (bool(selected_symbols) and not unauthorized)
+    )
+    if resolved_mode == "live" and not major_ready:
+        reasons.append("MAJOR_UNIVERSE_NOT_READY")
     credentials_ok = resolved_mode == "paper" or bool(config.api_key and config.api_secret)
     # These fields are Binance account evidence. Paper must not present local
     # state as a verified exchange account.
@@ -795,7 +826,7 @@ def evaluate_runtime_gate(
             observation_gates_ok,
             testnet_lifecycle_ok,
             alpha_status == "ALPHA_SUPPORTED",
-            meme_ready,
+            major_ready,
             live_trading_enabled,
             confirmation_ok,
             realtime_24h_status == "PASSED",
@@ -894,7 +925,8 @@ def evaluate_runtime_gate(
         paper_db_ok=paper_db_ok,
         paper_accounting_ok=paper_accounting_ok,
         alpha_gate_status=alpha_status,
-        meme_universe_ready=meme_ready,
+        major_universe_ready=major_ready,
+        meme_universe_ready=False,
         evaluated_at=evaluated_at,
         evidence_verified_at=(
             max(evidence_verified_times).isoformat()

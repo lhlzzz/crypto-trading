@@ -194,7 +194,7 @@ def _risk(intent: TradeIntent, **updates: object):
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
         "positioning_confidence": Decimal("1"),
-        "is_meme": True,
+        "is_meme": False,
         "exchange_rules": ExchangeRules(
             symbol=intent.symbol,
             min_qty=Decimal("0.001"),
@@ -314,7 +314,7 @@ def test_paper_open_and_close_long() -> None:
     assert "BTC" not in store.balances
 
 
-def test_paper_exit_remains_possible_while_store_is_halted() -> None:
+def test_paper_strategy_close_is_blocked_while_store_is_halted() -> None:
     store = MemoryStore()
     executor = PaperExecutor(
         store=store,
@@ -345,10 +345,8 @@ def test_paper_exit_remains_possible_while_store_is_halted() -> None:
         meme_risk_tier="BLOCK",
     )
 
-    result = executor.submit(close, decision, market=_market())
-
-    assert decision.decision == "ALLOW"
-    assert result.status == "FILLED"
+    assert decision.decision == "HALT"
+    assert "halted" in decision.reason
 
 
 def test_paper_close_realized_pnl_updates_wallet_and_equity() -> None:
@@ -730,7 +728,7 @@ def test_futures_observation_to_paper_position_path() -> None:
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
         evidence_status={"orderbook": "VALID"},
-        is_meme=True,
+        is_meme=False,
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,
     )

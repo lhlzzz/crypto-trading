@@ -277,6 +277,7 @@ def test_runtime_gate_exposes_current_health() -> None:
         mode="paper",
         store=RequiredFreshStore(),
         reconciliation_ok=True,
+        symbols=["BTCUSDT"],
     )
 
     assert gate.current_data_health == "OK"
@@ -310,6 +311,7 @@ def test_runtime_gate_exposes_transport_health() -> None:
         mode="paper",
         store=RequiredFreshStore(),
         reconciliation_ok=True,
+        symbols=["BTCUSDT"],
     )
     assert gate.global_transport_health in {"OK", "DEGRADED"}
     assert "BTCUSDT" in gate.per_symbol_source_health
@@ -381,10 +383,15 @@ def test_paper_testnet_live_symbol_sets_are_independent(monkeypatch) -> None:
 
     monkeypatch.setenv("BIAN_PAPER_SYMBOLS", "BTCUSDT")
     monkeypatch.setenv("BIAN_TESTNET_SYMBOLS", "ETHUSDT")
-    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "SOLUSDT")
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "BNBUSDT")
     assert trading_symbols_for_mode("paper") == ("BTCUSDT",)
     assert trading_symbols_for_mode("testnet") == ("ETHUSDT",)
-    assert trading_symbols_for_mode("live") == ("SOLUSDT",)
+    assert trading_symbols_for_mode("live") == ("BNBUSDT",)
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "SOLUSDT")
+    assert trading_symbols_for_mode("live") == ()
+    from runtime_gate import unauthorized_symbols_for_mode
+
+    assert unauthorized_symbols_for_mode("live") == ("SOLUSDT",)
     monkeypatch.delenv("BIAN_LIVE_SYMBOLS", raising=False)
     assert trading_symbols_for_mode("live") == ()
 
@@ -400,3 +407,17 @@ def test_live_preflight_without_client_cannot_pass(monkeypatch) -> None:
     result = evaluate_runtime_gate(mode="live", probe_account=True)
     assert result.live_allowed is False
     assert result.account_reachable is False
+
+
+def test_live_unauthorized_symbol_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "DOGEUSDT")
+    gate = evaluate_runtime_gate(
+        mode="live",
+        symbols=["DOGEUSDT"],
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=False,
+    )
+    assert gate.live_allowed is False
+    assert "UNAUTHORIZED_SYMBOL" in gate.reasons
+    assert gate.major_universe_ready is False

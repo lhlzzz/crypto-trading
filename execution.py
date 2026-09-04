@@ -194,6 +194,7 @@ class _BaseExecutor(Executor):
                 decision=risk_decision.decision,
                 reason=risk_decision.reason,
                 payload=self._risk_audit_payload(risk_decision),
+                mode=self.config.mode,
             )
             raise ExecutionRejected(risk_decision.reason)
         approved = risk_decision.executable_intent
@@ -204,6 +205,7 @@ class _BaseExecutor(Executor):
             decision=risk_decision.decision,
             reason=risk_decision.reason,
             payload=self._risk_audit_payload(risk_decision),
+            mode=self.config.mode,
         )
         self.store.record_intent(approved, status="RISK_APPROVED")
         return approved
@@ -246,14 +248,10 @@ class _BaseExecutor(Executor):
         )
 
     def _store_call(self, method: str, *args, **kwargs):
-        """Call a store method with explicit runtime mode when the owner accepts it."""
+        """Call a store method with explicit runtime mode. No silent fallback."""
         target = getattr(self.store, method)
-        kwargs.setdefault("mode", self.config.mode)
-        try:
-            return target(*args, **kwargs)
-        except TypeError:
-            kwargs.pop("mode", None)
-            return target(*args, **kwargs)
+        kwargs["mode"] = self.config.mode
+        return target(*args, **kwargs)
 
 
 class ExecutionRejected(RuntimeError):
@@ -333,7 +331,9 @@ class PaperExecutor(_BaseExecutor):
                     "intent_id": str(approved.id),
                     "required": str(required_margin + fee_estimate),
                     "available": str(account["available_balance"]),
+                    "mode": self.config.mode,
                 },
+                mode=self.config.mode,
             )
             raise ExecutionRejected("paper margin is insufficient")
         expiry_base = market.current_timestamp or datetime.now(timezone.utc)
@@ -406,10 +406,7 @@ class PaperExecutor(_BaseExecutor):
 
     def get_open_orders(self) -> list[ExecutionResult]:
         lister = getattr(self.store, "list_open_local_orders", None)
-        try:
-            rows = lister(mode=self.config.mode) if lister is not None else []
-        except TypeError:
-            rows = lister() if lister is not None else []
+        rows = lister(mode=self.config.mode) if lister is not None else []
         results: list[ExecutionResult] = []
         for row in rows:
             self._expire_if_needed(row)
@@ -458,10 +455,7 @@ class PaperExecutor(_BaseExecutor):
         return result
 
     def account_state(self) -> dict[str, Decimal]:
-        try:
-            row = self.store.get_balance("USDT", mode=self.config.mode) or {}
-        except TypeError:
-            row = self.store.get_balance("USDT") or {}
+        row = self.store.get_balance("USDT", mode=self.config.mode) or {}
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
         wallet = _decimal_field(row, "wallet_balance", default=str(row.get("free", self.config.initial_usdt)))
         used = _decimal_field(row, "used_margin", default=str(row.get("locked", "0")))
@@ -484,20 +478,14 @@ class PaperExecutor(_BaseExecutor):
     def account_snapshot(self) -> FuturesAccountSnapshot:
         account = self.account_state()
         lister = getattr(self.store, "list_positions", None)
-        try:
-            positions = lister(mode=self.config.mode) if lister is not None else []
-        except TypeError:
-            positions = lister() if lister is not None else []
+        positions = lister(mode=self.config.mode) if lister is not None else []
         configured = {
             str(row.get("symbol")).upper(): self.config.default_leverage
             for row in positions
             if row.get("symbol")
         }
         open_lister = getattr(self.store, "list_open_local_orders", None)
-        try:
-            open_orders = open_lister(mode=self.config.mode) if open_lister is not None else []
-        except TypeError:
-            open_orders = open_lister() if open_lister is not None else []
+        open_orders = open_lister(mode=self.config.mode) if open_lister is not None else []
         return FuturesAccountSnapshot.from_paper(
             account=account,
             positions=positions,
@@ -673,6 +661,7 @@ class PaperExecutor(_BaseExecutor):
                 "position_notional": str(notional),
                 "funding_pnl": str(-signed),
             },
+            mode=self.config.mode,
         )
         return -signed
 
@@ -728,10 +717,11 @@ class PaperExecutor(_BaseExecutor):
                 "model": "SIMPLIFIED",
                 "binance_parity": "NOT_BINANCE_PARITY",
             },
+            mode=self.config.mode,
         )
         setter = getattr(self.store, "set_halt", None)
         if setter is not None:
-            setter(True, reason="LIQUIDATED", source="paper")
+            setter(True, reason="LIQUIDATED", source="paper", mode=self.config.mode)
         elif hasattr(self.store, "halted"):
             self.store.halted = True
 
@@ -766,10 +756,7 @@ class PaperExecutor(_BaseExecutor):
         getter = getattr(self.store, "get_order", None)
         if getter is None:
             return None
-        try:
-            return getter(order_id, mode=self.config.mode)
-        except TypeError:
-            return getter(order_id)
+        return getter(order_id, mode=self.config.mode)
 
     def _expire_if_needed(self, order: dict[str, Any]) -> None:
         expires_at = order.get("expires_at")
@@ -942,10 +929,7 @@ class PaperExecutor(_BaseExecutor):
         )
 
     def _ensure_initial_balance(self) -> None:
-        try:
-            existing = self.store.get_balance("USDT", mode=self.config.mode)
-        except TypeError:
-            existing = self.store.get_balance("USDT")
+        existing = self.store.get_balance("USDT", mode=self.config.mode)
         if existing is None:
             self._write_account(
                 wallet_balance=self.config.initial_usdt,
@@ -1027,10 +1011,7 @@ class PaperExecutor(_BaseExecutor):
         extra: dict[str, Any] | None = None,
     ) -> None:
         notional = quantity * mark_price
-        try:
-            current = self.store.get_position(symbol, mode=self.config.mode)
-        except TypeError:
-            current = self.store.get_position(symbol)
+        current = self.store.get_position(symbol, mode=self.config.mode)
         current_payload = (
             current.get("payload")
             if isinstance(current, dict) and isinstance(current.get("payload"), dict)

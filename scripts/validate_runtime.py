@@ -49,7 +49,7 @@ DURATION_GATES = {
     if spec["kind"] == "realtime"
 }
 LADDER = ("realtime_30m", "realtime_2h", "realtime_6h", "realtime_24h")
-BENCHMARK_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT"})
+BENCHMARK_SYMBOLS = frozenset({"BTCUSDT", "ETHUSDT", "BNBUSDT"})
 PAPER_RESTART_EXIT = 75
 STAGE_STATES = {
     "NOT_STARTED", "RUNNING", "PASSED", "FAILED", "BLOCKED", "EXPIRED",
@@ -808,17 +808,18 @@ def store_status(status: str) -> str:
 def universe_qualification(symbols: list[str]) -> dict[str, Any]:
     compact = [item.replace("-", "").upper() for item in symbols]
     benchmark = [item for item in compact if item in BENCHMARK_SYMBOLS]
-    production = [item for item in compact if item not in BENCHMARK_SYMBOLS]
-    benchmark_only = bool(compact) and set(compact) <= BENCHMARK_SYMBOLS
+    unauthorized = [item for item in compact if item not in BENCHMARK_SYMBOLS]
+    benchmark_only = bool(compact) and not unauthorized
     return {
         "runtime_stage_validated_symbols": compact,
-        "production_target_universe": production,
+        "production_target_universe": unauthorized,
         "benchmark_symbols": benchmark,
-        "meme_universe_validated": bool(production) and not benchmark_only,
+        "meme_universe_validated": False,
+        "major_universe_validated": benchmark_only,
         "qualification_scope": (
-            "BENCHMARK_ONLY" if benchmark_only else "MEME" if production and not benchmark else "MIXED"
+            "BENCHMARK_ONLY" if benchmark_only else "UNAUTHORIZED"
         ),
-        "is_meme": False if benchmark_only else bool(production),
+        "is_meme": False,
     }
 
 
@@ -853,7 +854,12 @@ def evidence_planes(
 def persist_store_gate(store: TradingStore | None, gate: str, status: str, detail: dict[str, Any]) -> None:
     if store is None or gate not in STORE_GATES:
         return
-    store.record_runtime_gate_status(gate, store_status(status), detail=detail)
+    store.record_runtime_gate_status(
+        gate,
+        store_status(status),
+        detail=detail,
+        mode=str(detail.get("mode") or os.environ.get("BIAN_MODE") or "paper"),
+    )
 
 
 def build_session_stage(
@@ -2042,7 +2048,7 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
         "USER_STREAM_HEALTHY": True,
         "RECONCILIATION_HEALTHY": True,
         "RISK_HEALTHY": True,
-        "MEME_UNIVERSE_HEALTHY": True,
+        "MAJOR_UNIVERSE_HEALTHY": True,
     }
     current_health: dict[str, Any] = {}
     try:
@@ -2069,7 +2075,8 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
             "current_reconciliation": gate.get("RECONCILIATION_HEALTH"),
             "global_transport_health": gate.get("global_transport_health"),
             "risk_health": gate.get("RISK_HEALTH"),
-            "meme_universe": gate.get("meme_universe"),
+            "major_universe": gate.get("major_universe"),
+            "meme_universe": False,
             "mode": gate.get("mode"),
             "symbols": live_symbols,
         }
@@ -2078,7 +2085,7 @@ def run_live_preflight(stages: dict[str, Any] | None = None) -> dict[str, Any]:
         required["USER_STREAM_HEALTHY"] = gate.get("USER_STREAM_HEALTH") == "OK"
         required["RECONCILIATION_HEALTHY"] = gate.get("RECONCILIATION_HEALTH") == "OK"
         required["RISK_HEALTHY"] = gate.get("RISK_HEALTH") == "SAFE"
-        required["MEME_UNIVERSE_HEALTHY"] = bool(gate.get("meme_universe"))
+        required["MAJOR_UNIVERSE_HEALTHY"] = bool(gate.get("major_universe"))
         if gate.get("global_transport_health") in {"HALT", "FAILED", "BLOCKED"}:
             required["REAL_DATA_READY"] = False
     except Exception as exc:

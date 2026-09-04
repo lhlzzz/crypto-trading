@@ -60,7 +60,7 @@ def _trading_halted() -> bool:
 
 def _persistent_trading_halt(store: TradingStore) -> bool:
     try:
-        return _trading_halted() or store.is_halted()
+        return _trading_halted() or store.is_halted(mode=_trading_mode())
     except Exception:
         return _trading_halted()
 
@@ -256,7 +256,7 @@ def get_trading_status() -> dict[str, Any]:
     store = _trading_store()
     try:
         counts = store.trading_counts()
-        summary = store.trading_summary()
+        summary = store.trading_summary(mode=_trading_mode())
         halted = _persistent_trading_halt(store)
         database_status = "ok"
     except Exception:
@@ -289,13 +289,15 @@ def get_trading_status() -> dict[str, Any]:
         "user_stream": gate.current_user_stream,
         "reconciliation": gate.reconciliation,
         "risk": gate.risk_status,
-        "meme_universe": gate.meme_universe_ready,
+        "major_universe": gate.major_universe_ready,
+        "meme_universe": False,
         "observation_gate_status": gate.observation_gate_status,
         "paper_gate_status": gate.paper_gate_status,
         "shadow_gate_status": gate.shadow_gate_status,
         "testnet_gate_status": gate.testnet_gate_status,
         "alpha_gate_status": gate.alpha_gate_status,
-        "meme_universe_ready": gate.meme_universe_ready,
+        "major_universe_ready": gate.major_universe_ready,
+        "meme_universe_ready": False,
         "data_health": gate.data_health,
         "reconciliation": gate.reconciliation,
         "risk_status": gate.risk_status,
@@ -314,7 +316,7 @@ def get_trading_status() -> dict[str, Any]:
 @app.get("/api/trading/summary")
 def get_trading_summary() -> dict[str, Any]:
     try:
-        return {"status": "ok", **_trading_store().trading_summary()}
+        return {"status": "ok", **_trading_store().trading_summary(mode=_trading_mode())}
     except Exception:
         return {"status": "unavailable"}
 
@@ -324,7 +326,7 @@ def get_trading_orders(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     try:
-        return {"items": _trading_store().list_orders(limit)}
+        return {"items": _trading_store().list_orders(limit, mode=_trading_mode())}
     except Exception:
         return {"items": [], "status": "unavailable"}
 
@@ -334,7 +336,7 @@ def get_trading_trades(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     try:
-        return {"items": _trading_store().list_trades(limit)}
+        return {"items": _trading_store().list_trades(limit, mode=_trading_mode())}
     except Exception:
         return {"items": [], "status": "unavailable"}
 
@@ -342,7 +344,7 @@ def get_trading_trades(
 @app.get("/api/trading/positions")
 def get_trading_positions() -> dict[str, Any]:
     try:
-        return {"items": _trading_store().list_positions()}
+        return {"items": _trading_store().list_positions(mode=_trading_mode())}
     except Exception:
         return {"items": [], "status": "unavailable"}
 
@@ -350,7 +352,7 @@ def get_trading_positions() -> dict[str, Any]:
 @app.get("/api/trading/balance")
 def get_trading_balance() -> dict[str, Any]:
     try:
-        return {"items": _trading_store().list_balances()}
+        return {"items": _trading_store().list_balances(mode=_trading_mode())}
     except Exception:
         return {"items": [], "status": "unavailable"}
 
@@ -362,7 +364,7 @@ def get_trading_risk(
     try:
         return {
             "halted": _persistent_trading_halt(_trading_store()),
-            "items": _trading_store().list_risk_events(limit),
+            "items": _trading_store().list_risk_events(limit, mode=_trading_mode()),
         }
     except Exception:
         return {"halted": _trading_halted(), "items": [], "status": "unavailable"}
@@ -373,7 +375,7 @@ def get_trading_events(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     try:
-        return {"items": _trading_store().list_system_events(limit)}
+        return {"items": _trading_store().list_system_events(limit, mode=_trading_mode())}
     except Exception:
         return {"items": [], "status": "unavailable"}
 
@@ -487,44 +489,6 @@ def get_positioning_status() -> dict[str, Any]:
         "trading_halted": _persistent_trading_halt(_trading_store()),
         "runtime_gate": gate.as_dict(),
     }
-
-
-@app.get("/api/meme/universe")
-def get_meme_universe(
-    limit: int = Query(default=100, ge=1, le=200),
-) -> dict[str, Any]:
-    """Expose the latest persisted Futures meme classification read-only."""
-    result = _positioning_items(limit)
-    if result.get("status") != "ok":
-        return result
-    return {
-        "status": "ok",
-        "market": "FUTURES",
-        "items": [
-            {
-                "symbol": item.get("symbol"),
-                "state": item.get("state"),
-                "meme_risk_tier": item.get("meme_risk_tier"),
-                "data_quality_score": item.get("data_quality_score"),
-                "observed_at": item.get("observed_at"),
-            }
-            for item in result.get("items", [])
-        ],
-    }
-
-
-@app.get("/api/meme/candidates")
-def get_meme_candidates(
-    limit: int = Query(default=20, ge=1, le=100),
-) -> dict[str, Any]:
-    result = get_meme_universe(200)
-    if result.get("status") != "ok":
-        return result
-    candidates = [
-        item for item in result.get("items", [])
-        if item.get("meme_risk_tier") in {"TRADEABLE", "REDUCED"}
-    ]
-    return {"status": "ok", "market": "FUTURES", "items": candidates[:limit]}
 
 
 if __name__ == "__main__":

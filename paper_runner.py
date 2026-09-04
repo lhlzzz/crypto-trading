@@ -40,7 +40,7 @@ from runtime_gate import (
     trading_symbols_for_mode,
     user_stream_allows_open,
 )
-from trade_intent import TradeIntent
+from trade_intent import TradeIntent, is_canonical_futures_symbol
 from trading_store import TradingStore
 
 
@@ -99,9 +99,14 @@ def _symbols(value: str) -> list[str]:
 
 
 def _mode_symbols(mode: str, value: str | None = None) -> list[str]:
-    if value:
-        return _symbols(value)
-    return list(trading_symbols_for_mode(mode))
+    symbols = _symbols(value) if value else list(trading_symbols_for_mode(mode))
+    unauthorized = [symbol for symbol in symbols if not is_canonical_futures_symbol(symbol)]
+    if unauthorized:
+        raise ValueError(
+            "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+            f"unauthorized symbols: {','.join(unauthorized)}"
+        )
+    return symbols
 
 
 def _current_user_stream_state(store: TradingStore, runtime_gate: GateResult | None) -> str:
@@ -124,12 +129,9 @@ def _set_halt(
     *,
     reason: str,
     source: str,
-    mode: str | None = None,
+    mode: str,
 ) -> None:
-    try:
-        store.set_halt(halted, reason=reason, source=source, mode=mode)
-    except TypeError:
-        store.set_halt(halted, reason=reason, source=source)
+    store.set_halt(halted, reason=reason, source=source, mode=mode)
 
 
 def _halt_user_stream(
@@ -137,17 +139,21 @@ def _halt_user_stream(
     reason: str,
     *,
     state: str = "FAILED",
-    mode: str | None = None,
+    mode: str,
 ) -> None:
     setter = getattr(store, "set_user_stream_health", None)
     if callable(setter):
-        setter(state, reason=reason)
+        try:
+            setter(state, reason=reason, mode=mode)
+        except TypeError:
+            setter(state, reason=reason)
     _set_halt(store, True, reason=reason, source="user_stream", mode=mode)
     store.record_system_event(
         event_type="RUNTIME_HALT",
         severity="CRITICAL",
         message=reason,
         payload={"source": "user_stream", "state": state, "mode": mode},
+        mode=mode,
     )
 
 
@@ -259,7 +265,9 @@ def _record_shadow(
             "direction": shadow["direction"],
             "state": shadow["state"],
             "positioning_decision": positioning.as_dict(),
+            "mode": "shadow",
         },
+        mode="shadow",
     )
     return positioning, shadow
 
@@ -442,7 +450,8 @@ def paper_shadow_attribution(
         event_type="PAPER_SHADOW_ATTRIBUTION",
         severity="INFO",
         message="positioning attribution calculated",
-        payload={"symbol": symbol.upper(), **payload},
+        payload={"symbol": symbol.upper(), "mode": "shadow", **payload},
+        mode="shadow",
     )
     return {"symbol": symbol.upper(), **payload}
 
@@ -615,9 +624,6 @@ def _risk_context(
         # classification is observe-only; it must not default to tradeable.
         meme_risk_tier=intent.meme_risk_tier or "OBSERVE",
         is_meme=intent.is_meme,
-        meme_require_classification=os.environ.get(
-            "MEME_REQUIRE_CLASSIFICATION", "true"
-        ).strip().lower() in {"1", "true", "yes", "on"},
         account_snapshot=account_snapshot,
         account_state_error=account_state_error,
         evidence_freshness=evidence_freshness,
@@ -640,7 +646,7 @@ def run_cycle(
     if mode != "paper":
         if runtime_gate is None:
             raise RuntimeError("non-paper cycles require the canonical runtime gate")
-        if mode == "live" and not runtime_gate.live_allowed:
+        if not runtime_gate.trading_enabled:
             raise RuntimeError(
                 "canonical runtime gate blocks trading: "
                 + "; ".join(runtime_gate.reasons)
@@ -719,7 +725,9 @@ def run_cycle(
                 "captured_at": frame.captured_at.isoformat(),
                 "strategy_version": engine.config.strategy_version,
                 "shadow": positioning.as_dict(),
+                "mode": mode,
             },
+            mode=mode,
         )
         return {
             "status": "no_signal",
@@ -734,6 +742,7 @@ def run_cycle(
                 decision="DENY",
                 reason="USER_STREAM_UNHEALTHY",
                 payload={"mode": mode, "state": stream_state, "action": intent.action},
+                mode=mode,
             )
             return {
                 "status": "blocked",
@@ -857,14 +866,15 @@ async def _run_private_forever(
 
     stream = UserStreamClient(
         ClientConfig.from_env(mode),
-        on_event=lambda event: apply_user_stream_event(store, event),
+        on_event=lambda event: apply_user_stream_event(store, event, mode=mode),
         on_reconcile=lambda: reconciler.recover(),
         on_halt=on_halt,
         on_listen_key=lambda key: store.record_system_event(
             event_type="LISTEN_KEY_CREATED",
             severity="INFO",
             message="user stream listenKey created",
-            payload={"listen_key": key, "created": True},
+            payload={"listen_key": key, "created": True, "mode": mode},
+            mode=mode,
         ),
     )
     stream_task = asyncio.create_task(stream.run_forever())
@@ -891,8 +901,19 @@ async def _run_private_forever(
             stream_state = str(getattr(stream, "state", "UNKNOWN") or "UNKNOWN").upper()
             setter = getattr(store, "set_user_stream_health", None)
             if callable(setter):
-                setter(stream_state)
-            current_gate = runtime_gate
+                try:
+                    setter(stream_state, mode=mode)
+                except TypeError:
+                    setter(stream_state)
+            current_gate = evaluate_runtime_gate(
+                mode=mode,
+                store=store,
+                client=executor.client if isinstance(executor, BinanceExecutor) else None,
+                symbols=symbols,
+                probe_account=False,
+                reconciliation_ok=runtime_gate.reconciliation_ok,
+                data_health_ok=None,
+            )
             for symbol in symbols:
                 try:
                     result = await asyncio.to_thread(
@@ -913,6 +934,7 @@ async def _run_private_forever(
                         severity="CRITICAL",
                         message=reason,
                         payload={"symbol": symbol, "error": str(exc), "mode": mode},
+                        mode=mode,
                     )
                     raise RuntimeError(reason) from exc
             await asyncio.sleep(interval)
@@ -954,6 +976,14 @@ def run_forever(
         )
         while deadline is None or time.monotonic() < deadline:
             _heartbeat(store)
+            current_gate = evaluate_runtime_gate(
+                mode=resolved_mode,
+                store=store,
+                symbols=symbols,
+                probe_account=False,
+                reconciliation_ok=runtime_gate.reconciliation_ok,
+                data_health_ok=None,
+            )
             for symbol in symbols:
                 try:
                     print(
@@ -963,7 +993,7 @@ def run_forever(
                             executor=executor,
                             public_client=public_client,
                             mode=resolved_mode,
-                            runtime_gate=runtime_gate,
+                            runtime_gate=current_gate,
                         ),
                         flush=True,
                     )
@@ -975,6 +1005,7 @@ def run_forever(
                         severity="CRITICAL",
                         message=reason,
                         payload={"symbol": symbol, "error": str(exc), "mode": resolved_mode},
+                        mode=resolved_mode,
                     )
                     raise RuntimeError(reason) from exc
             if restart_at is not None and time.monotonic() >= restart_at:
@@ -982,7 +1013,11 @@ def run_forever(
                     event_type="PAPER_PLANNED_RESTART",
                     severity="INFO",
                     message="planned paper restart",
-                    payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
+                    payload={
+                        "remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic())),
+                        "mode": resolved_mode,
+                    },
+                    mode=resolved_mode,
                 )
                 _record_restart_snapshot(store, "pre_restart", mode=resolved_mode, symbols=symbols)
                 raise SystemExit(75)
@@ -1029,7 +1064,8 @@ def run_shadow_forever(
                     event_type="SHADOW_CYCLE_FAILED",
                     severity="CRITICAL",
                     message=f"WATCHDOG:shadow:{type(exc).__name__}",
-                    payload={"symbol": symbol, "error": str(exc)},
+                    payload={"symbol": symbol, "error": str(exc), "mode": "shadow"},
+                    mode="shadow",
                 )
                 raise
         if restart_at is not None and time.monotonic() >= restart_at:
@@ -1037,7 +1073,11 @@ def run_shadow_forever(
                 event_type="SHADOW_PLANNED_RESTART",
                 severity="INFO",
                 message="planned shadow restart",
-                payload={"remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic()))},
+                payload={
+                    "remaining_sec": None if deadline is None else max(0, int(deadline - time.monotonic())),
+                    "mode": "shadow",
+                },
+                mode="shadow",
             )
             _record_restart_snapshot(store, "pre_restart", mode="shadow", symbols=symbols)
             raise SystemExit(75)
@@ -1115,6 +1155,15 @@ def main(argv: list[str] | None = None) -> int:
             client_config=client_config,
         )
         for symbol in symbols:
+            current_gate = evaluate_runtime_gate(
+                mode=args.mode,
+                store=store,
+                client=executor.client if isinstance(executor, BinanceExecutor) else None,
+                symbols=symbols,
+                probe_account=False,
+                reconciliation_ok=runtime_gate.reconciliation_ok,
+                data_health_ok=None,
+            )
             print(
                 run_cycle(
                     symbol,
@@ -1122,7 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
                     executor=executor,
                     public_client=public_client,
                     mode=args.mode,
-                    runtime_gate=runtime_gate,
+                    runtime_gate=current_gate,
                 ),
                 flush=True,
             )

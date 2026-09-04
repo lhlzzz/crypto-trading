@@ -10,7 +10,7 @@ from risk import (
     RiskContext,
     RiskGate,
     RiskLimits,
-    classify_meme_risk_tier,
+    classify_futures_risk_tier,
 )
 from trade_intent import TradeIntent
 
@@ -47,7 +47,7 @@ def _context(**updates: object) -> RiskContext:
         "data_quality_score": Decimal("1"),
         "liquidity_score": Decimal("1"),
         "positioning_confidence": Decimal("1"),
-        "is_meme": True,
+        "is_meme": False,
         "account_snapshot": FuturesAccountSnapshot(
             mode="paper",
             wallet_balance=Decimal("1000"),
@@ -359,7 +359,7 @@ def test_account_snapshot_mode_mismatch_halts() -> None:
     assert "INVALID_ACCOUNT_STATE" in decision.reason
 
 
-def test_stale_account_snapshot_blocks_open_but_not_reduce_only_exit() -> None:
+def test_stale_account_snapshot_blocks_open_and_reduce_only_exit() -> None:
     stale = FuturesAccountSnapshot(
         mode="paper",
         wallet_balance=Decimal("1000"),
@@ -390,7 +390,8 @@ def test_stale_account_snapshot_blocks_open_but_not_reduce_only_exit() -> None:
 
     assert open_decision.decision == "HALT"
     assert "ACCOUNT_SNAPSHOT_STALE" in open_decision.reason
-    assert close_decision.decision == "ALLOW"
+    assert close_decision.decision == "HALT"
+    assert "ACCOUNT_SNAPSHOT_STALE" in close_decision.reason
 
 
 def test_unknown_position_mark_halts_new_open() -> None:
@@ -414,53 +415,59 @@ def test_blocked_meme_tier_is_denied() -> None:
     assert "blocked" in decision.reason
 
 
-def test_meme_notional_cap() -> None:
+def test_meme_membership_cannot_open() -> None:
+    decision = RiskGate().evaluate(_intent(), _context(is_meme=True))
+    assert decision.decision == "DENY"
+    assert "canonical universe" in decision.reason
+
+
+def test_symbol_notional_cap() -> None:
     decision = RiskGate(
-        RiskLimits(max_meme_symbol_notional_usdt=Decimal("15"))
+        RiskLimits(max_symbol_notional_usdt=Decimal("15"))
     ).evaluate(
         _intent(quantity=Decimal("0.1")),
-        _context(symbol_meme_notional=Decimal("6")),
+        _context(symbol_notional=Decimal("6")),
     )
     assert decision.decision == "DENY"
-    assert "meme symbol" in decision.reason
+    assert "symbol exposure" in decision.reason
 
 
-def test_meme_portfolio_cap_is_separate_from_symbol_cap() -> None:
+def test_portfolio_cap_is_separate_from_symbol_cap() -> None:
     decision = RiskGate(
         RiskLimits(
-            max_meme_symbol_notional_usdt=Decimal("100"),
-            max_meme_portfolio_notional_usdt=Decimal("15"),
+            max_symbol_notional_usdt=Decimal("100"),
+            max_portfolio_notional_usdt=Decimal("15"),
         )
     ).evaluate(
         _intent(quantity=Decimal("0.1")),
-        _context(total_meme_notional=Decimal("6")),
+        _context(total_notional=Decimal("6")),
     )
     assert decision.decision == "DENY"
-    assert "total meme" in decision.reason
+    assert "total exposure" in decision.reason
 
 
-def test_directional_meme_cap() -> None:
+def test_directional_exposure_cap() -> None:
     decision = RiskGate(
-        RiskLimits(max_directional_meme_exposure_usdt=Decimal("15"))
+        RiskLimits(max_directional_exposure_usdt=Decimal("15"))
     ).evaluate(
         _intent(quantity=Decimal("0.1")),
-        _context(directional_meme_exposure=Decimal("6")),
+        _context(directional_exposure=Decimal("6")),
     )
     assert decision.decision == "DENY"
-    assert "directional meme" in decision.reason
+    assert "directional exposure" in decision.reason
 
 
-def test_classify_meme_risk_tier_uses_canonical_thresholds() -> None:
-    assert classify_meme_risk_tier(trading=False) == "BLOCK"
-    assert classify_meme_risk_tier(data_quality_score=Decimal("0.1")) == "OBSERVE"
-    assert classify_meme_risk_tier(
+def test_classify_futures_risk_tier_uses_canonical_thresholds() -> None:
+    assert classify_futures_risk_tier(trading=False) == "BLOCK"
+    assert classify_futures_risk_tier(data_quality_score=Decimal("0.1")) == "OBSERVE"
+    assert classify_futures_risk_tier(
         crowding_score=Decimal("0.95"),
         liquidity_score=Decimal("1"),
         data_quality_score=Decimal("1"),
         spread_bps=Decimal("2"),
         open_interest=Decimal("10"),
     ) == "REDUCED"
-    assert classify_meme_risk_tier(
+    assert classify_futures_risk_tier(
         crowding_score=Decimal("0.1"),
         liquidity_score=Decimal("1"),
         data_quality_score=Decimal("1"),
@@ -485,7 +492,7 @@ def test_each_configured_risk_limit_fails_closed() -> None:
         assert decision.decision == expected, (limits, updates, decision)
 
 
-def test_kill_switch_blocks_open_but_allows_close(monkeypatch) -> None:
+def test_kill_switch_blocks_open_and_close(monkeypatch) -> None:
     monkeypatch.setenv("BIAN_KILL_SWITCH", "true")
     open_decision = RiskGate().evaluate(_intent(), _context())
     close_decision = RiskGate().evaluate(
@@ -494,10 +501,11 @@ def test_kill_switch_blocks_open_but_allows_close(monkeypatch) -> None:
     )
     assert open_decision.decision == "DENY"
     assert "kill switch" in open_decision.reason
-    assert close_decision.decision == "ALLOW"
+    assert close_decision.decision == "DENY"
+    assert "kill switch" in close_decision.reason
 
 
-def test_exit_safety_survives_halt_and_untrusted_entry_evidence() -> None:
+def test_halt_and_untrusted_evidence_block_strategy_close() -> None:
     decision = RiskGate().evaluate(
         _intent(
             action="CLOSE",
@@ -519,11 +527,11 @@ def test_exit_safety_survives_halt_and_untrusted_entry_evidence() -> None:
         ),
     )
 
-    assert decision.decision == "ALLOW"
-    assert decision.reason == "exit safety path"
+    assert decision.decision == "HALT"
+    assert "halted" in decision.reason
 
 
-def test_stale_evidence_denies_open_but_allows_exit() -> None:
+def test_stale_evidence_denies_open_reduce_and_close() -> None:
     open_decision = RiskGate().evaluate(
         _intent(action="OPEN"),
         _context(evidence_freshness="STALE"),
@@ -546,35 +554,37 @@ def test_stale_evidence_denies_open_but_allows_exit() -> None:
     )
     assert open_decision.decision == "DENY"
     assert "EVIDENCE_STALE" in open_decision.reason
-    assert close_decision.decision == "ALLOW"
-    assert reduce_decision.decision == "ALLOW"
+    assert close_decision.decision == "DENY"
+    assert "EVIDENCE_STALE" in close_decision.reason
+    assert reduce_decision.decision == "DENY"
+    assert "EVIDENCE_STALE" in reduce_decision.reason
 
 
 def test_symbol_isolation_allows_healthy_symbol_when_another_is_stale() -> None:
-    pepe_rules = ExchangeRules(
-        symbol="PEPEUSDT",
+    btc_rules = ExchangeRules(
+        symbol="BTCUSDT",
         min_qty=Decimal("0.001"),
         step_size=Decimal("0.001"),
         tick_size=Decimal("0.01"),
         min_notional=Decimal("5"),
     )
-    doge_rules = ExchangeRules(
-        symbol="DOGEUSDT",
+    eth_rules = ExchangeRules(
+        symbol="ETHUSDT",
         min_qty=Decimal("0.001"),
         step_size=Decimal("0.001"),
         tick_size=Decimal("0.01"),
         min_notional=Decimal("5"),
     )
-    pepe = RiskGate().evaluate(
-        _intent(symbol="PEPEUSDT", action="OPEN"),
-        _context(evidence_freshness="STALE", exchange_rules=pepe_rules),
+    btc = RiskGate().evaluate(
+        _intent(symbol="BTCUSDT", action="OPEN"),
+        _context(evidence_freshness="STALE", exchange_rules=btc_rules),
     )
-    doge = RiskGate().evaluate(
-        _intent(symbol="DOGEUSDT", action="OPEN"),
-        _context(evidence_freshness="FRESH", exchange_rules=doge_rules),
+    eth = RiskGate().evaluate(
+        _intent(symbol="ETHUSDT", action="OPEN"),
+        _context(evidence_freshness="FRESH", exchange_rules=eth_rules),
     )
-    assert pepe.decision == "DENY"
-    assert doge.decision == "ALLOW"
+    assert btc.decision == "DENY"
+    assert eth.decision == "ALLOW"
 
 
 def test_below_min_qty_is_denied() -> None:

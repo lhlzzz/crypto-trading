@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Literal, Mapping
 from uuid import UUID, NAMESPACE_URL, uuid5
 
-from trade_intent import TradeIntent
+from trade_intent import FuturesRiskTier, TradeIntent, is_canonical_futures_symbol
 
 PositioningState = Literal[
     "NEUTRAL", "LONG_BUILDING", "SHORT_BUILDING", "LONG_UNWIND",
@@ -24,7 +24,7 @@ PositioningState = Literal[
 ]
 Direction = Literal["LONG", "SHORT", "FLAT"]
 Action = Literal["OPEN", "HOLD", "REDUCE", "CLOSE"]
-MemeRiskTier = Literal["TRADEABLE", "REDUCED", "OBSERVE", "BLOCK"]
+MemeRiskTier = FuturesRiskTier
 EvidenceStatus = Literal[
     "REQUIRED", "AVAILABLE", "STALE", "UNSAFE", "MISSING", "CONFLICTING"
 ]
@@ -955,7 +955,6 @@ class StrategyConfig:
     minimum_data_quality: Decimal = Decimal("0.8")
     maximum_crowding: Decimal = Decimal("0.9")
     minimum_liquidity_score: Decimal = Decimal("0.4")
-    meme_require_classification: bool = True
     legacy_execution_enabled: bool = False
     source_ttl_sec: int = 900
     positioning_weights: PositioningWeights = field(default_factory=PositioningWeights)
@@ -976,9 +975,6 @@ class StrategyConfig:
             default_leverage=decimal("DEFAULT_LEVERAGE", Decimal("1")),
             positioning_decision_enabled=os.environ.get(
                 "POSITIONING_DECISION_ENABLED", "false"
-            ).strip().lower() in {"1", "true", "yes", "on"},
-            meme_require_classification=os.environ.get(
-                "MEME_REQUIRE_CLASSIFICATION", "true"
             ).strip().lower() in {"1", "true", "yes", "on"},
             legacy_execution_enabled=os.environ.get(
                 "LEGACY_EXECUTION_ENABLED", "false"
@@ -1335,7 +1331,9 @@ class StrategyEngine:
             or frame.meme_risk_tier in {"BLOCK", "OBSERVE"}
         ):
             return None
-        if self.config.meme_require_classification and frame.is_meme is not True:
+        if not is_canonical_futures_symbol(decision.symbol):
+            return None
+        if frame.is_meme is True:
             return None
         return self._intent_for_action(
             symbol=decision.symbol,

@@ -394,9 +394,19 @@ def test_universe_qualification_does_not_treat_btc_as_meme_universe() -> None:
     payload = vr.universe_qualification(["BTC-USDT"])
     assert payload["qualification_scope"] == "BENCHMARK_ONLY"
     assert payload["meme_universe_validated"] is False
+    assert payload["major_universe_validated"] is True
     assert payload["is_meme"] is False
     assert payload["runtime_stage_validated_symbols"] == ["BTCUSDT"]
     assert payload["production_target_universe"] == []
+
+
+def test_universe_qualification_rejects_non_major_symbols() -> None:
+    payload = vr.universe_qualification(["BTC-USDT", "DOGEUSDT"])
+    assert payload["qualification_scope"] == "UNAUTHORIZED"
+    assert payload["meme_universe_validated"] is False
+    assert payload["major_universe_validated"] is False
+    assert payload["is_meme"] is False
+    assert payload["production_target_universe"] == ["DOGEUSDT"]
 
 
 def test_paper_acceptance_requires_evidence_not_returncode() -> None:
@@ -861,7 +871,8 @@ def test_live_preflight_evaluates_live_mode(monkeypatch) -> None:
                 "USER_STREAM_HEALTH": "OK",
                 "RECONCILIATION_HEALTH": "OK",
                 "RISK_HEALTH": "SAFE",
-                "meme_universe": True,
+                "major_universe": True,
+                "meme_universe": False,
                 "global_transport_health": "OK",
             }
 
@@ -895,7 +906,8 @@ def test_live_preflight_rejects_not_applicable_account_health(monkeypatch) -> No
                 "USER_STREAM_HEALTH": "NOT_APPLICABLE",
                 "RECONCILIATION_HEALTH": "OK",
                 "RISK_HEALTH": "SAFE",
-                "meme_universe": True,
+                "major_universe": True,
+                "meme_universe": False,
                 "global_transport_health": "OK",
             }
 
@@ -1589,7 +1601,8 @@ def test_live_allowed_remains_false(monkeypatch) -> None:
                 "USER_STREAM_HEALTH": "OK",
                 "RECONCILIATION_HEALTH": "OK",
                 "RISK_HEALTH": "SAFE",
-                "meme_universe": True,
+                "major_universe": True,
+                "meme_universe": False,
                 "global_transport_health": "OK",
             }
 

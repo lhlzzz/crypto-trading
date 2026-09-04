@@ -24,4 +24,9 @@
 - Futures public observation is primary; Spot is confirmation-only and has no
   private trading or account authority.
 - Unknown, stale, future, or timestamp-inconsistent evidence is fail-closed
-  and cannot create a CLOSE action.
+  and cannot create a strategy CLOSE, REDUCE, or OPEN. Emergency flatten is
+  not a strategy CLOSE.
+- Canonical USD-M universe is BTCUSDT, ETHUSDT, and BNBUSDT only.
+- Store trading-state methods require explicit `mode=`; no `BIAN_MODE` fallback.
+- Live CREATE, CANCEL, and CANCEL_ALL require `authorize_live_order_mutation`.
+- Runtime gate is re-evaluated every cycle; a startup snapshot is not reused.

@@ -38,7 +38,8 @@ class StoreStub:
     def initialize(self):
         self.initialized = True
 
-    def is_halted(self):
+    def is_halted(self, *, mode=None, market="FUTURES"):
+        del mode, market
         return self.halted
 
     def list_open_local_orders(self, *args, **kwargs):
@@ -69,16 +70,19 @@ def test_paper_risk_context_uses_symbol_aware_model_liquidation_price() -> None:
         def initialize(self):
             return None
 
-        def is_halted(self):
+        def is_halted(self, *, mode=None, market="FUTURES"):
+            del mode, market
             return False
 
-        def get_balance(self, asset):
+        def get_balance(self, asset, *, mode=None):
+            del mode
             return self.balances.get(asset)
 
         def upsert_balance(self, asset, **fields):
             self.balances[asset] = {"asset": asset, **fields}
 
-        def get_position(self, symbol):
+        def get_position(self, symbol, *, mode=None, market="FUTURES"):
+            del mode, market
             return self.positions.get(symbol)
 
     store = ContextStore()
@@ -265,7 +269,7 @@ def test_disabled_positioning_does_not_open_from_sufficient_evidence() -> None:
         market_regime="RISK_ON",
         meme_risk_tier="TRADEABLE",
         evidence_status={"orderbook": "VALID"},
-        is_meme=True,
+        is_meme=False,
         freshness=(SourceFreshness("futures_trade_flow", captured, captured, 900, captured),),
         source_timestamps=source_timestamps,
     )
@@ -540,9 +544,11 @@ def test_paper_cycle_global_halt_when_observation_store_fails() -> None:
         def latest_market_observation(self, *args, **kwargs):
             raise RuntimeError("db down")
 
-        def set_halt(self, halted, reason="", source=""):
+        def set_halt(self, halted, reason="", source="", mode=None, market="FUTURES"):
+            del market
             self.reason = reason
             self.halted = halted
+            self.mode = mode
 
     class UnusedExecutor:
         def account_snapshot(self):
@@ -617,15 +623,18 @@ class _CycleStore:
     def user_stream_health(self) -> str:
         return self._user_stream_health
 
-    def set_user_stream_health(self, status: str, *, reason: str | None = None) -> None:
+    def set_user_stream_health(self, status: str, *, reason: str | None = None, mode: str | None = None) -> None:
+        del mode
         self._user_stream_health = status
 
-    def is_halted(self) -> bool:
+    def is_halted(self, *, mode=None, market="FUTURES") -> bool:
+        del mode, market
         return self.halted
 
-    def set_halt(self, halted: bool, *, reason: str, source: str) -> None:
+    def set_halt(self, halted: bool, *, reason: str, source: str, mode: str | None = None, market: str = "FUTURES") -> None:
+        del market
         self.halted = halted
-        self.events.append({"halted": halted, "reason": reason, "source": source})
+        self.events.append({"halted": halted, "reason": reason, "source": source, "mode": mode})
 
 
 def _open_engine():
@@ -941,3 +950,20 @@ def test_default_environment_keeps_live_allowed_false(monkeypatch) -> None:
     monkeypatch.delenv("BIAN_LIVE_CONFIRMATION", raising=False)
     gate = evaluate_runtime_gate(mode="paper")
     assert gate.live_allowed is False
+
+
+def test_degraded_runtime_gate_blocks_open_each_cycle() -> None:
+    store = _CycleStore("LIVE")
+    with pytest.raises(RuntimeError, match="canonical runtime gate blocks trading"):
+        run_cycle(
+            "BTCUSDT",
+            store=store,
+            engine=_open_engine(),
+            executor=_account_executor(),
+            mode="testnet",
+            runtime_gate=_testnet_gate(
+                testnet_ready=False,
+                data_health_ok=False,
+                reasons=("DATA_HEALTH_NOT_VERIFIED",),
+            ),
+        )

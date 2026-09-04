@@ -789,11 +789,11 @@ class FuturesPrivateClient:
         operation: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        if (
-            self.config.mode == "live"
-            and method.upper() == "POST"
-            and path.rstrip("/") == "/fapi/v1/order"
-        ):
+        if self.config.mode == "live" and operation in {
+            "create_order",
+            "cancel_order",
+            "cancel_all_orders",
+        }:
             from runtime_gate import LiveAuthorizationError, authorize_live_order_mutation
 
             try:

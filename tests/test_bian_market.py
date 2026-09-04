@@ -97,10 +97,10 @@ class BianMarketTests(unittest.TestCase):
         self.assertEqual(features["market_regime"], "RISK_ON")
         self.assertEqual(features["candidate_symbols"], ["BTCUSDT", "ETHUSDT"])
         self.assertEqual(features["meme_candidate_symbols"], [])
-        self.assertIsNone(features["symbols"][0]["is_meme"])
+        self.assertIs(features["symbols"][0]["is_meme"], False)
         self.assertEqual(
             features["symbols"][0]["meme_classification_source"],
-            "MEME_CLASSIFICATION_UNAVAILABLE",
+            "CANONICAL_FUTURES_UNIVERSE",
         )
 
     def test_candidate_stream_symbols_keep_benchmarks_and_deduplicate_tier_two(self):
@@ -111,7 +111,7 @@ class BianMarketTests(unittest.TestCase):
 
         self.assertEqual(
             candidates,
-            ["BTC-USDT", "ETH-USDT", "SOL-USDT", "ADA-USDT"],
+            ["BTC-USDT", "ETH-USDT", "BNB-USDT"],
         )
 
     def test_positioning_observation_cycle_persists_spot_and_futures_without_private_clients(self):
@@ -129,11 +129,11 @@ class BianMarketTests(unittest.TestCase):
                 dsn="postgresql://bian-test",
             )
 
-        self.assertEqual(candidates, ["BTC-USDT", "ETH-USDT", "SOL-USDT"])
+        self.assertEqual(candidates, ["BTC-USDT", "ETH-USDT", "BNB-USDT"])
         collect.assert_called_once()
         futures.assert_called_once()
         self.assertEqual(
-            futures.call_args.args[0], ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            futures.call_args.args[0], ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
         )
         self.assertEqual(persist.call_count, 2)
 
@@ -1094,29 +1094,35 @@ assert bian_market._market_data_envelope_type().__name__ == 'MarketDataEnvelope'
         self.assertEqual(event["metadata"]["lastFundingRate"], "0.0001")
         self.assertEqual(event["latency_ms"], 1000)
 
-    def test_futures_universe_applies_allowlist_and_liquidity_tiers(self):
-        with patch.dict(__import__("os").environ, {"MEME_ALLOWLIST": "DOGEUSDT", "MEME_BLOCKLIST": ""}, clear=False):
-            features = bian_market.universe_features(
-                [
-                    {"symbol": "DOGEUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "1000", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
-                    {"symbol": "SHIBUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "10", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
-                ],
-                candidate_limit=2,
-            )
+    def test_futures_universe_blocks_non_canonical_symbols(self):
+        features = bian_market.universe_features(
+            [
+                {"symbol": "BTCUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "1000", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
+                {"symbol": "DOGEUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "900", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
+                {"symbol": "SHIBUSDT", "lastPrice": "1", "priceChangePercent": "1", "quoteVolume": "10", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "spreadBps": "2", "openInterest": "10"},
+            ],
+            candidate_limit=3,
+        )
 
-        self.assertIn("DOGEUSDT", features["tiers"]["TRADEABLE"])
+        self.assertIn("BTCUSDT", features["tiers"]["TRADEABLE"])
+        self.assertIn("DOGEUSDT", features["tiers"]["BLOCK"])
         self.assertIn("SHIBUSDT", features["tiers"]["BLOCK"])
+        btc = next(
+            row for row in features["symbols"] if row["symbol"] == "BTCUSDT"
+        )
         doge = next(
             row for row in features["symbols"] if row["symbol"] == "DOGEUSDT"
         )
-        shib = next(
-            row for row in features["symbols"] if row["symbol"] == "SHIBUSDT"
-        )
-        self.assertIs(doge["is_meme"], True)
-        self.assertIs(shib["is_meme"], False)
+        self.assertIs(btc["is_meme"], False)
+        self.assertIs(doge["is_meme"], False)
         self.assertEqual(
-            doge["meme_classification_source"], "MEME_ALLOWLIST"
+            btc["meme_classification_source"], "CANONICAL_FUTURES_UNIVERSE"
         )
+        self.assertEqual(
+            doge["meme_classification_source"], "NON_CANONICAL_SYMBOL"
+        )
+        self.assertEqual(features["candidate_symbols"], ["BTCUSDT"])
+        self.assertEqual(features["meme_candidate_symbols"], [])
 
     def test_feed_handler_shutdown_uses_async_api_on_the_running_loop(self):
         class Handler:
