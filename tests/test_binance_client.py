@@ -267,7 +267,7 @@ def test_environment_credentials_are_mode_specific(monkeypatch) -> None:
     monkeypatch.setenv("BIAN_TESTNET_API_KEY", "testnet-key")
     monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "testnet-secret")
 
-    testnet = ClientConfig.from_env()
+    testnet = ClientConfig.from_env("testnet")
 
     assert testnet.api_key == "testnet-key"
     assert testnet.api_secret == "testnet-secret"
@@ -275,10 +275,20 @@ def test_environment_credentials_are_mode_specific(monkeypatch) -> None:
     monkeypatch.setenv("BIAN_MODE", "live")
     monkeypatch.setenv("BIAN_LIVE_API_KEY", "live-key")
     monkeypatch.setenv("BIAN_LIVE_API_SECRET", "live-secret")
-    live = ClientConfig.from_env()
+    live = ClientConfig.from_env("live")
 
     assert live.api_key == "live-key"
     assert live.api_secret == "live-secret"
+
+    with pytest.raises(TypeError):
+        ClientConfig.from_env()
+
+
+def test_futures_clients_require_explicit_config() -> None:
+    with pytest.raises(TypeError):
+        FuturesPublicClient()
+    with pytest.raises(TypeError):
+        FuturesPrivateClient()
 
 
 def test_private_testnet_create_order_preserves_client_order_id() -> None:

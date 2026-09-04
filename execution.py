@@ -91,8 +91,8 @@ class ExecutionConfig:
     risk_rules: FuturesRiskRules | None = PAPER_RISK_RULES
 
     @classmethod
-    def from_env(cls, mode: str | None = None) -> "ExecutionConfig":
-        resolved_mode = mode or os.environ.get("BIAN_MODE", "paper").strip().lower()
+    def from_env(cls, mode: str) -> "ExecutionConfig":
+        resolved_mode = str(mode or "").strip().lower()
         return cls(
             mode=resolved_mode,
             fee_rate=Decimal(os.environ.get("PAPER_FEE_RATE", "0.001")),
@@ -1177,7 +1177,9 @@ class BinanceExecutor(_BaseExecutor):
         if config.mode not in {"testnet", "live"}:
             raise ValueError("BinanceExecutor requires testnet or live mode")
         super().__init__(store or TradingStore(), config)
-        resolved_client_config = client_config or ClientConfig.from_env()
+        if client_config is None:
+            raise ValueError("BinanceExecutor requires an explicit ClientConfig")
+        resolved_client_config = client_config
         if resolved_client_config.mode != config.mode:
             raise ValueError("execution and Binance client modes must match")
         self.client = FuturesPrivateClient(resolved_client_config)
@@ -1776,10 +1778,11 @@ def _result_from_local(order: dict[str, Any]) -> ExecutionResult:
 def executor_from_env(
     *,
     store: TradingStore | None = None,
-    config: ExecutionConfig | None = None,
+    config: ExecutionConfig,
     client_config: ClientConfig | None = None,
 ) -> Executor:
-    config = config or ExecutionConfig(mode=ClientConfig.from_env().mode)
     if config.mode == "paper":
         return PaperExecutor(store=store, config=config)
+    if client_config is None:
+        raise ValueError("non-paper executor requires an explicit ClientConfig")
     return BinanceExecutor(store=store, config=config, client_config=client_config)

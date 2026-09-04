@@ -806,16 +806,19 @@ def test_latest_market_observation_uses_futures_only():
 
 def test_market_universe_context_uses_futures_only():
     cursor = MagicMock()
-    cursor.fetchone.return_value = None
+    now = datetime.now(timezone.utc)
+    cursor.fetchone.side_effect = [(now, now, 0, {"metadata": {}})] + [None] * 32
     connection = MagicMock()
     connection.__enter__.return_value = connection
     connection.cursor.return_value.__enter__.return_value = cursor
-    now = datetime.now(timezone.utc)
     with patch("psycopg2.connect", return_value=connection):
         TradingStore("postgresql://test").market_universe_context("BTCUSDT", as_of=now)
-    statement = cursor.execute.call_args.args[0]
-    assert "market = 'FUTURES'" in statement
-    assert "UNIVERSE_BREADTH" in statement
+    statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+    assert statements
+    assert any("UNIVERSE_BREADTH" in statement for statement in statements)
+    assert any("bian_market_snapshots" in statement for statement in statements)
+    for statement in statements:
+        assert "market = 'FUTURES'" in statement or "snapshot.market = 'FUTURES'" in statement
 
 
 def test_latest_stale_row_cannot_fall_back_to_previous_fresh():
@@ -827,6 +830,10 @@ def test_latest_stale_row_cannot_fall_back_to_previous_fresh():
         (
             "BTCUSDT", "FUTURES", "ORDERBOOK", stale, stale, 0,
             {"health": "STALE", "health_status": "STALE"},
+        ),
+        (
+            "BTCUSDT", "FUTURES", "ORDERBOOK", fresh, fresh, 0,
+            {"health": "FRESH", "health_status": "FRESH"},
         ),
     ]
     connection = MagicMock()
@@ -842,14 +849,35 @@ def test_latest_stale_row_cannot_fall_back_to_previous_fresh():
     assert by_source["FUTURES_DEPTH"]["status"] == "STALE"
     statement = cursor.execute.call_args.args[0]
     assert "IS DISTINCT FROM 'STALE'" not in statement
+    assert "health != 'STALE'" not in statement
     assert "DISTINCT ON (symbol, event_type)" in statement
-    del fresh
+    assert "received_timestamp DESC" in statement
 
 
 def test_replay_frames_requires_dataset_scope():
     store = TradingStore("postgresql://test")
     with pytest.raises(ValueError, match="validation_session_id"):
         store.positioning_replay_frames()
+
+
+def test_store_helpers_require_explicit_mode():
+    store = TradingStore("postgresql://test")
+    with pytest.raises(ValueError, match="explicit mode"):
+        store.get_position("BTCUSDT")
+    with pytest.raises(ValueError, match="explicit mode"):
+        store.get_balance("USDT")
+    with pytest.raises(ValueError, match="explicit mode"):
+        store.get_order(UUID("00000000-0000-0000-0000-000000000001"))
+    with pytest.raises(ValueError, match="explicit mode"):
+        store.record_trade(
+            UUID("00000000-0000-0000-0000-000000000001"),
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+            fee=Decimal("0.1"),
+            fee_asset="USDT",
+        )
 
 
 def test_source_event_id_is_mode_scoped():
@@ -923,6 +951,11 @@ def test_schema_migration_is_idempotent():
     assert "ADD COLUMN IF NOT EXISTS market TEXT" in first_sql
     assert "DROP CONSTRAINT IF EXISTS %I" in first_sql
     assert "evidence_snapshots_pkey" in first_sql
+    assert "EXCEPTION WHEN duplicate_object THEN NULL" in first_sql
+    assert "positions_active_leverage_positive" in first_sql
+    assert "balances_pkey" in first_sql
+    assert "positions_pkey" in first_sql
     assert "DROP INDEX IF EXISTS trades_source_event_id_idx" in second_sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS trades_mode_source_event_id_idx" in second_sql
     assert "DROP CONSTRAINT IF EXISTS %I" in second_sql
+    assert "EXCEPTION WHEN duplicate_object THEN NULL" in second_sql

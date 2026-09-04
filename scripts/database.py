@@ -768,7 +768,14 @@ def _migrate_futures_columns(cursor: Any) -> None:
     )
     cursor.execute("ALTER TABLE balances DROP CONSTRAINT IF EXISTS balances_pkey")
     cursor.execute(
-        "ALTER TABLE balances ADD CONSTRAINT balances_pkey PRIMARY KEY (mode, asset)"
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE balances
+                ADD CONSTRAINT balances_pkey PRIMARY KEY (mode, asset);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
     )
     cursor.execute(
         """
@@ -794,16 +801,27 @@ def _migrate_futures_columns(cursor: Any) -> None:
     )
     cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey")
     cursor.execute(
-        "ALTER TABLE positions ADD CONSTRAINT positions_pkey PRIMARY KEY (mode, market, symbol)"
+        """
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_pkey PRIMARY KEY (mode, market, symbol);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
     )
     cursor.execute("ALTER TABLE positions ALTER COLUMN mode SET DEFAULT 'legacy'")
     cursor.execute("ALTER TABLE positions ALTER COLUMN mode SET NOT NULL")
     cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_mode_valid")
     cursor.execute(
         """
-        ALTER TABLE positions
-            ADD CONSTRAINT positions_mode_valid
-            CHECK (mode IN ('paper', 'testnet', 'live', 'legacy'))
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_mode_valid
+                CHECK (mode IN ('paper', 'testnet', 'live', 'legacy'));
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
         """
     )
     cursor.execute(
@@ -874,9 +892,13 @@ def _migrate_futures_columns(cursor: Any) -> None:
     cursor.execute("UPDATE positions SET leverage = 1 WHERE quantity > 0 AND COALESCE(leverage, 0) <= 0")
     cursor.execute(
         """
-        ALTER TABLE positions
-            ADD CONSTRAINT positions_active_leverage_positive
-            CHECK (quantity = 0 OR leverage > 0)
+        DO $$
+        BEGIN
+            ALTER TABLE positions
+                ADD CONSTRAINT positions_active_leverage_positive
+                CHECK (quantity = 0 OR leverage > 0);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
         """
     )
     cursor.execute("ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_active_liquidation_positive")

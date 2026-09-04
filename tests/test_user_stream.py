@@ -83,6 +83,11 @@ def test_user_stream_is_hard_blocked_in_paper_mode() -> None:
         UserStreamClient(ClientConfig(mode="paper"))
 
 
+def test_user_stream_requires_explicit_config() -> None:
+    with pytest.raises(TypeError):
+        UserStreamClient()
+
+
 class FakeRest:
     def __init__(self) -> None:
         self.created = 0

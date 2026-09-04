@@ -1541,15 +1541,15 @@ def collect_futures_observations(
     """Collect public USD-M positioning context without enabling trading."""
     if client is None:
         try:
-            from binance_client import FuturesPublicClient
+            from binance_client import ClientConfig, FuturesPublicClient
         except ModuleNotFoundError:
             import sys
             from pathlib import Path
 
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-            from binance_client import FuturesPublicClient
+            from binance_client import ClientConfig, FuturesPublicClient
 
-        client = FuturesPublicClient()
+        client = FuturesPublicClient(ClientConfig(mode="paper"))
     events: list[dict[str, Any]] = []
 
     def append(

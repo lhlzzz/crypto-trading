@@ -186,7 +186,7 @@ class UserStreamClient:
 
     def __init__(
         self,
-        config: ClientConfig | None = None,
+        config: ClientConfig,
         *,
         on_event: EventCallback | None = None,
         on_reconcile: ReconcileCallback | None = None,
@@ -199,7 +199,7 @@ class UserStreamClient:
         keepalive_sec: float = 1800,
         max_backoff_sec: float | None = None,
     ) -> None:
-        self.config = config or ClientConfig.from_env()
+        self.config = config
         if self.config.mode == "paper":
             raise BinanceAuthError("UserStreamClient cannot run in paper mode")
         self.on_event = on_event

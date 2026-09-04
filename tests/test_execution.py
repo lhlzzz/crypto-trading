@@ -12,6 +12,7 @@ from execution import (
     ExecutionRejected,
     MarketSnapshot,
     PaperExecutor,
+    executor_from_env,
 )
 from binance_client import BinanceConnectionError, ClientConfig, FuturesRiskRules
 from risk import ExchangeRules, FuturesAccountSnapshot, RiskContext, RiskGate
@@ -1148,3 +1149,17 @@ def test_cancel_still_open_is_not_cancelled(monkeypatch) -> None:
     assert store.orders[order_id]["status"] == "ACKNOWLEDGED"
     assert any(event[1] in {"CANCEL_STILL_OPEN", "STILL_OPEN", "CANCEL_REJECTED"} for event in store.events)
     assert not any(event[1] == "ORDER_CANCELLED" and event[2] == "CANCELLED" for event in store.events)
+
+
+def test_executor_construction_requires_explicit_mode() -> None:
+    with pytest.raises(TypeError):
+        ExecutionConfig.from_env()
+    with pytest.raises(TypeError):
+        executor_from_env()
+    with pytest.raises(ValueError, match="explicit ClientConfig"):
+        BinanceExecutor(store=MemoryStore(), config=ExecutionConfig(mode="testnet"))
+    with pytest.raises(ValueError, match="explicit ClientConfig"):
+        executor_from_env(
+            store=MemoryStore(),
+            config=ExecutionConfig(mode="testnet"),
+        )

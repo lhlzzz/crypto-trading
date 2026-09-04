@@ -97,8 +97,8 @@ class ClientConfig:
     transport_metadata: TransportMetadata = field(default_factory=TransportMetadata)
 
     @classmethod
-    def from_env(cls, mode: str | None = None) -> "ClientConfig":
-        resolved_mode = (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+    def from_env(cls, mode: str) -> "ClientConfig":
+        resolved_mode = str(mode or "").strip().lower()
         credential_prefix = {
             "testnet": "BIAN_TESTNET",
             "live": "BIAN_LIVE",
@@ -456,8 +456,8 @@ def _futures_api_key_request(
 class FuturesPublicClient:
     """Public USD-M Futures observation adapter; it has no order methods."""
 
-    def __init__(self, config: ClientConfig | None = None) -> None:
-        self.config = config or ClientConfig.from_env()
+    def __init__(self, config: ClientConfig) -> None:
+        self.config = config
         self.base_url = (
             "https://testnet.binancefuture.com/fapi/v1"
             if self.config.mode == "testnet"
@@ -586,8 +586,8 @@ class FuturesPublicClient:
 class FuturesPrivateClient:
     """Authenticated USD-M Futures adapter. Paper cannot construct it."""
 
-    def __init__(self, config: ClientConfig | None = None) -> None:
-        self.config = config or ClientConfig.from_env()
+    def __init__(self, config: ClientConfig) -> None:
+        self.config = config
         if self.config.mode == "paper":
             raise BinanceAuthError(
                 "FuturesPrivateClient cannot be created in paper mode; use execution.py"

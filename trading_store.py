@@ -2562,6 +2562,7 @@ class TradingStore:
     def get_order_by_client_order_id(self, client_order_id: str, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
+        resolved_mode = self._mode(mode)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2574,7 +2575,7 @@ class TradingStore:
                     FROM orders
                     WHERE client_order_id = %s AND mode = %s
                     """,
-                    (client_order_id, self._mode(mode)),
+                    (client_order_id, resolved_mode),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -2591,6 +2592,7 @@ class TradingStore:
     def get_order(self, order_id: UUID, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
+        resolved_mode = self._mode(mode)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2603,7 +2605,7 @@ class TradingStore:
                     FROM orders
                     WHERE order_id = %s AND mode = %s
                     """,
-                    (str(order_id), self._mode(mode)),
+                    (str(order_id), resolved_mode),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -2878,6 +2880,7 @@ class TradingStore:
     ) -> dict[str, Any] | None:
         import psycopg2
 
+        resolved_mode = self._mode(mode)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2890,7 +2893,7 @@ class TradingStore:
                     FROM positions
                     WHERE mode = %s AND market = %s AND symbol = %s
                     """,
-                    (self._mode(mode), market, symbol),
+                    (resolved_mode, market, symbol),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -2971,6 +2974,7 @@ class TradingStore:
     def get_balance(self, asset: str, *, mode: str | None = None) -> dict[str, Any] | None:
         import psycopg2
 
+        resolved_mode = self._mode(mode)
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2981,7 +2985,7 @@ class TradingStore:
                     FROM balances
                     WHERE asset = %s AND mode = %s
                     """,
-                    (asset, self._mode(mode)),
+                    (asset, resolved_mode),
                 )
                 row = cursor.fetchone()
         if row is None:

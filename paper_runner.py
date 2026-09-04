@@ -793,12 +793,12 @@ def run_cycle(
     }
 
 
-def _assert_account_risk_config(client: Any) -> None:
+def _assert_account_risk_config(client: Any, *, mode: str) -> None:
     """Compatibility wrapper for callers that still expect a preflight check."""
     gate = evaluate_runtime_gate(
-        mode=os.environ.get("BIAN_MODE", "testnet"),
+        mode=mode,
         client=client,
-        symbols=trading_symbols_for_mode(os.environ.get("BIAN_MODE", "testnet")),
+        symbols=trading_symbols_for_mode(mode),
         probe_account=True,
     )
     if not gate.account_mode_ok or not gate.margin_mode_ok:
@@ -954,12 +954,12 @@ async def _run_private_forever(
 def run_forever(
     symbols: list[str],
     *,
-    mode: str | None = None,
+    mode: str,
     duration_sec: int | None = None,
     planned_restart_after: int | None = None,
 ) -> None:
     """Run the configured mode until interrupted."""
-    resolved_mode = (mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+    resolved_mode = str(mode).strip().lower()
     if resolved_mode not in {"paper", "testnet", "live"}:
         raise SystemExit("BIAN_MODE must be paper, testnet, or live")
     store = TradingStore()

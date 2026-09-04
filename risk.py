@@ -168,12 +168,12 @@ _LEGACY_MEME_RISK_ENV = (
 )
 
 
-def reject_legacy_meme_risk_env(*, mode: str | None = None) -> None:
+def reject_legacy_meme_risk_env(*, mode: str) -> None:
     """Legacy meme risk env must not silently size major-futures limits."""
     present = [name for name in _LEGACY_MEME_RISK_ENV if os.environ.get(name)]
     if not present:
         return
-    resolved = str(mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+    resolved = str(mode or "").strip().lower()
     joined = ", ".join(present)
     message = (
         "legacy meme risk environment variables are not a major-futures "

@@ -539,8 +539,66 @@ def test_account_noncanonical_open_order_blocks_gate(monkeypatch) -> None:
         gate_evidence={"testnet": "PASSED"},
     )
     assert gate.open_orders_ok is False
+    assert gate.live_allowed is False
     assert gate.testnet_ready is False
     assert "UNAUTHORIZED_EXCHANGE_ORDER" in gate.reasons
+
+
+def test_account_missing_position_symbol_blocks_gate(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    gate = evaluate_runtime_gate(
+        mode="testnet",
+        client=_account_client(positions=({"positionAmt": "1"},)),
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+        gate_evidence={"testnet": "PASSED"},
+    )
+    assert gate.exchange_positions_ok is False
+    assert gate.live_allowed is False
+    assert "UNAUTHORIZED_EXCHANGE_POSITION" in gate.reasons
+
+
+def test_account_invalid_position_rows_block_gate(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    client = _client()
+    snapshot = client.account_snapshot.return_value
+    client.account_snapshot.return_value = SimpleNamespace(
+        position_mode=snapshot.position_mode,
+        margin_mode=snapshot.margin_mode,
+        symbol_leverage=snapshot.symbol_leverage,
+        leverage=snapshot.leverage,
+        positions=None,
+        open_orders=(),
+    )
+    gate = evaluate_runtime_gate(
+        mode="testnet",
+        client=client,
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+        gate_evidence={"testnet": "PASSED"},
+    )
+    assert gate.exchange_positions_ok is False
+    assert gate.live_allowed is False
+    assert "UNAUTHORIZED_EXCHANGE_POSITION" in gate.reasons
+
+
+def test_runtime_gate_requires_explicit_mode() -> None:
+    with pytest.raises(TypeError):
+        evaluate_runtime_gate()
 
 
 def test_mixed_futures_universe_halts(monkeypatch) -> None:

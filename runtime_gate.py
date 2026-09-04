@@ -27,17 +27,17 @@ def _account_row_symbol(row: Any) -> str:
     ).upper().replace("-PERP", "").removesuffix("PERP").replace("-", "")
 
 
-def _unauthorized_account_symbols(rows: Any) -> tuple[str, ...]:
+def _account_universe_status(rows: Any) -> tuple[bool, tuple[str, ...]]:
+    """Inspect every account row. Type-correct collections are not healthy."""
     if not isinstance(rows, (tuple, list)):
-        return ()
+        return False, ("INVALID_ACCOUNT_ROWS",)
     unauthorized: list[str] = []
     for row in rows:
         symbol = _account_row_symbol(row)
-        if not symbol:
-            continue
-        if not is_canonical_futures_symbol(symbol):
-            unauthorized.append(symbol)
-    return tuple(dict.fromkeys(unauthorized))
+        if not symbol or not is_canonical_futures_symbol(symbol):
+            unauthorized.append(symbol or "MISSING_SYMBOL")
+    unique = tuple(dict.fromkeys(unauthorized))
+    return (not unique, unique)
 
 
 def _enabled(name: str, *, default: bool = False) -> bool:
@@ -47,8 +47,8 @@ def _enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _mode() -> str:
-    return os.environ.get("BIAN_MODE", "paper").strip().lower()
+def _require_mode(mode: str) -> str:
+    return str(mode or "").strip().lower()
 
 
 class LiveAuthorizationError(RuntimeError):
@@ -615,7 +615,7 @@ def _current_user_stream_health(store: Any | None, *, mode: str) -> str:
     return "UNKNOWN"
 
 
-def _risk_config_ok(*, mode: str | None = None) -> bool:
+def _risk_config_ok(*, mode: str) -> bool:
     try:
         reject_legacy_meme_risk_env(mode=mode)
         limits = RiskLimits.from_env()
@@ -631,7 +631,7 @@ def _risk_config_ok(*, mode: str | None = None) -> bool:
 
 def evaluate_runtime_gate(
     *,
-    mode: str | None = None,
+    mode: str,
     store: Any | None = None,
     client: Any | None = None,
     symbols: Iterable[str] | None = None,
@@ -643,7 +643,7 @@ def evaluate_runtime_gate(
     major_universe_ready: bool | None = None,
 ) -> GateResult:
     """Evaluate the canonical runtime gate from configuration and evidence."""
-    resolved_mode = (mode or _mode()).strip().lower()
+    resolved_mode = _require_mode(mode)
     if resolved_mode not in {"paper", "testnet", "live"}:
         return GateResult(
             mode=resolved_mode,
@@ -774,17 +774,17 @@ def evaluate_runtime_gate(
                 value == expected_leverage for value in symbol_leverage.values()
             )
             margin_mode_ok = bool(selected_symbols) and margin_mode_ok
-            unauthorized_positions = _unauthorized_account_symbols(snapshot.positions)
-            unauthorized_orders = _unauthorized_account_symbols(snapshot.open_orders)
-            exchange_positions_ok = (
-                isinstance(snapshot.positions, tuple) and not unauthorized_positions
+            positions_ok, unauthorized_positions = _account_universe_status(
+                snapshot.positions
             )
-            open_orders_ok = (
-                isinstance(snapshot.open_orders, tuple) and not unauthorized_orders
+            orders_ok, unauthorized_orders = _account_universe_status(
+                snapshot.open_orders
             )
-            if unauthorized_positions:
+            exchange_positions_ok = positions_ok
+            open_orders_ok = orders_ok
+            if not positions_ok:
                 reasons.append("UNAUTHORIZED_EXCHANGE_POSITION")
-            if unauthorized_orders:
+            if not orders_ok:
                 reasons.append("UNAUTHORIZED_EXCHANGE_ORDER")
             _store_account_health(
                 resolved_mode,
