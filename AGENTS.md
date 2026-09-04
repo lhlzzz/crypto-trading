@@ -9,20 +9,22 @@
 Never read Polymarket data, add wallet/withdrawal access, or import code from
 another bot workspace. `bian_api.py` is read-only. `execution.py` is the only
 order-submission owner. `database.py` remains schema/connection owner only.
-`engine.py` only creates TradeIntent objects. `SpotPublicClient`/`PublicClient`
-and `FuturesPublicClient` are read-only. `FuturesPrivateClient` is the only authenticated USD-M order/account adapter. Spot `PrivateClient` is removed.
-Paper cannot construct `FuturesPrivateClient`. Paper, Testnet, and Live share
-the same Executor interface, and Live requires configuration plus explicit
-startup confirmation. Testnet and Live credentials are separate mode-specific
-environment secrets; validation-only signal injection is Paper-only and
-disabled by default.
+`engine.py` only creates TradeIntent objects. `FuturesPublicClient` is
+read-only. `FuturesPrivateClient` is the only authenticated USD-M
+order/account adapter. Spot public and private clients are removed from the
+runtime path. Paper cannot construct `FuturesPrivateClient`. Paper, Testnet,
+and Live share the same Executor interface, and Live requires configuration
+plus explicit startup confirmation. Testnet and Live credentials are separate
+mode-specific environment secrets; validation-only signal injection is
+Paper-only and disabled by default.
 
 Capital Positioning is observation and shadow-only until its explicit runtime
 acceptance gates pass. `POSITIONING_DECISION_ENABLED` defaults to `false`;
 stale, sequence-gapped, incomplete, or timestamp-inconsistent market data
 must produce `UNKNOWN`/`FLAT`, never a synthetic trade signal. Futures market
-data remains public observation until later paper/testnet/live phases. Spot is
-confirmation only; production execution market is Binance USD-M Futures.
+data remains public observation until later paper/testnet/live phases. Spot
+historical data may exist in PostgreSQL for research; production execution
+market is Binance USD-M Futures.
 `scripts/bian_market.py observe` is the single public positioning-observation
 owner, and `paper_runner.py --shadow-forever` records comparisons without
 calling Risk, Execution, TradeIntent creation, or order submission.
@@ -38,15 +40,17 @@ a separate semantic.
 
 Production execution market is Binance USD-M Futures. First-phase universe is
 only `BTCUSDT`, `ETHUSDT`, and `BNBUSDT` via `trading_symbols_for_mode()`.
-Any other live symbol is REJECT/HALT. Universe expansion is a new release,
-not a config change. Spot is confirmation only and has no private trading.
-Web3/DEX/Spot private trading is out of this workspace. Store trading-state
-calls require explicit `mode=`; implicit `BIAN_MODE` fallback is banned.
-Live CREATE, CANCEL, and CANCEL_ALL all require `authorize_live_order_mutation`.
+Any other live symbol is REJECT/HALT. Mixed env such as `BTCUSDT,DOGEUSDT`
+fails the gate instead of silently running BTC only. Universe expansion is a
+new release, not a config change. Spot is historical/research only and has no
+private trading. Web3/DEX/Spot private trading is out of this workspace.
+Store trading-state calls require explicit `mode=`; implicit `BIAN_MODE`
+fallback is banned. Live CREATE, CANCEL, and CANCEL_ALL all require
+`authorize_live_order_mutation`.
 
-Current validation status on 2026-09-04 after major-coin and meme
-convergence: `449` pytest tests passed, `compileall` PASS,
-`git diff --check` PASS.
+Current validation status on 2026-09-04 after major-futures hardening:
+`456` pytest tests passed, `compileall` PASS, `git diff --check` PASS.
+Do not reuse the prior 449-test count.
 Prior 409-test evidence and commit
 `d1fd55dde97cab5cf7f0ce22475ca46205119b63` are expired and must not be reused.
 `LIVE_ALLOWED=false`. `TESTNET=BLOCKED_BY_EXTERNAL_CREDENTIALS`.

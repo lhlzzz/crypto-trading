@@ -17,9 +17,9 @@ shadow, paper, testnet, and recovery gates pass.
 - `risk.py`: single risk owner.
 - `execution.py`: only order-submission owner. Paper and Binance share
   `Executor`.
-- `binance_client.py`: `PublicClient` (Spot public), `FuturesPublicClient`
-  (USD-M public, no order methods), `FuturesPrivateClient` (USD-M signed REST).
-  Alias: `SpotPublicClient`. Spot private client is removed.
+- `binance_client.py`: `FuturesPublicClient` (USD-M public, no order
+  methods) and `FuturesPrivateClient` (USD-M signed REST). Spot public and
+  private clients are removed from the runtime path.
 - `scripts/bian_market.py`: single public observation owner.
 - `scripts/database.py`: schema/connection owner.
 - `trading_store.py`: trading-fact persistence.
@@ -29,6 +29,25 @@ shadow, paper, testnet, and recovery gates pass.
 
 No `engine_v2.py`, `futures_engine.py`, `positioning_engine.py`, or second
 executor family exists.
+
+PostgreSQL remains the structured fact store. Historical Spot rows and
+legacy meme classification columns are kept. Obsidian remains the knowledge
+store and is not an execution owner. Web3/DEX/Spot private execution is
+outside this workspace.
+
+## Major Futures hardening (2026-09-04)
+
+Universe is BTCUSDT / ETHUSDT / BNBUSDT only, enforced at TradeIntent,
+RiskGate, FuturesPrivateClient (testnet/live), and the runtime gate.
+Mixed env `BTCUSDT,DOGEUSDT` is UNAUTHORIZED and does not run. Legacy
+`MAX_MEME_*` risk env is not a major-futures fallback. Positioning
+snapshots and previous_state are validation-session scoped. Cancel that
+remains open is `STILL_OPEN`, not `CANCEL_RECONCILED`. Order identity is
+`UNIQUE(mode, exchange_order_id)` and `UNIQUE(mode, client_order_id)`.
+Runtime gate reuses a TTL-bounded account-health snapshot instead of
+clearing account health on `probe_account=False`. `LIVE_ALLOWED=false`.
+Testnet is `BLOCKED_BY_EXTERNAL_CREDENTIALS`. Prior 30M/2H PASS is
+`EXPIRED`.
 
 ## Historical Phase A audit (2026-08-28)
 

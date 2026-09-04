@@ -993,3 +993,67 @@ def test_paper_executor_does_not_read_testnet_position(monkeypatch) -> None:
     assert paper is not None
     assert paper["quantity"] == Decimal("0.1")
     assert testnet["quantity"] == Decimal("9")
+
+
+def test_uncertain_cancel_does_not_claim_reconciled_when_still_open(monkeypatch) -> None:
+    class Client:
+        def cancel_order(self, **kwargs):
+            del kwargs
+            raise TimeoutError("timed out")
+
+        def get_order(self, **kwargs):
+            del kwargs
+            return {"orderId": "42", "status": "NEW", "executedQty": "0"}
+
+    client = Client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+    order_id = store.create_order(
+        intent,
+        mode="testnet",
+        status="ACKNOWLEDGED",
+        exchange_order_id="42",
+    )
+    result = executor.cancel(order_id)
+    assert result.status == "ACKNOWLEDGED"
+    assert store.orders[order_id]["status"] == "ACKNOWLEDGED"
+    assert any(event[1] == "STILL_OPEN" for event in store.events)
+    assert not any(event[1] == "CANCEL_RECONCILED" for event in store.events)
+
+
+def test_uncertain_cancel_unknown_lookup_fails_closed(monkeypatch) -> None:
+    class Client:
+        def cancel_order(self, **kwargs):
+            del kwargs
+            raise TimeoutError("timed out")
+
+        def get_order(self, **kwargs):
+            del kwargs
+            raise TimeoutError("lookup unavailable")
+
+    client = Client()
+    monkeypatch.setattr("execution.FuturesPrivateClient", lambda config: client)
+    store = MemoryStore()
+    intent = _intent()
+    executor = BinanceExecutor(
+        store=store,
+        config=ExecutionConfig(mode="testnet"),
+        client_config=ClientConfig(mode="testnet", api_key="key", api_secret="secret"),
+    )
+    order_id = store.create_order(
+        intent,
+        mode="testnet",
+        status="ACKNOWLEDGED",
+        exchange_order_id="42",
+    )
+    result = executor.cancel(order_id)
+    assert result.status == "UNKNOWN"
+    assert store.halted is True
+    assert any(event[1] == "CANCEL_UNKNOWN" for event in store.events)
+    assert not any(event[1] == "CANCEL_RECONCILED" for event in store.events)

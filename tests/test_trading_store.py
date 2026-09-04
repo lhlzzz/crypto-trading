@@ -148,6 +148,8 @@ def test_positioning_snapshot_persists_complete_episode_and_evidence_contract():
     assert "episode_direction" in statements
     assert "episode_status" in statements
     assert "evidence_sufficiency" in statements
+    assert "ON CONFLICT (snapshot_id)" in statements
+    assert "WHERE validation_session_id IS NULL" in statements
     assert "data_quality" in statements
     evidence_args = cursor.execute.call_args_list[1].args[1]
     assert '"futures_trade_flow"' in evidence_args[4]
@@ -521,6 +523,47 @@ def test_duplicate_exchange_trade_id_is_idempotent():
     statement = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
     assert "ON CONFLICT (mode, exchange_trade_id)" in statement
     assert first == second
+
+
+def test_positioning_snapshot_conflict_is_session_scoped():
+    from engine import StrategyEngine
+    from tests.test_engine import _positioning_frame
+
+    decision = StrategyEngine().positioning_decision(_positioning_frame())
+    cursor = MagicMock()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    store.validation_session_id = "session-b"
+    with patch("psycopg2.connect", return_value=connection):
+        store.record_positioning_snapshot(decision, strategy_version="positioning-v1")
+        store.latest_positioning_state(
+            "BTCUSDT",
+            before=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        )
+    statements = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "ON CONFLICT (snapshot_id, validation_session_id)" in statements
+    assert "WHERE validation_session_id IS NOT NULL" in statements
+    latest_sql = cursor.execute.call_args_list[-1].args[0]
+    latest_params = cursor.execute.call_args_list[-1].args[1]
+    assert "validation_session_id IS NOT DISTINCT FROM %s" in latest_sql
+    assert latest_params[-1] == "session-b"
+
+
+def test_orders_conflict_on_mode_and_client_order_id():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("00000000-0000-0000-0000-000000000009",)
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    store = TradingStore("postgresql://test")
+    from tests.test_trade_intent import _intent
+
+    with patch("psycopg2.connect", return_value=connection):
+        store.create_order(_intent(), mode="paper", status="CREATED")
+    statement = cursor.execute.call_args.args[0]
+    assert "ON CONFLICT (mode, client_order_id)" in statement
 
 
 def test_position_mode_isolation_uses_canonical_mode_key():

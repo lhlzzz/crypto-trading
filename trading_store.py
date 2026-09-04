@@ -1393,6 +1393,17 @@ class TradingStore:
 
         snapshot_id = decision.evidence_snapshot_id
         payload = decision.as_dict()
+        session_id = self._session_id()
+        if session_id:
+            snapshot_conflict = """
+                    ON CONFLICT (snapshot_id, validation_session_id)
+                    WHERE validation_session_id IS NOT NULL
+            """
+        else:
+            snapshot_conflict = """
+                    ON CONFLICT (snapshot_id)
+                    WHERE validation_session_id IS NULL
+            """
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1411,7 +1422,10 @@ class TradingStore:
                               %s, %s, %s, %s, %s, %s, %s,
                               CAST(%s AS JSONB), %s, %s, %s, %s, %s,
                               CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
-                    ON CONFLICT (snapshot_id) DO UPDATE SET
+                    """
+                    + snapshot_conflict
+                    + """
+                    DO UPDATE SET
                         episode_id = EXCLUDED.episode_id,
                         episode_direction = EXCLUDED.episode_direction,
                         episode_status = EXCLUDED.episode_status,
@@ -1440,7 +1454,7 @@ class TradingStore:
                         decision.meme_classification_version,
                         decision.meme_classified_at,
                         _json(list(decision.meme_reason_codes)), _json(payload),
-                        self._session_id(),
+                        session_id,
                     ),
                 )
                 cursor.execute(
@@ -1453,7 +1467,10 @@ class TradingStore:
                     ) VALUES (%s, %s, %s, CAST(%s AS JSONB), CAST(%s AS JSONB),
                               CAST(%s AS JSONB), %s, %s, %s, %s, %s, %s,
                               CAST(%s AS JSONB), CAST(%s AS JSONB), %s)
-                    ON CONFLICT (snapshot_id) DO UPDATE SET
+                    """
+                    + snapshot_conflict
+                    + """
+                    DO UPDATE SET
                         source_timestamps = EXCLUDED.source_timestamps,
                         evidence = EXCLUDED.evidence,
                         data_quality = EXCLUDED.data_quality,
@@ -1559,11 +1576,24 @@ class TradingStore:
         return [_row_dict(columns, row) for row in rows]
 
     def latest_positioning_state(
-        self, symbol: str, *, before: datetime
+        self,
+        symbol: str,
+        *,
+        before: datetime,
+        validation_session_id: str | None = None,
     ) -> str | None:
-        """Return the persisted predecessor state for a timestamp-bounded decision."""
+        """Return the persisted predecessor state for a timestamp-bounded decision.
+
+        Validation paths are session-scoped: session B cannot read session A's
+        previous_state even when the content-addressed snapshot_id matches.
+        """
         import psycopg2
 
+        session_id = (
+            validation_session_id
+            if validation_session_id is not None
+            else self._session_id()
+        )
         with psycopg2.connect(self.dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1572,10 +1602,11 @@ class TradingStore:
                     FROM positioning_snapshots
                     WHERE symbol = %s
                       AND observed_at < %s
+                      AND validation_session_id IS NOT DISTINCT FROM %s
                     ORDER BY observed_at DESC, snapshot_id DESC
                     LIMIT 1
                     """,
-                    (symbol.upper(), _as_utc(before)),
+                    (symbol.upper(), _as_utc(before), session_id),
                 )
                 row = cursor.fetchone()
         return str(row[0]) if row is not None else None
@@ -2395,7 +2426,7 @@ class TradingStore:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                               CAST(%s AS JSONB), %s)
-                    ON CONFLICT (client_order_id) DO UPDATE SET
+                    ON CONFLICT (mode, client_order_id) DO UPDATE SET
                         updated_at = EXCLUDED.updated_at
                     RETURNING order_id
                     """,

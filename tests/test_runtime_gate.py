@@ -6,7 +6,20 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from risk import FuturesAccountSnapshot
 
-from runtime_gate import REQUIRED_FUTURES_SOURCES, evaluate_runtime_gate
+import pytest
+
+from runtime_gate import (
+    REQUIRED_FUTURES_SOURCES,
+    evaluate_runtime_gate,
+    reset_account_health_cache,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_account_health_cache():
+    reset_account_health_cache()
+    yield
+    reset_account_health_cache()
 
 
 class FreshStore:
@@ -392,6 +405,17 @@ def test_paper_testnet_live_symbol_sets_are_independent(monkeypatch) -> None:
     from runtime_gate import unauthorized_symbols_for_mode
 
     assert unauthorized_symbols_for_mode("live") == ("SOLUSDT",)
+    monkeypatch.setenv("BIAN_LIVE_SYMBOLS", "BTCUSDT,DOGEUSDT")
+    assert trading_symbols_for_mode("live") == ("BTCUSDT",)
+    assert unauthorized_symbols_for_mode("live") == ("DOGEUSDT",)
+    mixed = evaluate_runtime_gate(
+        mode="live",
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=False,
+    )
+    assert mixed.live_allowed is False
+    assert "UNAUTHORIZED_SYMBOL" in mixed.reasons
     monkeypatch.delenv("BIAN_LIVE_SYMBOLS", raising=False)
     assert trading_symbols_for_mode("live") == ()
 
@@ -421,3 +445,35 @@ def test_live_unauthorized_symbol_is_rejected(monkeypatch) -> None:
     assert gate.live_allowed is False
     assert "UNAUTHORIZED_SYMBOL" in gate.reasons
     assert gate.major_universe_ready is False
+
+
+def test_account_health_cache_survives_probe_account_false(monkeypatch) -> None:
+    monkeypatch.setenv("BIAN_TESTNET_API_KEY", "key")
+    monkeypatch.setenv("BIAN_TESTNET_API_SECRET", "secret")
+    monkeypatch.setenv("DEFAULT_LEVERAGE", "2")
+    monkeypatch.setenv("MAX_DATA_LATENCY_MS", "200000000000")
+    monkeypatch.setenv("ACCOUNT_HEALTH_TTL_SEC", "30")
+    reset_account_health_cache()
+    probed = evaluate_runtime_gate(
+        mode="testnet",
+        client=_client(),
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=True,
+    )
+    cached = evaluate_runtime_gate(
+        mode="testnet",
+        client=_client(),
+        symbols=["BTCUSDT"],
+        store=TestnetHealthStore(),
+        data_health_ok=True,
+        reconciliation_ok=True,
+        probe_account=False,
+    )
+    reset_account_health_cache()
+    assert probed.account_reachable is True
+    assert cached.account_reachable is True
+    assert "ACCOUNT_PREFLIGHT_NOT_RUN" not in cached.reasons
+    assert "ACCOUNT_HEALTH_EXPIRED" not in cached.reasons

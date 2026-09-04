@@ -12,7 +12,7 @@ import os
 
 from binance_client import ClientConfig
 from engine import ObservationFreshnessPolicy, runtime_required_sources, validate_source_timestamps
-from risk import FuturesAccountSnapshot, RiskLimits
+from risk import FuturesAccountSnapshot, RiskLimits, reject_legacy_meme_risk_env
 from trade_intent import CANONICAL_FUTURES_SYMBOLS, is_canonical_futures_symbol
 
 
@@ -99,7 +99,12 @@ def unauthorized_symbols_for_mode(mode: str) -> tuple[str, ...]:
 
 
 def trading_symbols_for_mode(mode: str | None = None) -> tuple[str, ...]:
-    """Canonical major-coin universe for one runtime mode. No cross-mode fallback."""
+    """Canonical major-coin universe for one runtime mode. No cross-mode fallback.
+
+    Unauthorized symbols are never silently dropped into this result. Callers
+    must also inspect ``unauthorized_symbols_for_mode``; a mixed request such
+    as ``BTCUSDT,DOGEUSDT`` fails the runtime gate instead of running BTC only.
+    """
     if mode is None or not str(mode).strip():
         raise ValueError("trading_symbols_for_mode requires an explicit mode")
     return tuple(
@@ -140,6 +145,51 @@ def max_data_age_sec() -> int:
         return max(1, int(os.environ.get("BIAN_MAX_DATA_AGE_SEC", "900")))
     except ValueError:
         return 900
+
+
+def account_health_ttl_sec() -> int:
+    """Bound how long a probed exchange-account snapshot may be reused."""
+    try:
+        return max(1, int(os.environ.get("ACCOUNT_HEALTH_TTL_SEC", "30")))
+    except ValueError:
+        return 30
+
+
+_ACCOUNT_HEALTH: dict[str, tuple[datetime, dict[str, Any]]] = {}
+
+
+def reset_account_health_cache() -> None:
+    """Drop cached account preflight evidence. Tests and fail-closed restarts."""
+    _ACCOUNT_HEALTH.clear()
+
+
+def account_health_probe_due(mode: str) -> bool:
+    """True when testnet/live must refresh the canonical account snapshot."""
+    resolved = str(mode or "").strip().lower()
+    if resolved == "paper":
+        return False
+    row = _ACCOUNT_HEALTH.get(resolved)
+    if row is None:
+        return True
+    captured, _fields = row
+    age = (datetime.now(timezone.utc) - captured).total_seconds()
+    return age >= account_health_ttl_sec()
+
+
+def _store_account_health(mode: str, fields: Mapping[str, Any]) -> None:
+    _ACCOUNT_HEALTH[mode] = (datetime.now(timezone.utc), dict(fields))
+
+
+def _cached_account_health(mode: str) -> tuple[str, dict[str, Any] | None]:
+    row = _ACCOUNT_HEALTH.get(mode)
+    if row is None:
+        return "MISSING", None
+    captured, fields = row
+    age = (datetime.now(timezone.utc) - captured).total_seconds()
+    payload = {**fields, "captured_at": captured, "age_sec": int(max(0, age))}
+    if age > account_health_ttl_sec():
+        return "EXPIRED", payload
+    return "FRESH", payload
 
 
 def gate_evidence_max_age_sec() -> int:
@@ -541,8 +591,9 @@ def _current_user_stream_health(store: Any | None, *, mode: str) -> str:
     return "UNKNOWN"
 
 
-def _risk_config_ok() -> bool:
+def _risk_config_ok(*, mode: str | None = None) -> bool:
     try:
+        reject_legacy_meme_risk_env(mode=mode)
         limits = RiskLimits.from_env()
     except Exception:
         return False
@@ -595,18 +646,27 @@ def evaluate_runtime_gate(
     if alpha_status not in {"INSUFFICIENT_SAMPLE", "ALPHA_NOT_SUPPORTED", "ALPHA_SUPPORTED"}:
         alpha_status = "ALPHA_NOT_SUPPORTED"
     unauthorized = tuple(
-        symbol for symbol in selected_symbols if not is_canonical_futures_symbol(symbol)
+        dict.fromkeys(
+            (
+                *unauthorized_symbols_for_mode(resolved_mode),
+                *(
+                    symbol
+                    for symbol in selected_symbols
+                    if not is_canonical_futures_symbol(symbol)
+                ),
+            )
+        )
     )
     if unauthorized:
         reasons.append("UNAUTHORIZED_SYMBOL")
-    if resolved_mode == "live" and not selected_symbols:
+    if resolved_mode in {"testnet", "live"} and not selected_symbols and not unauthorized:
         reasons.append("MAJOR_UNIVERSE_EMPTY")
     major_ready = (
         bool(major_universe_ready)
         if major_universe_ready is not None
         else (bool(selected_symbols) and not unauthorized)
     )
-    if resolved_mode == "live" and not major_ready:
+    if not major_ready:
         reasons.append("MAJOR_UNIVERSE_NOT_READY")
     credentials_ok = resolved_mode == "paper" or bool(config.api_key and config.api_secret)
     # These fields are Binance account evidence. Paper must not present local
@@ -625,9 +685,30 @@ def evaluate_runtime_gate(
     leverage_ok = False
     symbol_leverage: dict[str, str] = {}
 
+    def _apply_account_fields(fields: Mapping[str, Any]) -> None:
+        nonlocal account_reachable, account_mode_ok, margin_mode_ok
+        nonlocal exchange_positions_ok, open_orders_ok, wallet_balance_ok
+        nonlocal available_balance_ok, server_time_ok, leverage_ok, symbol_leverage
+        account_reachable = bool(fields.get("account_reachable"))
+        account_mode_ok = bool(fields.get("account_mode_ok"))
+        margin_mode_ok = bool(fields.get("margin_mode_ok"))
+        exchange_positions_ok = bool(fields.get("exchange_positions_ok"))
+        open_orders_ok = bool(fields.get("open_orders_ok"))
+        wallet_balance_ok = bool(fields.get("wallet_balance_ok"))
+        available_balance_ok = bool(fields.get("available_balance_ok"))
+        server_time_ok = bool(fields.get("server_time_ok"))
+        leverage_ok = bool(fields.get("leverage_ok"))
+        symbol_leverage = dict(fields.get("symbol_leverage") or {})
+
     if resolved_mode != "paper" and not credentials_ok:
         reasons.append("CREDENTIALS_MISSING")
-    if resolved_mode != "paper" and client is not None and probe_account and credentials_ok:
+    should_probe_account = (
+        resolved_mode != "paper"
+        and client is not None
+        and credentials_ok
+        and (probe_account or account_health_probe_due(resolved_mode))
+    )
+    if should_probe_account:
         try:
             snapshot_getter = getattr(client, "account_snapshot", None)
             if snapshot_getter is None:
@@ -671,8 +752,24 @@ def evaluate_runtime_gate(
             margin_mode_ok = bool(selected_symbols) and margin_mode_ok
             exchange_positions_ok = isinstance(snapshot.positions, tuple)
             open_orders_ok = isinstance(snapshot.open_orders, tuple)
+            _store_account_health(
+                resolved_mode,
+                {
+                    "account_reachable": account_reachable,
+                    "account_mode_ok": account_mode_ok,
+                    "margin_mode_ok": margin_mode_ok,
+                    "exchange_positions_ok": exchange_positions_ok,
+                    "open_orders_ok": open_orders_ok,
+                    "wallet_balance_ok": wallet_balance_ok,
+                    "available_balance_ok": available_balance_ok,
+                    "server_time_ok": server_time_ok,
+                    "leverage_ok": leverage_ok,
+                    "symbol_leverage": dict(symbol_leverage),
+                },
+            )
         except Exception as exc:
             reasons.append(f"ACCOUNT_PREFLIGHT_FAILED:{type(exc).__name__}")
+            reset_account_health_cache()
             account_reachable = False
             account_mode_ok = False
             margin_mode_ok = False
@@ -683,7 +780,15 @@ def evaluate_runtime_gate(
             server_time_ok = False
             leverage_ok = False
     elif resolved_mode != "paper":
-        reasons.append("ACCOUNT_PREFLIGHT_NOT_RUN")
+        cache_status, cached = _cached_account_health(resolved_mode)
+        if cache_status == "FRESH" and cached is not None:
+            _apply_account_fields(cached)
+        else:
+            reasons.append(
+                "ACCOUNT_HEALTH_EXPIRED"
+                if cache_status == "EXPIRED"
+                else "ACCOUNT_PREFLIGHT_NOT_RUN"
+            )
 
     if resolved_mode != "paper" and not account_mode_ok:
         reasons.append("ACCOUNT_MODE_NOT_VERIFIED")
@@ -716,7 +821,7 @@ def evaluate_runtime_gate(
     if not reconciliation_ok:
         reasons.append("RECONCILIATION_NOT_VERIFIED")
 
-    risk_config_ok = _risk_config_ok()
+    risk_config_ok = _risk_config_ok(mode=resolved_mode)
     if not risk_config_ok:
         reasons.append("RISK_CONFIG_INVALID")
     kill_switch_ok = not _enabled("BIAN_KILL_SWITCH") and not _enabled("BIAN_TRADING_HALTED")

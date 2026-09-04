@@ -1489,7 +1489,7 @@ def collect(limit: int = 20, *, run_id: str | None = None) -> dict[str, Any]:
             f"bian:universe-breadth:{received_timestamp.isoformat()}",
         )),
         "symbol": "__MARKET__",
-        "market": "SPOT",
+        "market": "FUTURES",
         "event_type": "UNIVERSE_BREADTH",
         "source_timestamp": received_timestamp.isoformat(),
         "received_timestamp": received_timestamp.isoformat(),
@@ -3299,7 +3299,7 @@ async def stream(
     *,
     flush_sec: float,
     dsn: str | None = None,
-    market: str = "SPOT",
+    market: str = "FUTURES",
     controlled_reconnect_after: float | None = None,
 ) -> None:
     """Maintain a public ticker stream and persist the latest batch per interval."""
@@ -3563,19 +3563,19 @@ def collect_positioning_observations(
     Execution.
     """
     normalized_limit = max(1, min(candidate_limit, 100))
-    spot_run_id = str(uuid.uuid4())
+    scanner_run_id = str(uuid.uuid4())
     try:
-        spot_report = collect(limit=normalized_limit, run_id=spot_run_id)
-        persist(spot_report, dsn)
+        scanner_report = collect(limit=normalized_limit, run_id=scanner_run_id)
+        persist(scanner_report, dsn)
     except Exception as exc:
         LOGGER.exception(
-            "spot positioning observation failed",
-            extra={"collection_kind": "positioning_observe_spot", "run_id": spot_run_id},
+            "futures scanner observation failed",
+            extra={"collection_kind": "positioning_observe_scanner", "run_id": scanner_run_id},
         )
         try:
             record_collection_failure(
-                spot_run_id,
-                "positioning_observe_spot",
+                scanner_run_id,
+                "positioning_observe_scanner",
                 _collection_error_code(exc),
                 dsn=dsn,
             )
@@ -3584,7 +3584,7 @@ def collect_positioning_observations(
         raise
 
     candidate_symbols = _candidate_stream_symbols(
-        spot_report, fallback_symbols=fallback_symbols
+        scanner_report, fallback_symbols=fallback_symbols
     )
     futures_run_id = str(uuid.uuid4())
     try:
@@ -3817,6 +3817,7 @@ def main(argv: list[str] | None = None) -> int:
             stream(
                 _stream_symbols(args.stream_symbols),
                 flush_sec=max(1.0, args.stream_flush_sec),
+                market="FUTURES",
             )
         )
         return 0

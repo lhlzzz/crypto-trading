@@ -11,6 +11,7 @@ from risk import (
     RiskGate,
     RiskLimits,
     classify_futures_risk_tier,
+    reject_legacy_meme_risk_env,
 )
 from trade_intent import TradeIntent
 
@@ -134,6 +135,30 @@ def test_risk_limits_load_from_environment(monkeypatch) -> None:
     assert limits.min_data_quality_score == Decimal("0.7")
     assert limits.max_funding_abs == Decimal("0.02")
     assert limits.max_margin_ratio == Decimal("0.5")
+    assert limits.max_symbol_notional_usdt == Decimal("500")
+
+
+def test_risk_limits_do_not_fallback_to_legacy_meme_env(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_MEME_SYMBOL_NOTIONAL_USDT", "12")
+    monkeypatch.setenv("MAX_SYMBOL_NOTIONAL_USDT", "80")
+    limits = RiskLimits.from_env()
+    assert limits.max_symbol_notional_usdt == Decimal("80")
+
+
+def test_legacy_meme_risk_env_fails_closed_on_testnet(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setenv("MAX_MEME_PORTFOLIO_NOTIONAL_USDT", "99")
+    with pytest.raises(ValueError, match="legacy meme risk"):
+        reject_legacy_meme_risk_env(mode="testnet")
+
+
+def test_risk_gate_halts_unauthorized_symbol() -> None:
+    intent = _intent()
+    object.__setattr__(intent, "symbol", "DOGEUSDT")
+    decision = RiskGate().evaluate(intent, _context())
+    assert decision.decision == "HALT"
+    assert "UNAUTHORIZED_SYMBOL" in decision.reason
 
 
 def test_risk_limits_reject_out_of_range_margin_ratio() -> None:

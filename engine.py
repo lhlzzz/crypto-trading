@@ -1237,7 +1237,12 @@ class StrategyEngine:
         timestamp: datetime,
         evidence: EvidenceVector,
     ) -> UUID:
-        """Bind a deterministic snapshot id to the actual decision inputs."""
+        """Bind a deterministic snapshot id to the actual decision inputs.
+
+        Replay identity remains content-addressed. Persistence uniqueness is
+        ``(validation_session_id, snapshot_id)`` so two research sessions with
+        identical inputs cannot overwrite each other.
+        """
         payload = {
             "symbol": frame.symbol.upper(),
             "timestamp": _aware(timestamp).isoformat(),

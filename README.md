@@ -36,9 +36,10 @@ Testnet credentials use `BIAN_TESTNET_API_KEY` and
 secret configuration, never stored in the database or returned by the API.
 
 Production execution market is Binance USD-M USDT-margined perpetual. First-phase
-universe is `BTCUSDT`, `ETHUSDT`, and `BNBUSDT` only. Spot is public confirmation
-only; `PrivateClient` cannot place Spot orders. Web3 and DEX trading live in a
-separate workspace.
+universe is `BTCUSDT`, `ETHUSDT`, and `BNBUSDT` only. Mixed env such as
+`BTCUSDT,DOGEUSDT` is INVALID and does not run. Spot historical rows may remain
+in PostgreSQL; Spot is not on the runtime trading path. Web3 and DEX trading
+live in a separate workspace.
 
 The read-only API exposes `/health` and
 `/api/os/front-data`. Financial OS proxies that contract through
@@ -48,7 +49,7 @@ The read-only API exposes `/health` and
 `python3.12 scripts/bian_market.py stream` collects public Futures trades,
 bookTicker, depth, mark/index/funding, and observed force-order events. It has
 no authenticated feed configuration and does not support orders, wallets, or
-private APIs. Spot remains auxiliary confirmation only.
+private APIs.
 
 Capital Positioning remains shadow-only. The collector derives 24-hour
 cross-sectional breadth, a bounded Tier 1 candidate universe, and a
@@ -60,12 +61,11 @@ selecting a retention period with `scripts/bian_market.py measure-storage`;
 `prune-raw-events` requires an explicit retention age.
 
 Use `scripts/bian_market.py observe` for continuous public-only observation.
-It refreshes the Tier 1 scanner and Futures REST context, then maintains Spot
-trade/book/depth plus Futures force-order streams only for the selected
-candidates. `POSITIONING_OBSERVER_CANDIDATE_LIMIT` defaults to five; it is
-separate from the broader scanner display limit to bound WebSocket, CPU, and
-API load. The command does not construct TradeIntent objects or invoke Risk,
-Execution, Testnet, or Live trading.
+It refreshes the Tier 1 scanner and Futures REST context, then maintains
+Futures trade/book/mark/index/liquidation streams only for BTC, ETH, and BNB.
+`POSITIONING_OBSERVER_CANDIDATE_LIMIT` is bounded; scanner extras cannot expand
+the stream set. The command does not construct TradeIntent objects or invoke
+Risk, Execution, Testnet, or Live trading.
 
 Run `paper_runner.py --shadow-forever --symbols BTCUSDT` alongside the public
 observer to persist legacy-versus-positioning decisions. This pure Shadow loop
@@ -95,13 +95,11 @@ The API contract and release identity default to `2026-08-15` and can be
 overridden independently with `BIAN_OPERATOR_CONTRACT_VERSION` and
 `BIAN_RELEASE_VERSION`.
 
-## Validation Status (2026-08-31)
+## Validation Status (2026-09-04)
 
-Code verification is green: `246` tests pass, Python 3.12 `compileall` passes,
-`git diff --check` passes, and PostgreSQL schema/status reports no missing
-tables. Public Binance access is not currently a stable runtime dependency:
-`markPrice` was reachable in a direct smoke, while OI, funding, aggregate
-trades, ticker collection, and Futures WebSocket observation encountered SSL
-EOF or connection-reset failures. Therefore the 30-minute, 2-hour, 6-hour,
-24-hour, 24-hour Paper, seven-day Shadow, Alpha OOS, and Testnet gates are not
-verified. Live remains blocked.
+Bian is a BTC/ETH/BNB USD-M Futures system. This session: `456` pytest
+tests pass, Python 3.12 `compileall` passes, `git diff --check` passes.
+Prior 246-test and 449-test counts are expired. `LIVE_ALLOWED=false`.
+Testnet remains `BLOCKED_BY_EXTERNAL_CREDENTIALS`. Realtime 30M/2H
+evidence is `EXPIRED`. Paper 24H, Shadow 7D, Alpha, and Live remain not
+started or blocked.

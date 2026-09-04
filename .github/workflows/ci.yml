@@ -1,0 +1,54 @@
+name: bian-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dangerous-pattern checks
+        run: |
+          set -euo pipefail
+          search() {
+            grep -R -n --include='*.py' "$@" \
+              engine.py risk.py trade_intent.py execution.py binance_client.py \
+              paper_runner.py runtime_gate.py trading_store.py reconciliation.py \
+              user_stream.py bian_api.py backtesting.py scripts tests
+          }
+          if search 'except TypeError'; then
+            echo "dangerous pattern: except TypeError mode fallback" >&2
+            exit 1
+          fi
+          if search 'ON CONFLICT (snapshot_id) DO UPDATE'; then
+            echo "dangerous pattern: cross-session snapshot overwrite" >&2
+            exit 1
+          fi
+          if grep -R -n --include='*.py' \
+            -E 'MAX_MEME_SYMBOL_NOTIONAL_USDT|MAX_MEME_PORTFOLIO_NOTIONAL_USDT|MAX_DIRECTIONAL_MEME_EXPOSURE_USDT' \
+            engine.py execution.py binance_client.py paper_runner.py runtime_gate.py \
+            trading_store.py reconciliation.py user_stream.py bian_api.py backtesting.py \
+            scripts; then
+            echo "dangerous pattern: legacy meme risk env on runtime path" >&2
+            exit 1
+          fi
+          if search -E 'class PublicClient|class SpotPublicClient|from binance_sdk_spot'; then
+            echo "dangerous pattern: Spot runtime client" >&2
+            exit 1
+          fi
+          if search -E '/api/meme/|MEME_ALLOWLIST|MEME_BLOCKLIST'; then
+            echo "dangerous pattern: meme runtime API" >&2
+            exit 1
+          fi
+          grep -n 'CANONICAL_FUTURES_SYMBOLS' trade_intent.py
+          grep -n 'UNAUTHORIZED_SYMBOL' risk.py runtime_gate.py
+          grep -n 'is_canonical_futures_symbol' binance_client.py
+      - name: Compile
+        run: python -m compileall -q -x '.venv|__pycache__' .
+      - name: Whitespace
+        run: git diff --check

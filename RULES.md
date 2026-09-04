@@ -21,8 +21,8 @@
   REST reconciliation as final truth.
 - `runtime_gate.py` owns the canonical readiness result. Its `live_allowed`
   field is false until the externally verified release gates pass.
-- Futures public observation is primary; Spot is confirmation-only and has no
-  private trading or account authority.
+- Futures public observation is the runtime market path; Spot is historical
+  research only and has no private trading or account authority.
 - Unknown, stale, future, or timestamp-inconsistent evidence is fail-closed
   and cannot create a strategy CLOSE, REDUCE, or OPEN. Emergency flatten is
   not a strategy CLOSE.
@@ -30,3 +30,9 @@
 - Store trading-state methods require explicit `mode=`; no `BIAN_MODE` fallback.
 - Live CREATE, CANCEL, and CANCEL_ALL require `authorize_live_order_mutation`.
 - Runtime gate is re-evaluated every cycle; a startup snapshot is not reused.
+- Unauthorized symbols fail closed at TradeIntent, RiskGate, and
+  FuturesPrivateClient. Mixed universe env fails the gate.
+- Legacy `MAX_MEME_*` risk env is not a major-futures fallback.
+- Positioning snapshots and previous_state are validation-session scoped.
+- Cancel requests that remain open are `STILL_OPEN`, not `CANCEL_RECONCILED`.
+- `orders.exchange_order_id` uniqueness is `(mode, exchange_order_id)`.

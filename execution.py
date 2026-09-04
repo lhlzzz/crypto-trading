@@ -1441,12 +1441,8 @@ class BinanceExecutor(_BaseExecutor):
                 reason=reason,
             )
         status = _normal_status(str(response.get("status", "UNKNOWN")))
-        if status == "UNKNOWN":
-            reason = "cancel lookup returned UNKNOWN status"
-            self.store.update_order(order_id, status="UNKNOWN", payload=response)
-            self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", response=response)
-            self._store_call("set_halt", True, reason=reason, source="execution")
-        else:
+        if status in {"ACKNOWLEDGED", "PARTIALLY_FILLED", "CREATED", "RISK_APPROVED", "SUBMITTED"}:
+            reason = "cancel request did not cancel; Binance order is still open"
             self.store.update_order(
                 order_id,
                 status=status,
@@ -1457,7 +1453,71 @@ class BinanceExecutor(_BaseExecutor):
                 ),
                 payload=response,
             )
-            self._event(order_id, "CANCEL_RECONCILED", status, response=response)
+            self._event(order_id, "STILL_OPEN", status, response=response)
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=UUID(str(local["intent_id"])),
+                status=status,
+                client_order_id=str(local["client_order_id"]),
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None else exchange_id
+                ),
+                reason=reason,
+            )
+        if status == "UNKNOWN":
+            reason = "cancel lookup returned UNKNOWN status"
+            self.store.update_order(order_id, status="UNKNOWN", payload=response)
+            self._event(order_id, "CANCEL_UNKNOWN", "UNKNOWN", response=response)
+            self._store_call("set_halt", True, reason=reason, source="execution")
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=UUID(str(local["intent_id"])),
+                status="UNKNOWN",
+                client_order_id=str(local["client_order_id"]),
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None else exchange_id
+                ),
+                reason=reason,
+            )
+        if status != "CANCELLED":
+            self.store.update_order(
+                order_id,
+                status=status,
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None else exchange_id
+                ),
+                payload=response,
+            )
+            self._event(order_id, "ORDER_RECONCILED", status, response=response)
+            return ExecutionResult(
+                order_id=order_id,
+                intent_id=UUID(str(local["intent_id"])),
+                status=status,
+                client_order_id=str(local["client_order_id"]),
+                executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+                exchange_order_id=(
+                    str(response["orderId"])
+                    if response.get("orderId") is not None else exchange_id
+                ),
+                reason="cancel outcome reconciled without cancellation",
+            )
+        self.store.update_order(
+            order_id,
+            status=status,
+            executed_quantity=Decimal(str(response.get("executedQty", "0"))),
+            exchange_order_id=(
+                str(response["orderId"])
+                if response.get("orderId") is not None else exchange_id
+            ),
+            payload=response,
+        )
+        self._event(order_id, "CANCEL_RECONCILED", status, response=response)
         return ExecutionResult(
             order_id=order_id,
             intent_id=UUID(str(local["intent_id"])),

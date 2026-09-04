@@ -29,9 +29,6 @@ client = FuturesPrivateClient(config)
 snapshot = client.account_snapshot()
 if snapshot.position_mode != "ONE_WAY":
     raise SystemExit("TESTNET HARD BLOCK: position mode must be ONE_WAY")
-listen_key = client.create_listen_key()
-if not listen_key:
-    raise SystemExit("TESTNET HARD BLOCK: user stream listenKey failed")
 gate = evaluate_runtime_gate(mode="testnet", client=client, probe_account=True)
 print(gate.as_dict())
 if not gate.credentials_ok or not gate.account_reachable:

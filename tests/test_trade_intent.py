@@ -138,3 +138,8 @@ def test_previous_state_is_positioning_metadata() -> None:
     intent = _intent(previous_state="NEUTRAL", positioning_state="LONG_BUILDING")
     assert intent.previous_state == "NEUTRAL"
     assert intent.positioning_state == "LONG_BUILDING"
+
+
+def test_trade_intent_rejects_non_canonical_futures_symbol() -> None:
+    with pytest.raises(ValueError, match="unauthorized symbol"):
+        _intent(symbol="DOGEUSDT")

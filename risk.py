@@ -11,7 +11,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Literal, Mapping
 import os
 
-from trade_intent import FuturesRiskTier, TradeIntent
+from trade_intent import FuturesRiskTier, TradeIntent, is_canonical_futures_symbol
 
 RiskDecisionType = Literal["ALLOW", "DENY", "REDUCE", "HALT"]
 PositionDirection = Literal["LONG", "SHORT", "FLAT"]
@@ -113,17 +113,12 @@ class RiskLimits:
             max_crowding_score=_decimal_env(
                 "MAX_CROWDING", "0.9",
             ),
-            max_symbol_notional_usdt=_decimal_env(
-                "MAX_SYMBOL_NOTIONAL_USDT",
-                os.environ.get("MAX_MEME_SYMBOL_NOTIONAL_USDT", "500"),
-            ),
+            max_symbol_notional_usdt=_decimal_env("MAX_SYMBOL_NOTIONAL_USDT", "500"),
             max_portfolio_notional_usdt=_decimal_env(
-                "MAX_PORTFOLIO_NOTIONAL_USDT",
-                os.environ.get("MAX_MEME_PORTFOLIO_NOTIONAL_USDT", "500"),
+                "MAX_PORTFOLIO_NOTIONAL_USDT", "500"
             ),
             max_directional_exposure_usdt=_decimal_env(
-                "MAX_DIRECTIONAL_EXPOSURE_USDT",
-                os.environ.get("MAX_DIRECTIONAL_MEME_EXPOSURE_USDT", "500"),
+                "MAX_DIRECTIONAL_EXPOSURE_USDT", "500"
             ),
             max_funding_abs=_decimal_env("MAX_FUNDING_ABS", "0.01"),
             max_margin_ratio=_decimal_env("MAX_MARGIN_RATIO", "0.8"),
@@ -164,6 +159,31 @@ class RiskLimits:
             raise ValueError("risk count limits cannot be negative")
         if not Decimal("0") <= self.max_margin_ratio <= Decimal("1"):
             raise ValueError("max_margin_ratio must be between 0 and 1")
+
+
+_LEGACY_MEME_RISK_ENV = (
+    "MAX_MEME_SYMBOL_NOTIONAL_USDT",
+    "MAX_MEME_PORTFOLIO_NOTIONAL_USDT",
+    "MAX_DIRECTIONAL_MEME_EXPOSURE_USDT",
+)
+
+
+def reject_legacy_meme_risk_env(*, mode: str | None = None) -> None:
+    """Legacy meme risk env must not silently size major-futures limits."""
+    present = [name for name in _LEGACY_MEME_RISK_ENV if os.environ.get(name)]
+    if not present:
+        return
+    resolved = str(mode or os.environ.get("BIAN_MODE", "paper")).strip().lower()
+    joined = ", ".join(present)
+    message = (
+        "legacy meme risk environment variables are not a major-futures "
+        f"fallback: {joined}"
+    )
+    if resolved in {"testnet", "live"}:
+        raise ValueError(message)
+    import logging
+
+    logging.getLogger("bian.risk").warning(message)
 
 @dataclass(frozen=True)
 class ExchangeRules:
@@ -485,6 +505,12 @@ class RiskGate:
 
     def evaluate(self, intent: TradeIntent, context: RiskContext) -> RiskDecision:
         entry = intent.action == "OPEN"
+        if not is_canonical_futures_symbol(intent.symbol):
+            return self._halt(
+                intent,
+                "UNAUTHORIZED_SYMBOL: canonical futures universe is "
+                "BTCUSDT, ETHUSDT, BNBUSDT",
+            )
         if context.account_snapshot is None:
             return self._halt(intent, "ACCOUNT_UNAVAILABLE")
         if context.account_snapshot.mode != context.mode:

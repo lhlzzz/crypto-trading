@@ -20,21 +20,6 @@ from typing import Any, Callable
 
 from scripts.bian_market import _get_http_opener
 
-from binance_common.configuration import ConfigurationRestAPI
-from binance_sdk_spot import (
-    BadRequestError,
-    ClientError,
-    ForbiddenError,
-    NetworkError,
-    RateLimitBanError,
-    ServerError,
-    Spot,
-    TooManyRequestsError,
-    UnauthorizedError,
-)
-from binance_sdk_spot.rest_api.models import (
-    KlinesIntervalEnum,
-)
 from risk import FuturesAccountSnapshot, FuturesRiskRules
 
 LOGGER = logging.getLogger("bian.futures.rest")
@@ -172,17 +157,6 @@ def _proxy_mode() -> str:
 
 
 def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
-    if isinstance(exc, (UnauthorizedError, ForbiddenError)):
-        return BinanceAuthError(f"{operation} authentication failed")
-    if isinstance(exc, (TooManyRequestsError, RateLimitBanError)):
-        return BinanceRateLimitError(f"{operation} rate limited")
-    if isinstance(exc, (NetworkError, ServerError)):
-        return BinanceConnectionError(f"{operation} connection failure")
-    if isinstance(exc, (BadRequestError, ClientError)):
-        message = str(exc)
-        if operation in {"create_order", "cancel_order"}:
-            return BinanceOrderError(f"{operation} rejected: {message}")
-        return BinanceAPIError(f"{operation} failed: {message}")
     if isinstance(exc, urllib.error.HTTPError):
         code = int(exc.code)
         try:
@@ -212,44 +186,6 @@ def _translate_error(exc: Exception, *, operation: str) -> BinanceError:
     ):
         return BinanceConnectionError(f"{operation} connection failure")
     return BinanceAPIError(f"{operation} failed: {exc}")
-
-
-def _model_dict(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return [_model_dict(item) for item in value]
-    if hasattr(value, "to_dict"):
-        return value.to_dict()
-    if isinstance(value, dict):
-        return {key: _model_dict(item) for key, item in value.items()}
-    return value
-
-
-def _call(operation: str, function: Callable[[], Any]) -> Any:
-    try:
-        response = function()
-        return _model_dict(response.data())
-    except Exception as exc:
-        raise _translate_error(exc, operation=operation) from exc
-
-
-def _configuration(config: ClientConfig, *, private: bool) -> ConfigurationRestAPI:
-    if private and (not config.api_key or not config.api_secret):
-        raise BinanceAuthError(
-            f"credentials are required for BIAN_MODE={config.mode}"
-        )
-    base_path = (
-        "https://api.binance.com"
-    )
-    return ConfigurationRestAPI(
-        api_key=config.api_key if private else None,
-        api_secret=config.api_secret if private else None,
-        base_path=base_path,
-        timeout=config.timeout_ms,
-        retries=config.retries,
-        backoff=config.backoff_ms,
-    )
 
 
 FUTURES_LIVE_REST = "https://fapi.binance.com"
@@ -515,102 +451,6 @@ def _futures_api_key_request(
         retries=config.retries,
         operation=operation,
     )
-
-
-class SpotPublicClient:
-    """Read-only Spot public market-data adapter. It has no order methods."""
-
-    def __init__(self, config: ClientConfig | None = None) -> None:
-        self.config = config or ClientConfig.from_env()
-        self._client = Spot(config_rest_api=_configuration(self.config, private=False))
-        self._exchange_info_cache: tuple[float, dict[str, Any]] | None = None
-
-    def get_klines(
-        self,
-        symbol: str,
-        interval: str = "1m",
-        limit: int = 500,
-    ) -> list[Any]:
-        try:
-            interval_enum = KlinesIntervalEnum(interval)
-        except ValueError as exc:
-            raise ValueError(f"unsupported Binance kline interval: {interval}") from exc
-        return _call(
-            "get_klines",
-            lambda: self._client.rest_api.klines(symbol, interval_enum, limit=limit),
-        )
-
-    def get_depth(self, symbol: str, limit: int = 100) -> dict[str, Any]:
-        return _call(
-            "get_depth",
-            lambda: self._client.rest_api.depth(symbol, limit=limit),
-        )
-
-    def get_ticker(self, symbol: str) -> dict[str, Any] | list[dict[str, Any]]:
-        return _call(
-            "get_ticker",
-            lambda: self._client.rest_api.ticker_price(symbol=symbol),
-        )
-
-    def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
-        if symbol is None and self._exchange_info_cache is not None:
-            cached_at, cached = self._exchange_info_cache
-            if time.monotonic() - cached_at < self.config.exchange_info_ttl_sec:
-                return cached
-        payload = _call(
-            "get_exchange_info",
-            lambda: self._client.rest_api.exchange_info(symbol=symbol),
-        )
-        if symbol is None:
-            self._exchange_info_cache = (time.monotonic(), payload)
-        return payload
-
-    def get_symbol_rules(
-        self,
-        symbol: str,
-        *,
-        force_refresh: bool = False,
-    ) -> dict[str, str]:
-        """Return normalized exchange filters for one symbol.
-
-        This is exchange metadata only. Risk owns how these values are
-        applied to an intent; the adapter only fetches, caches, and parses the
-        Binance response.
-        """
-        symbol = symbol.upper().strip()
-        if not symbol:
-            raise ValueError("symbol is required")
-        if force_refresh:
-            self._exchange_info_cache = None
-        payload = self.get_exchange_info()
-        symbols = payload.get("symbols") or []
-        row = next(
-            (item for item in symbols if str(item.get("symbol", "")).upper() == symbol),
-            None,
-        )
-        if row is None:
-            raise BinanceAPIError(f"exchange info has no symbol: {symbol}")
-        filters = {
-            str(item.get("filterType")): item
-            for item in row.get("filters", [])
-        }
-        lot = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
-        price = filters.get("PRICE_FILTER") or {}
-        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
-        return {
-            "symbol": symbol,
-            "status": str(row.get("status", "")),
-            "min_qty": str(lot.get("minQty", "0")),
-            "max_qty": str(lot.get("maxQty", "0")),
-            "step_size": str(lot.get("stepSize", "0")),
-            "tick_size": str(price.get("tickSize", "0")),
-            "min_notional": str(
-                notional.get("minNotional", notional.get("notional", "0"))
-            ),
-        }
-
-
-PublicClient = SpotPublicClient
 
 
 class FuturesPublicClient:
@@ -915,6 +755,16 @@ class FuturesPrivateClient:
         position_side: str | None = None,
         time_in_force: str | None = None,
     ) -> dict[str, Any]:
+        from trade_intent import is_canonical_futures_symbol
+
+        normalized_symbol = str(symbol or "").upper().strip()
+        if self.config.mode in {"testnet", "live"} and not is_canonical_futures_symbol(
+            normalized_symbol
+        ):
+            raise BinanceOrderError(
+                "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+                f"unauthorized symbol: {normalized_symbol or symbol}"
+            )
         normalized_side = side.upper().strip()
         normalized_type = order_type.upper().strip()
         if normalized_side not in {"BUY", "SELL"}:
@@ -924,7 +774,7 @@ class FuturesPrivateClient:
         if quantity is None:
             raise ValueError("Futures orders require quantity")
         params: dict[str, Any] = {
-            "symbol": symbol.upper(),
+            "symbol": normalized_symbol,
             "side": normalized_side,
             "type": normalized_type,
             "quantity": str(quantity),
@@ -947,23 +797,43 @@ class FuturesPrivateClient:
         order_id: int | str | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
+        from trade_intent import is_canonical_futures_symbol
+
+        normalized_symbol = str(symbol or "").upper().strip()
+        if self.config.mode in {"testnet", "live"} and not is_canonical_futures_symbol(
+            normalized_symbol
+        ):
+            raise BinanceOrderError(
+                "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+                f"unauthorized symbol: {normalized_symbol or symbol}"
+            )
         return self._order(
             "DELETE",
             "/fapi/v1/order",
             operation="cancel_order",
             params={
-                "symbol": symbol.upper(),
+                "symbol": normalized_symbol,
                 "orderId": int(order_id) if order_id is not None else None,
                 "origClientOrderId": client_order_id,
             },
         )
 
     def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
+        from trade_intent import is_canonical_futures_symbol
+
+        normalized_symbol = str(symbol or "").upper().strip()
+        if self.config.mode in {"testnet", "live"} and not is_canonical_futures_symbol(
+            normalized_symbol
+        ):
+            raise BinanceOrderError(
+                "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+                f"unauthorized symbol: {normalized_symbol or symbol}"
+            )
         return self._order(
             "DELETE",
             "/fapi/v1/allOpenOrders",
             operation="cancel_all_orders",
-            params={"symbol": symbol.upper()},
+            params={"symbol": normalized_symbol},
         )
 
     def get_order(

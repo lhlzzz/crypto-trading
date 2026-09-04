@@ -648,8 +648,27 @@ def _create_trading_tables(cursor: Any) -> None:
     )
     cursor.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS orders_exchange_order_id_idx
-        ON orders(exchange_order_id) WHERE exchange_order_id IS NOT NULL
+        DROP INDEX IF EXISTS orders_exchange_order_id_idx
+        """
+    )
+    # Exchange order IDs are unique per runtime mode, not globally. Paper,
+    # Testnet, and Live may coincidentally share numeric IDs.
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS orders_mode_exchange_order_id_idx
+        ON orders(mode, exchange_order_id) WHERE exchange_order_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
+        ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_client_order_id_key
+        """
+    )
+    cursor.execute("DROP INDEX IF EXISTS orders_client_order_id_key")
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS orders_mode_client_order_id_idx
+        ON orders(mode, client_order_id)
         """
     )
     _migrate_futures_columns(cursor)
@@ -939,6 +958,57 @@ def _migrate_validation_session_columns(cursor: Any) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS positioning_episodes_active_symbol_session_idx
         ON positioning_episodes(symbol, market, validation_session_id)
         WHERE status IN ('OPEN', 'UNRESOLVED') AND validation_session_id IS NOT NULL
+        """
+    )
+    # Snapshot identity is content-addressed. Persistence uniqueness is
+    # (snapshot_id, validation_session_id) so two research sessions with the
+    # same evidence cannot overwrite each other.
+    cursor.execute(
+        "ALTER TABLE positioning_snapshots DROP CONSTRAINT IF EXISTS positioning_snapshots_pkey"
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positioning_snapshots_id_null_session_idx
+        ON positioning_snapshots(snapshot_id)
+        WHERE validation_session_id IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS positioning_snapshots_id_session_idx
+        ON positioning_snapshots(snapshot_id, validation_session_id)
+        WHERE validation_session_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        "ALTER TABLE evidence_snapshots DROP CONSTRAINT IF EXISTS evidence_snapshots_pkey"
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS evidence_snapshots_id_null_session_idx
+        ON evidence_snapshots(snapshot_id)
+        WHERE validation_session_id IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS evidence_snapshots_id_session_idx
+        ON evidence_snapshots(snapshot_id, validation_session_id)
+        WHERE validation_session_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'trade_intents_evidence_snapshot_id_fkey'
+            ) THEN
+                ALTER TABLE trade_intents
+                DROP CONSTRAINT trade_intents_evidence_snapshot_id_fkey;
+            END IF;
+        END $$
         """
     )
 

@@ -1205,13 +1205,6 @@ def runtime_acceptance_snapshot(
             snapshot = getter(mode=mode, session_id=session_id)
             if isinstance(snapshot, dict):
                 return snapshot
-        except TypeError:
-            try:
-                snapshot = getter(mode=mode)
-            except TypeError:
-                snapshot = getter()
-            if isinstance(snapshot, dict):
-                return snapshot
         except Exception as exc:
             return {
                 "database_healthy": False,
@@ -1727,15 +1720,8 @@ def _load_alpha_frames() -> list[Any]:
         return []
     try:
         return list(getter())
-    except TypeError:
-        symbols = []
-        lister = getattr(store, "positioning_symbols", None)
-        if lister is not None:
-            symbols = list(lister() or [])
-        frames: list[Any] = []
-        for symbol in symbols:
-            frames.extend(list(getter(symbol)))
-        return frames
+    except Exception:
+        return []
 
 
 def run_alpha_stage() -> dict[str, Any]:

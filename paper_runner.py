@@ -99,12 +99,25 @@ def _symbols(value: str) -> list[str]:
 
 
 def _mode_symbols(mode: str, value: str | None = None) -> list[str]:
-    symbols = _symbols(value) if value else list(trading_symbols_for_mode(mode))
-    unauthorized = [symbol for symbol in symbols if not is_canonical_futures_symbol(symbol)]
+    from runtime_gate import unauthorized_symbols_for_mode
+
+    if value:
+        symbols = _symbols(value)
+        unauthorized = [
+            symbol for symbol in symbols if not is_canonical_futures_symbol(symbol)
+        ]
+    else:
+        unauthorized = list(unauthorized_symbols_for_mode(mode))
+        symbols = list(trading_symbols_for_mode(mode))
     if unauthorized:
         raise ValueError(
             "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
             f"unauthorized symbols: {','.join(unauthorized)}"
+        )
+    if not symbols:
+        raise ValueError(
+            "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+            "no authorized symbols configured"
         )
     return symbols
 
@@ -143,10 +156,7 @@ def _halt_user_stream(
 ) -> None:
     setter = getattr(store, "set_user_stream_health", None)
     if callable(setter):
-        try:
-            setter(state, reason=reason, mode=mode)
-        except TypeError:
-            setter(state, reason=reason)
+        setter(state, reason=reason, mode=mode)
     _set_halt(store, True, reason=reason, source="user_stream", mode=mode)
     store.record_system_event(
         event_type="RUNTIME_HALT",
@@ -240,7 +250,8 @@ def _record_shadow(
  ) -> tuple[PositioningDecision, dict[str, Any]]:
     """Persist the positioning decision before any intent can exist."""
     previous_state = store.latest_positioning_state(
-        frame.symbol, before=frame.captured_at
+        frame.symbol,
+        before=frame.captured_at,
     )
     current_episode = _current_episode(store, frame.symbol, engine)
     positioning = engine.positioning_decision(
@@ -901,10 +912,7 @@ async def _run_private_forever(
             stream_state = str(getattr(stream, "state", "UNKNOWN") or "UNKNOWN").upper()
             setter = getattr(store, "set_user_stream_health", None)
             if callable(setter):
-                try:
-                    setter(stream_state, mode=mode)
-                except TypeError:
-                    setter(stream_state)
+                setter(stream_state, mode=mode)
             current_gate = evaluate_runtime_gate(
                 mode=mode,
                 store=store,

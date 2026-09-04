@@ -104,6 +104,11 @@ class TradeIntent(BaseModel):
         symbol = self.symbol.upper().strip()
         if not symbol:
             raise ValueError("symbol is required")
+        if not is_canonical_futures_symbol(symbol):
+            raise ValueError(
+                "canonical futures universe is BTCUSDT, ETHUSDT, BNBUSDT; "
+                f"unauthorized symbol: {symbol}"
+            )
         object.__setattr__(self, "symbol", symbol)
 
         if self.direction == "FLAT":

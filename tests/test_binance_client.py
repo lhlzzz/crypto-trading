@@ -9,8 +9,6 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
-from binance_sdk_spot import NetworkError, ServerError, TooManyRequestsError
-
 from binance_client import (
     BinanceAuthError,
     BinanceAPIError,
@@ -20,28 +18,15 @@ from binance_client import (
     ClientConfig,
     FuturesPrivateClient,
     FuturesPublicClient,
-    PublicClient,
     _translate_error,
 )
 
 
-def test_public_client_uses_public_sdk_without_credentials() -> None:
-    with patch("binance_client.Spot") as spot:
-        response = MagicMock()
-        response.data.return_value = {"symbol": "BTCUSDT", "price": "100"}
-        spot.return_value.rest_api.ticker_price.return_value = response
-        client = PublicClient(ClientConfig(mode="paper"))
+def test_spot_public_client_is_removed() -> None:
+    import binance_client
 
-        assert client.get_ticker("BTCUSDT") == {
-            "symbol": "BTCUSDT",
-            "price": "100",
-        }
-
-    config = spot.call_args.kwargs["config_rest_api"]
-    assert config.base_path == "https://api.binance.com"
-    spot.return_value.rest_api.ticker_price.assert_called_once_with(
-        symbol="BTCUSDT"
-    )
+    assert not hasattr(binance_client, "PublicClient")
+    assert not hasattr(binance_client, "SpotPublicClient")
 
 
 def test_futures_public_client_retries_transient_timeout() -> None:
@@ -541,9 +526,6 @@ def test_futures_private_live_order_uses_production_host(monkeypatch) -> None:
         (TimeoutError("timeout"), BinanceConnectionError),
         (ConnectionError("reset"), BinanceConnectionError),
         (OSError("dns"), BinanceConnectionError),
-        (NetworkError("network"), BinanceConnectionError),
-        (ServerError("server", 503), BinanceConnectionError),
-        (TooManyRequestsError("rate limit", 429), BinanceRateLimitError),
         (
             urllib.error.HTTPError(
                 "https://fapi.binance.com/fapi/v1/order",
@@ -561,14 +543,18 @@ def test_transport_failures_use_unified_adapter_errors(source, translated) -> No
         raise _translate_error(source, operation="create_order")
 
 
-def test_public_client_caches_and_normalizes_exchange_rules() -> None:
-    with patch("binance_client.Spot") as spot:
-        response = MagicMock()
-        response.data.return_value = {
+def test_futures_public_client_normalizes_exchange_rules() -> None:
+    client = FuturesPublicClient(ClientConfig(mode="paper"))
+    with patch.object(
+        client,
+        "get_exchange_info",
+        return_value={
             "symbols": [
                 {
                     "symbol": "BTCUSDT",
                     "status": "TRADING",
+                    "quantityPrecision": 3,
+                    "pricePrecision": 1,
                     "filters": [
                         {
                             "filterType": "PRICE_FILTER",
@@ -587,18 +573,23 @@ def test_public_client_caches_and_normalizes_exchange_rules() -> None:
                     ],
                 }
             ]
-        }
-        spot.return_value.rest_api.exchange_info.return_value = response
-        client = PublicClient(ClientConfig(mode="paper"))
+        },
+    ) as exchange_info:
+        rules = client.get_symbol_rules("BTCUSDT")
 
-        assert client.get_symbol_rules("BTCUSDT") == {
-            "symbol": "BTCUSDT",
-            "status": "TRADING",
-            "min_qty": "0.001",
-            "max_qty": "100",
-            "step_size": "0.001",
-            "tick_size": "0.10",
-            "min_notional": "5",
-        }
-        assert client.get_symbol_rules("BTCUSDT")["step_size"] == "0.001"
-        spot.return_value.rest_api.exchange_info.assert_called_once_with(symbol=None)
+    assert rules["symbol"] == "BTCUSDT"
+    assert rules["status"] == "TRADING"
+    assert rules["min_qty"] == "0.001"
+    assert rules["max_qty"] == "100"
+    assert rules["step_size"] == "0.001"
+    assert rules["tick_size"] == "0.10"
+    assert rules["min_notional"] == "5"
+    exchange_info.assert_called_once_with("BTCUSDT")
+
+
+def test_futures_private_create_order_rejects_unauthorized_symbol() -> None:
+    client = FuturesPrivateClient(
+        ClientConfig(mode="testnet", api_key="key", api_secret="secret")
+    )
+    with pytest.raises(BinanceOrderError, match="unauthorized symbol"):
+        client.create_order("DOGEUSDT", "BUY", "MARKET", quantity="0.01")
