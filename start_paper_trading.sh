@@ -13,4 +13,5 @@ export BIAN_MARKET=FUTURES
 export BIAN_MODE=paper
 export LIVE_TRADING_ENABLED=false
 cd "$script_dir"
+"$python_bin" scripts/knowledge_loop.py
 exec "$python_bin" paper_runner.py "$@"
