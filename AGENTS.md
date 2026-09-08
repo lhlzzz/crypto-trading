@@ -29,6 +29,9 @@ market is Binance USD-M Futures.
 owner, and `paper_runner.py --shadow-forever` records comparisons without
 calling Risk, Execution, TradeIntent creation, or order submission.
 
+Obsidian `虚拟币/bian/daily` is a production knowledge dependency. Missing
+vault fails `scripts/knowledge_loop.py`. It does not submit orders.
+
 `runtime_gate.py` is the canonical readiness owner. Its `live_allowed` result
 must remain false until the externally verified observation, shadow, Testnet,
 reconciliation, data-health, and human-confirmation gates are complete.
